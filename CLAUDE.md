@@ -32,6 +32,28 @@ uv run server.py
 lifecycle-mcp
 ```
 
+#### Network Transport
+
+The server supports three transport modes: stdio (default), streamable-http, and sse.
+
+```bash
+# Streamable HTTP (recommended for network access)
+lifecycle-mcp --transport streamable-http --host 0.0.0.0 --port 8080
+
+# SSE (Server-Sent Events)
+lifecycle-mcp --transport sse --host 0.0.0.0 --port 8080
+
+# Stdio (default, for direct MCP client integration)
+lifecycle-mcp --transport stdio
+```
+
+Environment variable fallbacks:
+- `LIFECYCLE_TRANSPORT` — transport type (default: `stdio`)
+- `LIFECYCLE_HOST` — bind address (default: `127.0.0.1`)
+- `LIFECYCLE_PORT` — port number (default: `8080`)
+
+CLI arguments take precedence over environment variables.
+
 ### Testing the Server
 ```bash
 # Test with Claude Code (uv method - recommended)
@@ -43,6 +65,32 @@ claude mcp add lifecycle lifecycle-mcp
 # Manual configuration for other MCP clients
 export LIFECYCLE_DB="./lifecycle.db"
 uv run server.py  # or lifecycle-mcp if installed with pip
+```
+
+### Docker Deployment
+
+```bash
+# Build the image
+docker build -t lifecycle-mcp .
+
+# Run with persistent database
+docker run -p 8080:8080 -v lifecycle-data:/data lifecycle-mcp
+
+# Or use docker-compose
+docker-compose up -d
+```
+
+The container runs streamable-http transport on port 8080 by default. Database is stored at `/data/lifecycle.db` inside the container — mount a volume at `/data` for persistence.
+
+### Remote Client Configuration
+
+To connect to a network-accessible server from Claude Code:
+```bash
+# For streamable-http transport
+claude mcp add lifecycle --transport http http://SERVER_HOST:8080/mcp/
+
+# For SSE transport
+claude mcp add lifecycle --transport sse http://SERVER_HOST:8080/sse
 ```
 
 ## Architecture Overview

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+.worktrees
+*.db
+__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+htmlcov
+.coverage
+tests/
+docs/
+project_management/
+spike/

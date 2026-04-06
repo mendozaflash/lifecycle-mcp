@@ -1,0 +1,13 @@
+services:
+  lifecycle-mcp:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - lifecycle-data:/data
+    environment:
+      - LIFECYCLE_DB=/data/lifecycle.db
+    restart: unless-stopped
+
+volumes:
+  lifecycle-data:
