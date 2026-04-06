@@ -264,19 +264,19 @@ CREATE INDEX IF NOT EXISTS idx_lifecycle_events_entity ON lifecycle_events(entit
 CREATE INDEX IF NOT EXISTS idx_approvals_entity ON approvals(entity_type, entity_id);
 
 -- Triggers for automatic updates
-CREATE TRIGGER update_requirement_timestamp 
+CREATE TRIGGER IF NOT EXISTS update_requirement_timestamp
 AFTER UPDATE ON requirements
 BEGIN
     UPDATE requirements SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 
-CREATE TRIGGER update_task_timestamp 
+CREATE TRIGGER IF NOT EXISTS update_task_timestamp
 AFTER UPDATE ON tasks
 BEGIN
     UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
 END;
 
-CREATE TRIGGER log_requirement_status_change
+CREATE TRIGGER IF NOT EXISTS log_requirement_status_change
 AFTER UPDATE OF status ON requirements
 WHEN OLD.status != NEW.status
 BEGIN
@@ -284,40 +284,40 @@ BEGIN
     VALUES ('requirement', NEW.id, 'status_change', OLD.status, NEW.status);
 END;
 
-CREATE TRIGGER log_task_status_change
+CREATE TRIGGER IF NOT EXISTS log_task_status_change
 AFTER UPDATE OF status ON tasks
 WHEN OLD.status != NEW.status
 BEGIN
     INSERT INTO lifecycle_events (entity_type, entity_id, event_type, from_value, to_value)
     VALUES ('task', NEW.id, 'status_change', OLD.status, NEW.status);
-    
+
     -- Update completed timestamp
-    UPDATE tasks 
-    SET completed_at = CASE 
-        WHEN NEW.status = 'Complete' THEN CURRENT_TIMESTAMP 
-        ELSE NULL 
+    UPDATE tasks
+    SET completed_at = CASE
+        WHEN NEW.status = 'Complete' THEN CURRENT_TIMESTAMP
+        ELSE NULL
     END
     WHERE id = NEW.id;
 END;
 
 -- Update requirement task counts
-CREATE TRIGGER update_requirement_task_count_insert
+CREATE TRIGGER IF NOT EXISTS update_requirement_task_count_insert
 AFTER INSERT ON requirement_tasks
 BEGIN
-    UPDATE requirements 
+    UPDATE requirements
     SET task_count = (
         SELECT COUNT(*) FROM requirement_tasks WHERE requirement_id = NEW.requirement_id
     )
     WHERE id = NEW.requirement_id;
 END;
 
-CREATE TRIGGER update_requirement_task_completion
+CREATE TRIGGER IF NOT EXISTS update_requirement_task_completion
 AFTER UPDATE OF status ON tasks
 WHEN NEW.status = 'Complete' OR OLD.status = 'Complete'
 BEGIN
-    UPDATE requirements 
+    UPDATE requirements
     SET tasks_completed = (
-        SELECT COUNT(*) 
+        SELECT COUNT(*)
         FROM requirement_tasks rt
         JOIN tasks t ON rt.task_id = t.id
         WHERE rt.requirement_id = requirements.id AND t.status = 'Complete'

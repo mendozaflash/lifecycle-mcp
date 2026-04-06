@@ -192,15 +192,17 @@ class DatabaseManager:
         if needs_schema:
             logger.info(f"Initializing database schema at {self.db_path}")
             conn = sqlite3.connect(self.db_path)
-            schema_path = Path(__file__).parent / "lifecycle-schema.sql"
-            if schema_path.exists():
-                with open(schema_path, encoding="utf-8") as f:
-                    conn.executescript(f.read())
-                logger.info("Database schema initialized")
-            else:
-                logger.error(f"Schema file not found at {schema_path}")
-                raise FileNotFoundError(f"Schema file not found at {schema_path}")
-            conn.close()
+            try:
+                schema_path = Path(__file__).parent / "lifecycle-schema.sql"
+                if schema_path.exists():
+                    with open(schema_path, encoding="utf-8") as f:
+                        conn.executescript(f.read())
+                    logger.info("Database schema initialized")
+                else:
+                    logger.error(f"Schema file not found at {schema_path}")
+                    raise FileNotFoundError(f"Schema file not found at {schema_path}")
+            finally:
+                conn.close()
 
         # Apply any pending migrations
         apply_all_migrations(self.db_path)
