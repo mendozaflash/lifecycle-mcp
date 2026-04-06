@@ -173,8 +173,24 @@ class DatabaseManager:
 
     def _ensure_database_exists(self):
         """Initialize database with schema if needed"""
-        if not Path(self.db_path).exists():
-            logger.info(f"Creating new database at {self.db_path}")
+        needs_schema = not Path(self.db_path).exists()
+
+        if not needs_schema:
+            # File exists — check if schema was actually applied (tasks table must exist)
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
+                needs_schema = cursor.fetchone() is None
+                conn.close()
+                if needs_schema:
+                    logger.warning(f"Database file exists at {self.db_path} but is missing schema tables — re-initializing")
+            except sqlite3.Error as e:
+                logger.warning(f"Could not check database schema: {e} — re-initializing")
+                needs_schema = True
+
+        if needs_schema:
+            logger.info(f"Initializing database schema at {self.db_path}")
             conn = sqlite3.connect(self.db_path)
             schema_path = Path(__file__).parent / "lifecycle-schema.sql"
             if schema_path.exists():
@@ -230,6 +246,7 @@ class DatabaseManager:
 
             finally:
                 if conn:
+                    conn.row_factory = None  # reset before returning to pool
                     if self.enable_pooling and self.connection_pool:
                         self.connection_pool.return_connection(conn)
                     else:
@@ -308,6 +325,7 @@ class DatabaseManager:
 
             finally:
                 if conn:
+                    conn.row_factory = None  # reset before returning to pool
                     if self.enable_pooling and self.connection_pool:
                         self.connection_pool.return_connection(conn)
                     else:
