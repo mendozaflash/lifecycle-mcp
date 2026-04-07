@@ -56,7 +56,7 @@ class TestPerformanceBenchmarks:
             ],
         }
 
-    def test_database_insert_performance(self, db_manager, benchmark_data):
+    async def test_database_insert_performance(self, db_manager, benchmark_data):
         """Benchmark database insert operations"""
         requirements = benchmark_data["requirements"]
 
@@ -71,7 +71,7 @@ class TestPerformanceBenchmarks:
                 if "acceptance_criteria" in req_copy:
                     req_copy["acceptance_criteria"] = json.dumps(req_copy["acceptance_criteria"])
 
-                db_manager.insert_record(
+                await db_manager.insert_record(
                     "requirements",
                     {"id": f"REQ-{str(i + 1).zfill(4)}-FUNC-00", "requirement_number": i + 1, **req_copy},
                 )
@@ -96,9 +96,9 @@ class TestPerformanceBenchmarks:
         ]
 
         with measure_time("Batch insert (10 records)"):
-            db_manager.execute_many(
-                """INSERT INTO requirements 
-                   (id, requirement_number, type, title, priority, current_state, desired_state, author) 
+            await db_manager.execute_many(
+                """INSERT INTO requirements
+                   (id, requirement_number, type, title, priority, current_state, desired_state, author)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 batch_data,
             )
@@ -106,7 +106,7 @@ class TestPerformanceBenchmarks:
         # Performance assertions
         assert avg_single < 0.01  # Single insert should be < 10ms
 
-    def test_database_query_performance(self, db_manager, benchmark_data):
+    async def test_database_query_performance(self, db_manager, benchmark_data):
         """Benchmark database query operations"""
         # First populate database
         for i, req in enumerate(benchmark_data["requirements"]):
@@ -117,24 +117,26 @@ class TestPerformanceBenchmarks:
             if "acceptance_criteria" in req_copy:
                 req_copy["acceptance_criteria"] = json.dumps(req_copy["acceptance_criteria"])
 
-            db_manager.insert_record(
+            await db_manager.insert_record(
                 "requirements", {"id": f"REQ-{str(i + 1).zfill(4)}-FUNC-00", "requirement_number": i + 1, **req_copy}
             )
 
         # Simple query
         with measure_time("Simple SELECT (all records)"):
-            results = db_manager.execute_query("SELECT * FROM requirements", fetch_all=True)
+            results = await db_manager.execute_query("SELECT * FROM requirements", fetch_all=True)
         assert len(results) == 100
 
         # Filtered query
         with measure_time("Filtered SELECT (priority=P1)"):
-            results = db_manager.execute_query("SELECT * FROM requirements WHERE priority = ?", ["P1"], fetch_all=True)
+            results = await db_manager.execute_query(
+                "SELECT * FROM requirements WHERE priority = ?", ["P1"], fetch_all=True
+            )
         assert len(results) == 25  # 25% should be P1
 
         # Complex query with JOIN (after adding tasks)
         # Add some tasks first
         for i in range(50):
-            db_manager.insert_record(
+            await db_manager.insert_record(
                 "tasks",
                 {
                     "id": f"TASK-{str(i + 1).zfill(4)}-00-00",
@@ -144,13 +146,13 @@ class TestPerformanceBenchmarks:
                     "status": "Not Started",
                 },
             )
-            db_manager.insert_record(
+            await db_manager.insert_record(
                 "requirement_tasks",
                 {"requirement_id": "REQ-0001-FUNC-00", "task_id": f"TASK-{str(i + 1).zfill(4)}-00-00"},
             )
 
         with measure_time("Complex JOIN query"):
-            results = db_manager.execute_query(
+            results = await db_manager.execute_query(
                 """SELECT r.*, COUNT(rt.task_id) as task_count
                    FROM requirements r
                    LEFT JOIN requirement_tasks rt ON r.id = rt.requirement_id
@@ -181,7 +183,7 @@ class TestPerformanceBenchmarks:
 
         # Measure query performance
         with measure_time("Query 50 requirements"):
-            requirement_handler._query_requirements()  # Measure query performance
+            await requirement_handler._query_requirements()  # Measure query performance
 
         # Measure status updates
         update_times = []
@@ -226,18 +228,18 @@ class TestPerformanceBenchmarks:
 
         # Measure task queries
         with measure_time("Query 100 tasks"):
-            task_handler._query_tasks()  # Measure task queries
+            await task_handler._query_tasks()  # Measure task queries
 
         # Measure filtered queries
         with measure_time("Query tasks by assignee"):
-            task_handler._query_tasks(assignee="User5")  # Measure filtered queries
+            await task_handler._query_tasks(assignee="User5")  # Measure filtered queries
 
         # Measure task detail retrieval
         detail_times = []
         for i in range(10):
             task_id = f"TASK-{str(i + 1).zfill(4)}-00-00"
             start = time.perf_counter()
-            task_handler._get_task_details(task_id=task_id)  # Measure task detail retrieval
+            await task_handler._get_task_details(task_id=task_id)  # Measure task detail retrieval
             end = time.perf_counter()
             detail_times.append(end - start)
 
@@ -263,14 +265,14 @@ class TestPerformanceBenchmarks:
 
         # Measure concurrent requirement queries
         async def query_requirements():
-            return requirement_handler._query_requirements()
+            return await requirement_handler._query_requirements()
 
         with measure_time("10 concurrent requirement queries"):
             results = await asyncio.gather(*[query_requirements() for _ in range(10)])
 
         # Measure mixed concurrent operations
         async def mixed_operations():
-            # Mix of async and sync operations
+            # Mix of async operations
             async_tasks = [
                 task_handler._create_task(**benchmark_data["tasks"][0]),
                 requirement_handler._create_requirement(**benchmark_data["requirements"][0]),
@@ -280,11 +282,11 @@ class TestPerformanceBenchmarks:
             # Run async operations concurrently
             async_results = await asyncio.gather(*async_tasks)
 
-            # Run sync operations
+            # Run query operations
             sync_results = [
-                requirement_handler._query_requirements(),
-                requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00"),
-                task_handler._query_tasks(),
+                await requirement_handler._query_requirements(),
+                await requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00"),
+                await task_handler._query_tasks(),
             ]
 
             return async_results + sync_results
@@ -327,11 +329,11 @@ class TestPerformanceBenchmarks:
         assert "50 requirements" in result[0].text
         assert "100 tasks" in result[0].text
 
-    def test_database_index_performance(self, db_manager):
+    async def test_database_index_performance(self, db_manager):
         """Test that database indexes improve query performance"""
         # Insert many records
         for i in range(1000):
-            db_manager.insert_record(
+            await db_manager.insert_record(
                 "requirements",
                 {
                     "id": f"REQ-{str(i + 1).zfill(4)}-FUNC-00",
@@ -348,27 +350,29 @@ class TestPerformanceBenchmarks:
 
         # Query by indexed column (id) - should be fast
         with measure_time("Query by PRIMARY KEY (id)"):
-            result = db_manager.execute_query(
+            result = await db_manager.execute_query(
                 "SELECT * FROM requirements WHERE id = ?", ["REQ-0500-FUNC-00"], fetch_one=True
             )
         assert result is not None
 
         # Query by non-indexed column - compare performance
         with measure_time("Query by non-indexed column"):
-            results = db_manager.execute_query("SELECT * FROM requirements WHERE author = ?", ["Test"], fetch_all=True)
+            results = await db_manager.execute_query(
+                "SELECT * FROM requirements WHERE author = ?", ["Test"], fetch_all=True
+            )
         assert len(results) == 1000
 
         # The indexed query should be significantly faster
         # (actual timing comparison is informational)
 
     @pytest.mark.parametrize("record_count", [10, 100, 1000])
-    def test_scalability_with_increasing_data(self, db_manager, record_count):
+    async def test_scalability_with_increasing_data(self, db_manager, record_count):
         """Test performance scalability with increasing data volumes"""
         # Insert records
         insert_times = []
         for i in range(record_count):
             start = time.perf_counter()
-            db_manager.insert_record(
+            await db_manager.insert_record(
                 "requirements",
                 {
                     "id": f"REQ-{str(i + 1).zfill(4)}-FUNC-00",
@@ -388,7 +392,7 @@ class TestPerformanceBenchmarks:
 
         # Query all records
         with measure_time(f"Query {record_count} records"):
-            results = db_manager.execute_query("SELECT * FROM requirements", fetch_all=True)
+            results = await db_manager.execute_query("SELECT * FROM requirements", fetch_all=True)
 
         print(f"\n{record_count} records - Avg insert: {avg_insert:.4f}s")
 

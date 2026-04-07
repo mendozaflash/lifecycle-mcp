@@ -41,7 +41,7 @@ class TestArchitectureHandler:
         assert "ADR-0001" in result[0].text
 
         # Verify ADR was stored in database
-        records = architecture_handler.db.get_records("architecture", "*", "id = ?", ["ADR-0001"])
+        records = await architecture_handler.db.get_records("architecture", "*", "id = ?", ["ADR-0001"])
         assert len(records) == 1
         assert records[0]["title"] == "Test Architecture Decision"
         assert records[0]["context"] == "This is the context for the test decision"
@@ -76,25 +76,25 @@ class TestArchitectureHandler:
         # Note: In the current implementation, ADRs can be created without validating
         # requirement existence. Links are created but may be dangling.
 
-    def test_query_architecture_decisions_no_results(self, architecture_handler):
+    async def test_query_architecture_decisions_no_results(self, architecture_handler):
         """Test querying architecture decisions with no matches"""
-        result = architecture_handler._query_architecture_decisions(status="Nonexistent")
+        result = await architecture_handler._query_architecture_decisions(status="Nonexistent")
 
         assert len(result) == 1
         assert "INFO" in result[0].text
         assert "No architecture decisions found" in result[0].text
 
-    def test_get_architecture_details_not_found(self, architecture_handler):
+    async def test_get_architecture_details_not_found(self, architecture_handler):
         """Test getting details for non-existent ADR"""
-        result = architecture_handler._get_architecture_details(architecture_id="ADR-9999")
+        result = await architecture_handler._get_architecture_details(architecture_id="ADR-9999")
 
         assert len(result) == 1
         assert "ERROR" in result[0].text
         assert "Architecture decision not found" in result[0].text
 
-    def test_add_architecture_review_not_found(self, architecture_handler):
+    async def test_add_architecture_review_not_found(self, architecture_handler):
         """Test adding review to non-existent ADR"""
-        result = architecture_handler._add_architecture_review(architecture_id="ADR-9999", comment="Test review")
+        result = await architecture_handler._add_architecture_review(architecture_id="ADR-9999", comment="Test review")
 
         assert len(result) == 1
         assert "ERROR" in result[0].text

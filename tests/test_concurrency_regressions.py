@@ -29,10 +29,9 @@ class TestGetExistingRequirementsBroken:
     swallows the resulting AttributeError."""
 
     @pytest.mark.asyncio
-    async def test_returns_empty_despite_existing_requirements(self, db_manager, interview_handler):
-        """Bug: _get_existing_requirements always returns [] even when
-        the database contains requirements, because self.db_manager
-        raises AttributeError which is silently caught."""
+    async def test_returns_data_when_requirements_exist(self, db_manager, interview_handler):
+        """Fix verified: _get_existing_requirements now returns data when
+        requirements exist in the database (self.db_manager bug fixed)."""
         # Insert a requirement directly into the database (now async)
         await db_manager.insert_record(
             "requirements",
@@ -58,11 +57,11 @@ class TestGetExistingRequirementsBroken:
         )
         assert row is not None, "Requirement should exist in DB"
 
-        # Call the broken method — it should return data but returns []
+        # Fix verified: _get_existing_requirements now returns actual data
         result = await interview_handler._get_existing_requirements()
-        assert result == [], (
-            "Bug confirmation: _get_existing_requirements returns [] "
-            "even when requirements exist in the database"
+        assert len(result) > 0, (
+            "Fix verified: _get_existing_requirements returns data "
+            "when requirements exist in the database"
         )
 
     @pytest.mark.asyncio
@@ -297,18 +296,16 @@ class TestInterviewSessionConcurrency:
         # Verify it's NOT a full UUID (36 chars with dashes, 32 hex chars)
         assert len(session_id) < 32, "Session ID is truncated, not a full UUID"
 
-    def test_no_interview_lock_attribute(self, interview_handler):
-        """Bug: No asyncio.Lock protects interview_sessions dict.
-        Concurrent access can corrupt session state."""
-        assert not hasattr(interview_handler, "_interview_lock"), (
-            "Bug confirmation: no _interview_lock attribute exists"
+    def test_interview_lock_attribute_exists(self, interview_handler):
+        """Fix verified: asyncio.Lock now protects interview_sessions dict."""
+        assert hasattr(interview_handler, "_interview_lock"), (
+            "Fix verified: _interview_lock attribute exists for concurrency protection"
         )
 
-    def test_no_architectural_lock_attribute(self, interview_handler):
-        """Bug: No asyncio.Lock protects architectural_sessions dict.
-        Concurrent access can corrupt session state."""
-        assert not hasattr(interview_handler, "_architectural_lock"), (
-            "Bug confirmation: no _architectural_lock attribute exists"
+    def test_architectural_lock_attribute_exists(self, interview_handler):
+        """Fix verified: asyncio.Lock now protects architectural_sessions dict."""
+        assert hasattr(interview_handler, "_architectural_lock"), (
+            "Fix verified: _architectural_lock attribute exists for concurrency protection"
         )
 
     def test_session_dicts_are_plain_dict(self, interview_handler):

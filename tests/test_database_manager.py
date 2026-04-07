@@ -3,7 +3,6 @@ Unit tests for DatabaseManager
 """
 
 import os
-import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -31,52 +30,52 @@ class TestDatabaseManager:
         # Clean up
         os.unlink(db_path)
 
-    def test_get_connection_context_manager(self, db_manager):
-        """Test that get_connection works as context manager"""
-        with db_manager.get_connection() as conn:
-            assert isinstance(conn, sqlite3.Connection)
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            result = cursor.fetchone()
+    async def test_get_connection_context_manager(self, db_manager):
+        """Test that get_connection works as async context manager"""
+        async with db_manager.get_connection() as conn:
+            cursor = await conn.execute("SELECT 1")
+            result = await cursor.fetchone()
             assert result[0] == 1
 
-    def test_get_connection_with_row_factory(self, db_manager):
+    async def test_get_connection_with_row_factory(self, db_manager):
         """Test get_connection with row factory enabled"""
-        with db_manager.get_connection(row_factory=True) as conn:
-            assert conn.row_factory == sqlite3.Row
+        import aiosqlite
 
-    def test_execute_query_insert(self, db_manager):
+        async with db_manager.get_connection(row_factory=True) as conn:
+            assert conn.row_factory == aiosqlite.Row
+
+    async def test_execute_query_insert(self, db_manager):
         """Test execute_query for INSERT operations"""
         # Insert a test record with all required fields
-        result = db_manager.execute_query(
+        result = await db_manager.execute_query(
             "INSERT INTO requirements (id, requirement_number, type, title, priority, "
             "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
         )
         assert result is not None  # Should return row ID
 
-    def test_execute_query_select(self, db_manager):
+    async def test_execute_query_select(self, db_manager):
         """Test execute_query for SELECT operations"""
         # First insert a record with all required fields
-        db_manager.execute_query(
+        await db_manager.execute_query(
             "INSERT INTO requirements (id, requirement_number, type, title, priority, "
             "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
         )
 
         # Then select it
-        result = db_manager.execute_query(
+        result = await db_manager.execute_query(
             "SELECT id, title FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
         )
         assert result is not None
         assert result[0] == "REQ-0001-FUNC-00"
         assert result[1] == "Test Requirement"
 
-    def test_execute_query_select_all(self, db_manager):
+    async def test_execute_query_select_all(self, db_manager):
         """Test execute_query with fetch_all"""
         # Insert multiple records with all required fields
         for i in range(3):
-            db_manager.execute_query(
+            await db_manager.execute_query(
                 "INSERT INTO requirements (id, requirement_number, type, title, priority, "
                 "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
@@ -92,10 +91,12 @@ class TestDatabaseManager:
             )
 
         # Select all
-        results = db_manager.execute_query("SELECT id FROM requirements WHERE type = ?", ["FUNC"], fetch_all=True)
+        results = await db_manager.execute_query(
+            "SELECT id FROM requirements WHERE type = ?", ["FUNC"], fetch_all=True
+        )
         assert len(results) == 3
 
-    def test_execute_many(self, db_manager):
+    async def test_execute_many(self, db_manager):
         """Test execute_many for batch operations"""
         params_list = [
             ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement 1", "P1", "Current", "Desired", "Test Author"],
@@ -103,36 +104,36 @@ class TestDatabaseManager:
             ["REQ-0003-FUNC-00", 3, "FUNC", "Test Requirement 3", "P3", "Current", "Desired", "Test Author"],
         ]
 
-        db_manager.execute_many(
+        await db_manager.execute_many(
             "INSERT INTO requirements (id, requirement_number, type, title, priority, "
             "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params_list,
         )
 
         # Verify all records were inserted
-        count = db_manager.execute_query("SELECT COUNT(*) FROM requirements", fetch_one=True)
+        count = await db_manager.execute_query("SELECT COUNT(*) FROM requirements", fetch_one=True)
         assert count[0] == 3
 
-    def test_transaction_success(self, db_manager):
+    async def test_transaction_success(self, db_manager):
         """Test successful transaction"""
-        with db_manager.transaction() as cursor:
-            cursor.execute(
+        async with db_manager.transaction() as conn:
+            await conn.execute(
                 "INSERT INTO requirements (id, requirement_number, type, title, priority, "
                 "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
             )
 
         # Verify record was committed
-        result = db_manager.execute_query(
+        result = await db_manager.execute_query(
             "SELECT id FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
         )
         assert result is not None
 
-    def test_transaction_rollback(self, db_manager):
+    async def test_transaction_rollback(self, db_manager):
         """Test transaction rollback on exception"""
         try:
-            with db_manager.transaction() as cursor:
-                cursor.execute(
+            async with db_manager.transaction() as conn:
+                await conn.execute(
                     "INSERT INTO requirements (id, requirement_number, type, title, priority, "
                     "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
@@ -143,68 +144,101 @@ class TestDatabaseManager:
             pass
 
         # Verify record was not committed
-        result = db_manager.execute_query(
+        result = await db_manager.execute_query(
             "SELECT id FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
         )
         assert result is None
 
-    def test_get_next_id(self, db_manager):
-        """Test get_next_id functionality"""
-        # First ID should be 1
-        next_id = db_manager.get_next_id("requirements", "requirement_number")
+    async def test_insert_with_next_id(self, db_manager):
+        """Test insert_with_next_id functionality (replaces get_next_id)"""
+        # First insert should get ID 1
+        next_id = await db_manager.insert_with_next_id(
+            "requirements",
+            "requirement_number",
+            {
+                "id": "REQ-0001-FUNC-00",
+                "type": "FUNC",
+                "title": "Test Requirement",
+                "priority": "P1",
+                "current_state": "Current",
+                "desired_state": "Desired",
+                "author": "Test Author",
+            },
+        )
         assert next_id == 1
 
-        # Insert a record with all required fields
-        db_manager.execute_query(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
+        # Second insert should get ID 2
+        next_id = await db_manager.insert_with_next_id(
+            "requirements",
+            "requirement_number",
+            {
+                "id": "REQ-0002-FUNC-00",
+                "type": "FUNC",
+                "title": "Test Requirement 2",
+                "priority": "P1",
+                "current_state": "Current",
+                "desired_state": "Desired",
+                "author": "Test Author",
+            },
         )
-
-        # Next ID should be 2
-        next_id = db_manager.get_next_id("requirements", "requirement_number")
         assert next_id == 2
 
-    def test_get_next_id_with_filter(self, db_manager):
-        """Test get_next_id with WHERE clause"""
-        # Insert records of different types with all required fields
-        db_manager.execute_query(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
+    async def test_insert_with_next_id_with_filter(self, db_manager):
+        """Test insert_with_next_id with WHERE clause"""
+        # Insert FUNC requirement
+        next_id = await db_manager.insert_with_next_id(
+            "requirements",
+            "requirement_number",
+            {
+                "id": "REQ-0001-FUNC-00",
+                "type": "FUNC",
+                "title": "Test FUNC Requirement",
+                "priority": "P1",
+                "current_state": "Current",
+                "desired_state": "Desired",
+                "author": "Test Author",
+            },
+            "type = ?",
+            ["FUNC"],
         )
-        db_manager.execute_query(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ["REQ-0001-TECH-00", 1, "TECH", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
+        assert next_id == 1
+
+        # Insert TECH requirement - should also get ID 1 (different type filter)
+        next_id = await db_manager.insert_with_next_id(
+            "requirements",
+            "requirement_number",
+            {
+                "id": "REQ-0001-TECH-00",
+                "type": "TECH",
+                "title": "Test TECH Requirement",
+                "priority": "P1",
+                "current_state": "Current",
+                "desired_state": "Desired",
+                "author": "Test Author",
+            },
+            "type = ?",
+            ["TECH"],
         )
+        assert next_id == 1
 
-        # Next FUNC ID should be 2
-        next_id = db_manager.get_next_id("requirements", "requirement_number", "type = ?", ["FUNC"])
-        assert next_id == 2
-
-        # Next TECH ID should be 2
-        next_id = db_manager.get_next_id("requirements", "requirement_number", "type = ?", ["TECH"])
-        assert next_id == 2
-
-    def test_check_exists(self, db_manager):
+    async def test_check_exists(self, db_manager):
         """Test check_exists functionality"""
         # Should not exist initially
-        exists = db_manager.check_exists("requirements", "id = ?", ["REQ-0001-FUNC-00"])
+        exists = await db_manager.check_exists("requirements", "id = ?", ["REQ-0001-FUNC-00"])
         assert not exists
 
         # Insert record with all required fields
-        db_manager.execute_query(
+        await db_manager.execute_query(
             "INSERT INTO requirements (id, requirement_number, type, title, priority, "
             "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
         )
 
         # Should exist now
-        exists = db_manager.check_exists("requirements", "id = ?", ["REQ-0001-FUNC-00"])
+        exists = await db_manager.check_exists("requirements", "id = ?", ["REQ-0001-FUNC-00"])
         assert exists
 
-    def test_insert_record(self, db_manager):
+    async def test_insert_record(self, db_manager):
         """Test insert_record helper method"""
         data = {
             "id": "REQ-0001-FUNC-00",
@@ -217,19 +251,19 @@ class TestDatabaseManager:
             "author": "Test Author",
         }
 
-        row_id = db_manager.insert_record("requirements", data)
+        row_id = await db_manager.insert_record("requirements", data)
         assert row_id is not None
 
         # Verify record was inserted
-        result = db_manager.execute_query(
+        result = await db_manager.execute_query(
             "SELECT title FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
         )
         assert result[0] == "Test Requirement"
 
-    def test_update_record(self, db_manager):
+    async def test_update_record(self, db_manager):
         """Test update_record helper method"""
         # Insert initial record with all required fields
-        db_manager.insert_record(
+        await db_manager.insert_record(
             "requirements",
             {
                 "id": "REQ-0001-FUNC-00",
@@ -244,22 +278,22 @@ class TestDatabaseManager:
         )
 
         # Update record
-        db_manager.update_record(
+        await db_manager.update_record(
             "requirements", {"title": "Updated Title", "priority": "P2"}, "id = ?", ["REQ-0001-FUNC-00"]
         )
 
         # Verify update
-        result = db_manager.execute_query(
+        result = await db_manager.execute_query(
             "SELECT title, priority FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
         )
         assert result[0] == "Updated Title"
         assert result[1] == "P2"
 
-    def test_get_records(self, db_manager):
+    async def test_get_records(self, db_manager):
         """Test get_records helper method"""
         # Insert test data with all required fields
         for i in range(3):
-            db_manager.insert_record(
+            await db_manager.insert_record(
                 "requirements",
                 {
                     "id": f"REQ-000{i + 1}-FUNC-00",
@@ -274,10 +308,12 @@ class TestDatabaseManager:
             )
 
         # Get all records
-        records = db_manager.get_records("requirements", "*", "type = ?", ["FUNC"], "priority")
+        records = await db_manager.get_records("requirements", "*", "type = ?", ["FUNC"], "priority")
         assert len(records) == 3
         assert records[0]["title"] == "Test Requirement 1"  # Should be sorted by priority
 
         # Get limited records
-        records = db_manager.get_records("requirements", "id, title", "type = ?", ["FUNC"], "priority", limit=2)
+        records = await db_manager.get_records(
+            "requirements", "id, title", "type = ?", ["FUNC"], "priority", limit=2
+        )
         assert len(records) == 2

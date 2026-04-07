@@ -34,7 +34,7 @@ class TestRequirementHandler:
         assert "SUCCESS" in result[0].text  # Check for above-fold format
 
         # Verify requirement was stored in database
-        records = requirement_handler.db.get_records("requirements", "*", "id = ?", ["REQ-0001-FUNC-00"])
+        records = await requirement_handler.db.get_records("requirements", "*", "id = ?", ["REQ-0001-FUNC-00"])
         assert len(records) == 1
         assert records[0]["title"] == "Test Requirement"
         assert records[0]["type"] == "FUNC"
@@ -70,7 +70,9 @@ class TestRequirementHandler:
         assert "SUCCESS" in result[0].text  # Check for above-fold format
 
         # Verify status was updated
-        records = requirement_handler.db.get_records("requirements", "status", "id = ?", ["REQ-0001-FUNC-00"])
+        records = await requirement_handler.db.get_records(
+            "requirements", "status", "id = ?", ["REQ-0001-FUNC-00"]
+        )
         assert records[0]["status"] == "Under Review"
 
     @pytest.mark.asyncio
@@ -108,7 +110,7 @@ class TestRequirementHandler:
             data["title"] = f"Test Requirement {i + 1}"
             await requirement_handler._create_requirement(**data)
 
-        result = requirement_handler._query_requirements()
+        result = await requirement_handler._query_requirements()
 
         assert len(result) == 1
         assert "SUCCESS" in result[0].text  # Check for above-fold format
@@ -132,14 +134,14 @@ class TestRequirementHandler:
         await requirement_handler._create_requirement(**data2)
 
         # Query by priority
-        result = requirement_handler._query_requirements(priority="P0")
+        result = await requirement_handler._query_requirements(priority="P0")
         assert len(result) == 1
         assert "SUCCESS" in result[0].text  # Check for above-fold format
         assert "1 requirement" in result[0].text
         assert "High Priority Requirement" in result[0].text
 
         # Query by status
-        result = requirement_handler._query_requirements(status="Draft")
+        result = await requirement_handler._query_requirements(status="Draft")
         assert len(result) == 1
         assert "SUCCESS" in result[0].text  # Check for above-fold format
         assert "2 requirement" in result[0].text
@@ -157,15 +159,15 @@ class TestRequirementHandler:
         await requirement_handler._create_requirement(**data2)
 
         # Search by title
-        result = requirement_handler._query_requirements(search_text="Authentication")
+        result = await requirement_handler._query_requirements(search_text="Authentication")
         assert len(result) == 1
         assert "SUCCESS" in result[0].text  # Check for above-fold format
         assert "1 requirement" in result[0].text
         assert "User Authentication System" in result[0].text
 
-    def test_query_requirements_no_results(self, requirement_handler):
+    async def test_query_requirements_no_results(self, requirement_handler):
         """Test querying requirements with no matches"""
-        result = requirement_handler._query_requirements(status="Nonexistent")
+        result = await requirement_handler._query_requirements(status="Nonexistent")
 
         assert len(result) == 1
         assert "INFO" in result[0].text  # Check for above-fold format
@@ -177,7 +179,7 @@ class TestRequirementHandler:
         # Create requirement
         await requirement_handler._create_requirement(**sample_requirement_data)
 
-        result = requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00")
+        result = await requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00")
 
         assert len(result) == 1
         assert "INFO" in result[0].text  # Check for above-fold format
@@ -190,9 +192,9 @@ class TestRequirementHandler:
         assert "Desired test state" in details
         assert "Test business value" in details
 
-    def test_get_requirement_details_not_found(self, requirement_handler):
+    async def test_get_requirement_details_not_found(self, requirement_handler):
         """Test getting details for non-existent requirement"""
-        result = requirement_handler._get_requirement_details(requirement_id="REQ-9999-FUNC-00")
+        result = await requirement_handler._get_requirement_details(requirement_id="REQ-9999-FUNC-00")
 
         assert len(result) == 1
         assert "ERROR" in result[0].text  # Check for above-fold format
@@ -204,7 +206,7 @@ class TestRequirementHandler:
         # Create requirement
         await requirement_handler._create_requirement(**sample_requirement_data)
 
-        result = requirement_handler._trace_requirement(requirement_id="REQ-0001-FUNC-00")
+        result = await requirement_handler._trace_requirement(requirement_id="REQ-0001-FUNC-00")
 
         assert len(result) == 1
         assert "INFO" in result[0].text  # Check for above-fold format
@@ -213,9 +215,9 @@ class TestRequirementHandler:
         assert "Test Requirement" in trace
         assert "Implementation Tasks (0)" in trace  # No tasks linked yet
 
-    def test_trace_requirement_not_found(self, requirement_handler):
+    async def test_trace_requirement_not_found(self, requirement_handler):
         """Test tracing non-existent requirement"""
-        result = requirement_handler._trace_requirement(requirement_id="REQ-9999-FUNC-00")
+        result = await requirement_handler._trace_requirement(requirement_id="REQ-9999-FUNC-00")
 
         assert len(result) == 1
         assert "ERROR" in result[0].text  # Check for above-fold format
@@ -242,7 +244,7 @@ class TestRequirementHandler:
         await requirement_handler._create_requirement(**sample_requirement_data)
 
         # Get details and verify functional requirements appear
-        result = requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00")
+        result = await requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00")
         details = result[0].text
 
         assert "Functional Requirements" in details
@@ -256,7 +258,7 @@ class TestRequirementHandler:
         await requirement_handler._create_requirement(**sample_requirement_data)
 
         # Get details and verify acceptance criteria appear
-        result = requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00")
+        result = await requirement_handler._get_requirement_details(requirement_id="REQ-0001-FUNC-00")
         details = result[0].text
 
         assert "Acceptance Criteria" in details

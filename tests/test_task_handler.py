@@ -47,14 +47,14 @@ class TestTaskHandler:
         assert "TASK-0001-00-00" in result[0].text
 
         # Verify task was stored in database
-        records = task_handler.db.get_records("tasks", "*", "id = ?", ["TASK-0001-00-00"])
+        records = await task_handler.db.get_records("tasks", "*", "id = ?", ["TASK-0001-00-00"])
         assert len(records) == 1
         assert records[0]["title"] == "Test Task"
         assert records[0]["priority"] == "P1"
         assert records[0]["effort"] == "M"
 
         # Verify task-requirement link was created
-        links = task_handler.db.get_records("requirement_tasks", "*", "task_id = ?", ["TASK-0001-00-00"])
+        links = await task_handler.db.get_records("requirement_tasks", "*", "task_id = ?", ["TASK-0001-00-00"])
         assert len(links) == 1
         assert links[0]["requirement_id"] == "REQ-0001-FUNC-00"
 
@@ -96,7 +96,7 @@ class TestTaskHandler:
         assert "TASK-0001-00-00" in result[0].text
 
         # Verify status and assignee were updated
-        records = task_handler.db.get_records("tasks", "status, assignee", "id = ?", ["TASK-0001-00-00"])
+        records = await task_handler.db.get_records("tasks", "status, assignee", "id = ?", ["TASK-0001-00-00"])
         assert records[0]["status"] == "In Progress"
         assert records[0]["assignee"] == "New Assignee"
 
@@ -109,18 +109,18 @@ class TestTaskHandler:
         assert "ERROR" in result[0].text  # Check for above-fold format
         assert "Task not found" in result[0].text
 
-    def test_query_tasks_no_results(self, task_handler):
+    async def test_query_tasks_no_results(self, task_handler):
         """Test querying tasks with no matches"""
-        result = task_handler._query_tasks(status="Nonexistent")
+        result = await task_handler._query_tasks(status="Nonexistent")
 
         assert len(result) == 1
         assert "INFO" in result[0].text  # Check for above-fold format
         assert "No tasks found" in result[0].text
         assert "Try adjusting search criteria" in result[0].text
 
-    def test_get_task_details_not_found(self, task_handler):
+    async def test_get_task_details_not_found(self, task_handler):
         """Test getting details for non-existent task"""
-        result = task_handler._get_task_details(task_id="TASK-9999-00-00")
+        result = await task_handler._get_task_details(task_id="TASK-9999-00-00")
 
         assert len(result) == 1
         assert "ERROR" in result[0].text  # Check for above-fold format
@@ -167,5 +167,5 @@ class TestTaskHandler:
         assert "Approved, Architecture, Implemented, Ready, Validated" in result[0].text
 
         # Verify no task was created
-        tasks = task_handler.db.get_records("tasks", "*", "", [])
+        tasks = await task_handler.db.get_records("tasks", "*", "", [])
         assert len(tasks) == 0

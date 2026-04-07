@@ -73,7 +73,7 @@ class TestPropertyBasedValidation:
 
         # Verify data was stored correctly
         req_id = result[0].text.split()[2]  # Extract REQ-XXXX-TYPE-VV
-        details = requirement_handler._get_requirement_details(requirement_id=req_id)
+        details = await requirement_handler._get_requirement_details(requirement_id=req_id)
 
         # Check that lists are preserved
         details_text = details[0].text
@@ -157,6 +157,7 @@ class RequirementLifecycleStateMachine(RuleBasedStateMachine):
             conn.close()
 
         self.db_manager = DatabaseManager(db_path)
+        await self.db_manager.initialize()
         self.handler = RequirementHandler(self.db_manager)
         self.temp_db_path = db_path
 
@@ -228,10 +229,10 @@ class RequirementLifecycleStateMachine(RuleBasedStateMachine):
             assert "Invalid transition" in result[0].text
 
     @invariant()
-    def status_consistency(self):
+    async def status_consistency(self):
         """Invariant: All requirements in our state match the database"""
         for req_id, expected_status in self.requirements.items():
-            records = self.db_manager.get_records("requirements", "status", "id = ?", [req_id])
+            records = await self.db_manager.get_records("requirements", "status", "id = ?", [req_id])
             if records:
                 assert records[0]["status"] == expected_status
 
@@ -255,9 +256,9 @@ async def test_project_metrics_consistency(
 ):
     """Test that project metrics remain consistent regardless of data volume"""
     # Clear any existing data to ensure clean state for each hypothesis example
-    db_manager.execute_query("DELETE FROM requirement_tasks")
-    db_manager.execute_query("DELETE FROM tasks")
-    db_manager.execute_query("DELETE FROM requirements")
+    await db_manager.execute_query("DELETE FROM requirement_tasks")
+    await db_manager.execute_query("DELETE FROM tasks")
+    await db_manager.execute_query("DELETE FROM requirements")
 
     created_reqs = []
 
@@ -287,15 +288,15 @@ async def test_project_metrics_consistency(
             total_tasks += 1
 
     # Verify counts
-    req_count = db_manager.execute_query("SELECT COUNT(*) FROM requirements", fetch_one=True)[0]
-    task_count = db_manager.execute_query("SELECT COUNT(*) FROM tasks", fetch_one=True)[0]
+    req_count = (await db_manager.execute_query("SELECT COUNT(*) FROM requirements", fetch_one=True))[0]
+    task_count = (await db_manager.execute_query("SELECT COUNT(*) FROM tasks", fetch_one=True))[0]
 
     assert req_count == num_requirements
     assert task_count == total_tasks
 
     # Verify each requirement has correct task count
     for req_id in created_reqs:
-        req_tasks = db_manager.execute_query(
+        req_tasks = (await db_manager.execute_query(
             "SELECT COUNT(*) FROM requirement_tasks WHERE requirement_id = ?", [req_id], fetch_one=True
-        )[0]
+        ))[0]
         assert req_tasks == num_tasks_per_req

@@ -17,9 +17,9 @@ class TestStatusHandler:
         tool_names = [tool["name"] for tool in tools]
         assert "get_project_status" in tool_names
 
-    def test_get_project_status_empty_project(self, status_handler):
+    async def test_get_project_status_empty_project(self, status_handler):
         """Test getting status for empty project"""
-        result = status_handler._get_project_status()
+        result = await status_handler._get_project_status()
 
         assert len(result) == 1
         assert "INFO" in result[0].text
@@ -57,7 +57,7 @@ class TestStatusHandler:
                         requirement_id=f"REQ-000{i + 1}-FUNC-00", new_status="Approved"
                     )
 
-        result = status_handler._get_project_status()
+        result = await status_handler._get_project_status()
 
         assert len(result) == 1
         text = result[0].text
@@ -91,9 +91,9 @@ class TestStatusHandler:
         assert len(result) == 1
         assert "Unknown tool: unknown_tool" in result[0].text
 
-    def test_empty_project_messaging(self, status_handler):
+    async def test_empty_project_messaging(self, status_handler):
         """Test helpful messaging for empty projects"""
-        result = status_handler._get_project_status()
+        result = await status_handler._get_project_status()
 
         text = result[0].text
 

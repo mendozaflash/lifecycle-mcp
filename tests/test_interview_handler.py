@@ -102,9 +102,9 @@ class TestInterviewHandler:
         assert len(result) == 1
         assert "ERROR" in result[0].text
 
-    def test_start_architectural_conversation_success(self, interview_handler):
+    async def test_start_architectural_conversation_success(self, interview_handler):
         """Test starting an architectural conversation"""
-        result = interview_handler._start_architectural_conversation(
+        result = await interview_handler._start_architectural_conversation(
             project_context="Microservices migration",
             diagram_purpose="Show service boundaries",
             complexity_level="medium",
@@ -117,12 +117,12 @@ class TestInterviewHandler:
         # Should provide guidance based on complexity
         assert "medium" in result[0].text or "Medium" in result[0].text
 
-    def test_start_architectural_conversation_complexity_levels(self, interview_handler):
+    async def test_start_architectural_conversation_complexity_levels(self, interview_handler):
         """Test different complexity levels for architectural conversations"""
         complexity_levels = ["simple", "medium", "complex"]
 
         for level in complexity_levels:
-            result = interview_handler._start_architectural_conversation(
+            result = await interview_handler._start_architectural_conversation(
                 project_context="Test project", diagram_purpose="Test diagram", complexity_level=level
             )
 
@@ -139,7 +139,7 @@ class TestInterviewHandler:
     async def test_continue_architectural_conversation_success(self, interview_handler):
         """Test continuing an architectural conversation"""
         # Start conversation first
-        start_result = interview_handler._start_architectural_conversation(
+        start_result = await interview_handler._start_architectural_conversation(
             project_context="API Gateway design", diagram_purpose="Show request flow"
         )
 
@@ -160,7 +160,7 @@ class TestInterviewHandler:
             session_id = session_match.group(1)
 
         # Continue with responses
-        result = interview_handler._continue_architectural_conversation(
+        result = await interview_handler._continue_architectural_conversation(
             session_id=session_id,
             responses={
                 "components": ["API Gateway", "Auth Service", "User Service"],
@@ -229,7 +229,7 @@ class TestInterviewHandler:
     async def test_architectural_conversation_generates_diagram_spec(self, interview_handler):
         """Test that architectural conversation produces diagram specification"""
         # Start conversation
-        start_result = interview_handler._start_architectural_conversation(
+        start_result = await interview_handler._start_architectural_conversation(
             project_context="Event-driven architecture",
             diagram_purpose="Show event flow between services",
             complexity_level="complex",
@@ -259,7 +259,9 @@ class TestInterviewHandler:
             "scalability": "Each service can scale independently",
         }
 
-        result = interview_handler._continue_architectural_conversation(session_id=session_id, responses=responses)
+        result = await interview_handler._continue_architectural_conversation(
+            session_id=session_id, responses=responses
+        )
 
         assert len(result) == 1
         text = result[0].text

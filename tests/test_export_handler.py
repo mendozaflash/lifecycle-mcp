@@ -21,10 +21,10 @@ class TestExportHandler:
         expected_tools = ["export_project_documentation", "create_architectural_diagrams"]
         assert all(tool in tool_names for tool in expected_tools)
 
-    def test_export_project_documentation_empty_project(self, export_handler):
+    async def test_export_project_documentation_empty_project(self, export_handler):
         """Test exporting documentation for empty project"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._export_project_documentation(
+            result = await export_handler._export_project_documentation(
                 output_directory=temp_dir, project_name="test_project"
             )
 
@@ -66,7 +66,7 @@ class TestExportHandler:
         await architecture_handler._create_architecture_decision(**sample_architecture_data)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._export_project_documentation(
+            result = await export_handler._export_project_documentation(
                 output_directory=temp_dir,
                 project_name="test_project",
                 include_requirements=True,
@@ -98,7 +98,7 @@ class TestExportHandler:
 
         with tempfile.TemporaryDirectory() as temp_dir:
             # Export only requirements
-            result = export_handler._export_project_documentation(
+            result = await export_handler._export_project_documentation(
                 output_directory=temp_dir,
                 project_name="test_project",
                 include_requirements=True,
@@ -119,9 +119,9 @@ class TestExportHandler:
             assert "Test Requirement" in content
             assert "Tasks" not in content or "No tasks" in content
 
-    def test_export_project_documentation_invalid_directory(self, export_handler):
+    async def test_export_project_documentation_invalid_directory(self, export_handler):
         """Test export with invalid directory"""
-        result = export_handler._export_project_documentation(
+        result = await export_handler._export_project_documentation(
             output_directory="/invalid/path/that/does/not/exist", project_name="test_project"
         )
 
@@ -141,7 +141,9 @@ class TestExportHandler:
             await requirement_handler._create_requirement(**data)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._create_architectural_diagrams(diagram_type="requirements", output_path=temp_dir)
+            result = await export_handler._create_architectural_diagrams(
+                diagram_type="requirements", output_path=temp_dir
+            )
 
             assert len(result) == 1
             assert "SUCCESS" in result[0].text
@@ -178,7 +180,7 @@ class TestExportHandler:
         await task_handler._create_task(**subtask_data)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._create_architectural_diagrams(diagram_type="tasks", output_path=temp_dir)
+            result = await export_handler._create_architectural_diagrams(diagram_type="tasks", output_path=temp_dir)
 
             assert len(result) == 1
             assert "SUCCESS" in result[0].text
@@ -213,7 +215,7 @@ class TestExportHandler:
         await architecture_handler._create_architecture_decision(**sample_architecture_data)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._create_architectural_diagrams(
+            result = await export_handler._create_architectural_diagrams(
                 diagram_type="full_project", output_path=temp_dir, include_relationships=True
             )
 
@@ -243,7 +245,7 @@ class TestExportHandler:
         await requirement_handler._create_requirement(**req_data2)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._create_architectural_diagrams(
+            result = await export_handler._create_architectural_diagrams(
                 diagram_type="requirements", output_path=temp_dir, requirement_ids=["REQ-0001-FUNC-00"]
             )
 
@@ -261,7 +263,9 @@ class TestExportHandler:
     async def test_create_architectural_diagrams_invalid_type(self, export_handler):
         """Test creating diagram with invalid type"""
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._create_architectural_diagrams(diagram_type="invalid_type", output_path=temp_dir)
+            result = await export_handler._create_architectural_diagrams(
+                diagram_type="invalid_type", output_path=temp_dir
+            )
 
             assert len(result) == 1
             assert "ERROR" in result[0].text
@@ -294,7 +298,7 @@ class TestExportHandler:
         await requirement_handler._create_requirement(**req_data)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = export_handler._export_project_documentation(
+            result = await export_handler._export_project_documentation(
                 output_directory=temp_dir, project_name="test_project"
             )
 

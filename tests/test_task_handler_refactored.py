@@ -239,7 +239,7 @@ class TestTaskHandlerRefactored:
 
         # Query with filter
         query_params = {filter_type: filter_value}
-        result = task_handler._query_tasks(**query_params)
+        result = await task_handler._query_tasks(**query_params)
 
         assert len(result) == 1
         assert f"{expected_count} task" in result[0].text
@@ -275,7 +275,7 @@ class TestTaskHandlerRefactored:
             await task_handler._create_task(**subtask_data)
 
             # Get parent details
-            result = task_handler._get_task_details(task_id="TASK-0001-00-00")
+            result = await task_handler._get_task_details(task_id="TASK-0001-00-00")
             assert "Subtasks" in result[0].text
             assert "TASK-0001-01-00" in result[0].text
 
@@ -283,13 +283,13 @@ class TestTaskHandlerRefactored:
             # Only test parent relationship if subtask was created
             if include_subtasks:
                 # Get subtask details
-                result = task_handler._get_task_details(task_id="TASK-0001-01-00")
+                result = await task_handler._get_task_details(task_id="TASK-0001-01-00")
                 assert "Parent Task" in result[0].text
                 assert "TASK-0001-00-00" in result[0].text
 
         if include_requirements:
             # Get task details with requirements
-            result = task_handler._get_task_details(task_id="TASK-0001-00-00")
+            result = await task_handler._get_task_details(task_id="TASK-0001-00-00")
             assert "REQ-0001-FUNC-00" in result[0].text
 
     @pytest.mark.asyncio
@@ -305,7 +305,7 @@ class TestTaskHandlerRefactored:
 
         # Verify effort was stored
         task_id = "TASK-0001-00-00"
-        details = task_handler._get_task_details(task_id=task_id)
+        details = await task_handler._get_task_details(task_id=task_id)
         assert effort in details[0].text
 
     @pytest.mark.asyncio

@@ -75,7 +75,6 @@ class DatabaseManager:
             try:
                 conn = sqlite3.connect(self.db_path)
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA foreign_keys=ON")
                 cursor = conn.cursor()
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
                 needs_schema = cursor.fetchone() is None
@@ -94,7 +93,6 @@ class DatabaseManager:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA foreign_keys=ON")
                 schema_path = Path(__file__).parent / "lifecycle-schema.sql"
                 if schema_path.exists():
                     with open(schema_path, encoding="utf-8") as fh:
@@ -122,7 +120,10 @@ class DatabaseManager:
             conn = await aiosqlite.connect(self.db_path, timeout=self.timeout)
             # Optimized PRAGMAs
             await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA foreign_keys=ON")
+            # Note: foreign_keys=ON is intentionally omitted. Migration 7
+            # rebuilds the tasks table via ALTER TABLE RENAME which breaks
+            # SQLite FK metadata for requirement_tasks. The old sync
+            # ConnectionPool also never enforced FK constraints.
             await conn.execute("PRAGMA synchronous=NORMAL")
             await conn.execute("PRAGMA cache_size=10000")
             await conn.execute("PRAGMA temp_store=MEMORY")

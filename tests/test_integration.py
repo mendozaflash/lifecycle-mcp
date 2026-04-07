@@ -23,7 +23,7 @@ class TestMCPServerIntegration:
     """Integration tests for the complete MCP server"""
 
     @pytest.fixture
-    def server_instance(self):
+    async def server_instance(self):
         """
         Create a server instance with properly initialized temporary database.
 
@@ -45,11 +45,14 @@ class TestMCPServerIntegration:
                 # Create server instance
                 server = LifecycleMCPServer()
 
+                # Initialize the async connection pool
+                await server.db_manager.initialize()
+
                 # Verify database was properly initialized
-                with server.db_manager.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                    tables = [row[0] for row in cursor.fetchall()]
+                async with server.db_manager.get_connection() as conn:
+                    cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                    rows = await cursor.fetchall()
+                    tables = [row[0] for row in rows]
 
                     required_tables = ["requirements", "tasks", "architecture", "requirement_tasks"]
                     for table in required_tables:
@@ -69,7 +72,7 @@ class TestMCPServerIntegration:
 
                 # Close database connections properly
                 if hasattr(server, "db_manager"):
-                    server.db_manager.close()
+                    await server.db_manager.close()
 
     def test_server_initialization(self, server_instance):
         """Test that server initializes correctly with all handlers"""
@@ -185,13 +188,9 @@ class TestMCPServerIntegration:
             assert "SUCCESS" in req_update_result[0].text
 
         # 7. Verify final state with trace
-        trace_result = server.requirement_handler.handle_tool_call(
+        trace_result = await server.requirement_handler.handle_tool_call(
             "trace_requirement", {"requirement_id": "REQ-0001-FUNC-00"}
         )
-
-        # Handle sync trace_requirement call
-        if asyncio.iscoroutine(trace_result):
-            trace_result = await trace_result
 
         assert len(trace_result) == 1
         trace_text = trace_result[0].text
