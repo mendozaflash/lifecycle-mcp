@@ -80,15 +80,15 @@ class ExportHandler(BaseHandler):
         """Route tool calls to appropriate handler methods"""
         try:
             if tool_name == "export_project_documentation":
-                return self._export_project_documentation(**arguments)
+                return await self._export_project_documentation(**arguments)
             elif tool_name == "create_architectural_diagrams":
-                return self._create_architectural_diagrams(**arguments)
+                return await self._create_architectural_diagrams(**arguments)
             else:
                 return self._create_error_response(f"Unknown tool: {tool_name}")
         except Exception as e:
             return self._create_error_response(f"Error handling {tool_name}", e)
 
-    def _export_project_documentation(self, **params) -> list[TextContent]:
+    async def _export_project_documentation(self, **params) -> list[TextContent]:
         """Export comprehensive project documentation in markdown format"""
         try:
             project_name = params.get("project_name", "project")
@@ -100,13 +100,13 @@ class ExportHandler(BaseHandler):
             exported_files = []
 
             if params.get("include_requirements", True):
-                exported_files.extend(self._export_requirements(project_name, output_dir))
+                exported_files.extend(await self._export_requirements(project_name, output_dir))
 
             if params.get("include_tasks", True):
-                exported_files.extend(self._export_tasks(project_name, output_dir))
+                exported_files.extend(await self._export_tasks(project_name, output_dir))
 
             if params.get("include_architecture", True):
-                exported_files.extend(self._export_architecture(project_name, output_dir))
+                exported_files.extend(await self._export_architecture(project_name, output_dir))
 
             if exported_files:
                 # Create above-the-fold response for successful export
@@ -122,9 +122,9 @@ class ExportHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to export project documentation", e)
 
-    def _export_requirements(self, project_name: str, output_dir: str) -> list[str]:
+    async def _export_requirements(self, project_name: str, output_dir: str) -> list[str]:
         """Export requirements to markdown file"""
-        requirements = self.db.get_records("requirements", "*", order_by="type, requirement_number")
+        requirements = await self.db.get_records("requirements", "*", order_by="type, requirement_number")
 
         if not requirements:
             return []
@@ -183,9 +183,9 @@ class ExportHandler(BaseHandler):
 
         return [filename]
 
-    def _export_tasks(self, project_name: str, output_dir: str) -> list[str]:
+    async def _export_tasks(self, project_name: str, output_dir: str) -> list[str]:
         """Export tasks to markdown file"""
-        tasks = self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
+        tasks = await self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
 
         if not tasks:
             return []
@@ -227,7 +227,7 @@ class ExportHandler(BaseHandler):
                         content += "\n"
 
                 # Get linked requirements
-                linked_reqs = self.db.execute_query(
+                linked_reqs = await self.db.execute_query(
                     """
                     SELECT r.id, r.title FROM requirements r
                     JOIN requirement_tasks rt ON r.id = rt.requirement_id
@@ -251,9 +251,9 @@ class ExportHandler(BaseHandler):
 
         return [filename]
 
-    def _export_architecture(self, project_name: str, output_dir: str) -> list[str]:
+    async def _export_architecture(self, project_name: str, output_dir: str) -> list[str]:
         """Export architecture decisions to markdown file"""
-        architecture = self.db.get_records("architecture", "*", order_by="created_at DESC")
+        architecture = await self.db.get_records("architecture", "*", order_by="created_at DESC")
 
         if not architecture:
             return []
@@ -307,7 +307,7 @@ class ExportHandler(BaseHandler):
                     content += "\n"
 
             # Get linked requirements
-            linked_reqs = self.db.execute_query(
+            linked_reqs = await self.db.execute_query(
                 """
                 SELECT r.id, r.title FROM requirements r
                 JOIN relationships ra ON r.id = ra.source_id AND ra.source_type='requirement' AND ra.target_type='architecture'
@@ -331,7 +331,7 @@ class ExportHandler(BaseHandler):
 
         return [filename]
 
-    def _create_architectural_diagrams(self, **params) -> list[TextContent]:
+    async def _create_architectural_diagrams(self, **params) -> list[TextContent]:
         """Generate Mermaid diagrams for project architecture"""
         # Check if interactive mode is requested
         if params.get("interactive", False):
@@ -367,17 +367,17 @@ class ExportHandler(BaseHandler):
             requirement_ids = params.get("requirement_ids", [])
 
             if diagram_type == "requirements":
-                mermaid_content = self._generate_requirements_diagram(requirement_ids)
+                mermaid_content = await self._generate_requirements_diagram(requirement_ids)
             elif diagram_type == "tasks":
-                mermaid_content = self._generate_tasks_diagram(requirement_ids)
+                mermaid_content = await self._generate_tasks_diagram(requirement_ids)
             elif diagram_type == "architecture":
-                mermaid_content = self._generate_architecture_diagram(requirement_ids)
+                mermaid_content = await self._generate_architecture_diagram(requirement_ids)
             elif diagram_type == "full_project":
-                mermaid_content = self._generate_full_project_diagram(include_relationships, requirement_ids)
+                mermaid_content = await self._generate_full_project_diagram(include_relationships, requirement_ids)
             elif diagram_type == "directory_structure":
                 mermaid_content = self._generate_directory_structure_diagram()
             elif diagram_type == "dependencies":
-                mermaid_content = self._generate_dependencies_diagram(requirement_ids)
+                mermaid_content = await self._generate_dependencies_diagram(requirement_ids)
 
             if not mermaid_content:
                 return self._create_above_fold_response(
@@ -426,19 +426,19 @@ class ExportHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to create architectural diagram", e)
 
-    def _generate_requirements_diagram(self, requirement_ids: list[str] = None) -> str:
+    async def _generate_requirements_diagram(self, requirement_ids: list[str] = None) -> str:
         """Generate requirements flowchart"""
         if requirement_ids:
             # Filter specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
-            requirements = self.db.execute_query(
+            requirements = await self.db.execute_query(
                 f"SELECT * FROM requirements WHERE id IN ({placeholders}) ORDER BY type, requirement_number",
                 requirement_ids,
                 fetch_all=True,
                 row_factory=True,
             )
         else:
-            requirements = self.db.get_records("requirements", "*", order_by="type, requirement_number")
+            requirements = await self.db.get_records("requirements", "*", order_by="type, requirement_number")
 
         if not requirements:
             return ""
@@ -478,12 +478,12 @@ class ExportHandler(BaseHandler):
 
         return mermaid_content
 
-    def _generate_tasks_diagram(self, requirement_ids: list[str] = None) -> str:
+    async def _generate_tasks_diagram(self, requirement_ids: list[str] = None) -> str:
         """Generate task hierarchy diagram"""
         if requirement_ids:
             # Get tasks for specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
-            tasks = self.db.execute_query(
+            tasks = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT t.* FROM tasks t
                 JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -495,7 +495,7 @@ class ExportHandler(BaseHandler):
                 row_factory=True,
             )
         else:
-            tasks = self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
+            tasks = await self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
 
         if not tasks:
             return ""
@@ -518,7 +518,7 @@ class ExportHandler(BaseHandler):
             mermaid_content += f"    style {node_id} {status_color}\n"
 
             # Add parent-child relationships
-            parent_rels = self.db.execute_query(
+            parent_rels = await self.db.execute_query(
                 """
                 SELECT target_id FROM relationships
                 WHERE source_id = ? AND source_type='task' AND target_type='task' AND relationship_type='parent'
@@ -533,12 +533,12 @@ class ExportHandler(BaseHandler):
 
         return mermaid_content
 
-    def _generate_architecture_diagram(self, requirement_ids: list[str] = None) -> str:
+    async def _generate_architecture_diagram(self, requirement_ids: list[str] = None) -> str:
         """Generate architecture decisions diagram"""
         if requirement_ids:
             # Get architecture decisions for specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
-            architecture = self.db.execute_query(
+            architecture = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT a.* FROM architecture a
                 JOIN relationships ra ON a.id = ra.target_id AND ra.source_type='requirement' AND ra.target_type='architecture'
@@ -550,7 +550,7 @@ class ExportHandler(BaseHandler):
                 row_factory=True,
             )
         else:
-            architecture = self.db.get_records("architecture", "*", order_by="created_at DESC")
+            architecture = await self.db.get_records("architecture", "*", order_by="created_at DESC")
 
         if not architecture:
             return ""
@@ -573,18 +573,18 @@ class ExportHandler(BaseHandler):
 
         return mermaid_content
 
-    def _generate_full_project_diagram(self, include_relationships: bool, requirement_ids: list[str] = None) -> str:
+    async def _generate_full_project_diagram(self, include_relationships: bool, requirement_ids: list[str] = None) -> str:
         """Generate full project overview diagram"""
         if requirement_ids:
             # Filter to specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
-            requirements = self.db.execute_query(
+            requirements = await self.db.execute_query(
                 f"SELECT * FROM requirements WHERE id IN ({placeholders}) ORDER BY type, requirement_number",
                 requirement_ids,
                 fetch_all=True,
                 row_factory=True,
             )
-            tasks = self.db.execute_query(
+            tasks = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT t.* FROM tasks t
                 JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -595,7 +595,7 @@ class ExportHandler(BaseHandler):
                 fetch_all=True,
                 row_factory=True,
             )
-            architecture = self.db.execute_query(
+            architecture = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT a.* FROM architecture a
                 JOIN relationships ra ON a.id = ra.target_id AND ra.source_type='requirement' AND ra.target_type='architecture'
@@ -607,9 +607,9 @@ class ExportHandler(BaseHandler):
                 row_factory=True,
             )
         else:
-            requirements = self.db.get_records("requirements", "*", order_by="type, requirement_number")
-            tasks = self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
-            architecture = self.db.get_records("architecture", "*", order_by="created_at DESC")
+            requirements = await self.db.get_records("requirements", "*", order_by="type, requirement_number")
+            tasks = await self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
+            architecture = await self.db.get_records("architecture", "*", order_by="created_at DESC")
 
         mermaid_content = "flowchart TD\n"
         mermaid_content += "    Requirements[Requirements]\n"
@@ -639,7 +639,7 @@ class ExportHandler(BaseHandler):
 
         # Add relationships if requested
         if include_relationships:
-            req_tasks = self.db.execute_query(
+            req_tasks = await self.db.execute_query(
                 """
                 SELECT rt.requirement_id, rt.task_id
                 FROM requirement_tasks rt
@@ -667,12 +667,12 @@ class ExportHandler(BaseHandler):
     Root --> Docs
     Root --> Tests"""
 
-    def _generate_dependencies_diagram(self, requirement_ids: list[str] = None) -> str:
+    async def _generate_dependencies_diagram(self, requirement_ids: list[str] = None) -> str:
         """Generate dependencies diagram"""
         if requirement_ids:
             # Get task dependencies for specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
-            task_ids_query = self.db.execute_query(
+            task_ids_query = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT task_id FROM requirement_tasks
                 WHERE requirement_id IN ({placeholders})
@@ -685,7 +685,7 @@ class ExportHandler(BaseHandler):
             task_ids = [row["task_id"] for row in task_ids_query]
             if task_ids:
                 task_placeholders = ",".join(["?"] * len(task_ids))
-                dependencies = self.db.execute_query(
+                dependencies = await self.db.execute_query(
                     f"""
                     SELECT td.source_id AS task_id, td.target_id AS depends_on_task_id
                     FROM relationships td
@@ -702,7 +702,7 @@ class ExportHandler(BaseHandler):
             else:
                 dependencies = []
         else:
-            dependencies = self.db.execute_query(
+            dependencies = await self.db.execute_query(
                 """
                 SELECT td.source_id AS task_id, td.target_id AS depends_on_task_id
                 FROM relationships td

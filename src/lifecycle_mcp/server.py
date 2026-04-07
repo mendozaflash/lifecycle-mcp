@@ -333,14 +333,18 @@ async def amain(
         port: Port number for network transports.
     """
     server_instance = get_server_instance()
-    if transport == "stdio":
-        await server_instance.run_stdio()
-    elif transport == "sse":
-        await server_instance.run_sse(host, port)
-    elif transport == "streamable-http":
-        await server_instance.run_streamable_http(host, port)
-    else:
-        raise ValueError(f"Unknown transport: {transport}")
+    await server_instance.db_manager.initialize()
+    try:
+        if transport == "stdio":
+            await server_instance.run_stdio()
+        elif transport == "sse":
+            await server_instance.run_sse(host, port)
+        elif transport == "streamable-http":
+            await server_instance.run_streamable_http(host, port)
+        else:
+            raise ValueError(f"Unknown transport: {transport}")
+    finally:
+        await server_instance.db_manager.close()
 
 
 def main():

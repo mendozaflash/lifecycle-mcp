@@ -36,19 +36,19 @@ class StatusHandler(BaseHandler):
         """Route tool calls to appropriate handler methods"""
         try:
             if tool_name == "get_project_status":
-                return self._get_project_status(**arguments)
+                return await self._get_project_status(**arguments)
             elif tool_name == "get_project_metrics":
-                return self._get_project_metrics(**arguments)
+                return await self._get_project_metrics(**arguments)
             else:
                 return self._create_error_response(f"Unknown tool: {tool_name}")
         except Exception as e:
             return self._create_error_response(f"Error handling {tool_name}", e)
 
-    def _get_project_status(self, **params) -> list[TextContent]:
+    async def _get_project_status(self, **params) -> list[TextContent]:
         """Get overall project health metrics"""
         try:
             # Get requirement stats
-            req_stats = self.db.execute_query(
+            req_stats = await self.db.execute_query(
                 """
                 SELECT
                     status,
@@ -66,7 +66,7 @@ class StatusHandler(BaseHandler):
             )
 
             # Get task stats
-            task_stats = self.db.execute_query(
+            task_stats = await self.db.execute_query(
                 """
                 SELECT status, COUNT(*) as count
                 FROM tasks
@@ -81,7 +81,7 @@ class StatusHandler(BaseHandler):
             blocked = []
             if params.get("include_blocked", True):
                 try:
-                    blocked = self.db.execute_query("SELECT * FROM blocked_items", fetch_all=True, row_factory=True)
+                    blocked = await self.db.execute_query("SELECT * FROM blocked_items", fetch_all=True, row_factory=True)
                 except sqlite3.OperationalError:
                     # View might not work if no dependencies exist yet
                     blocked = []
@@ -121,7 +121,7 @@ class StatusHandler(BaseHandler):
                     report += f"  Blocked by: {item['blocking_items']}\n"
 
             # Add summary metrics
-            report += self._add_summary_metrics(req_stats, task_stats)
+            report += await self._add_summary_metrics(req_stats, task_stats)
 
             # Create above-the-fold response for project status
             total_reqs = sum(r["count"] for r in req_stats) if req_stats else 0
@@ -138,11 +138,11 @@ class StatusHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to get project status", e)
 
-    def _get_project_metrics(self, **params) -> list[TextContent]:
+    async def _get_project_metrics(self, **params) -> list[TextContent]:
         """Get structured project metrics for programmatic use"""
         try:
             # Get simplified metrics with by_status structure expected by UI
-            req_stats = self.db.execute_query(
+            req_stats = await self.db.execute_query(
                 """
                 SELECT status, COUNT(*) as count
                 FROM requirements
@@ -153,7 +153,7 @@ class StatusHandler(BaseHandler):
                 row_factory=True,
             )
 
-            req_priority_stats = self.db.execute_query(
+            req_priority_stats = await self.db.execute_query(
                 """
                 SELECT priority, COUNT(*) as count
                 FROM requirements
@@ -164,7 +164,7 @@ class StatusHandler(BaseHandler):
                 row_factory=True,
             )
 
-            task_stats = self.db.execute_query(
+            task_stats = await self.db.execute_query(
                 """
                 SELECT status, COUNT(*) as count
                 FROM tasks
@@ -175,7 +175,7 @@ class StatusHandler(BaseHandler):
                 row_factory=True,
             )
 
-            task_priority_stats = self.db.execute_query(
+            task_priority_stats = await self.db.execute_query(
                 """
                 SELECT priority, COUNT(*) as count
                 FROM tasks
@@ -186,7 +186,7 @@ class StatusHandler(BaseHandler):
                 row_factory=True,
             )
 
-            task_assignee_stats = self.db.execute_query(
+            task_assignee_stats = await self.db.execute_query(
                 """
                 SELECT COALESCE(assignee, 'Unassigned') as assignee, COUNT(*) as count
                 FROM tasks
@@ -197,7 +197,7 @@ class StatusHandler(BaseHandler):
                 row_factory=True,
             )
 
-            arch_stats = self.db.execute_query(
+            arch_stats = await self.db.execute_query(
                 """
                 SELECT status, COUNT(*) as count
                 FROM architecture
@@ -277,7 +277,7 @@ class StatusHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to get project metrics", e)
 
-    def _add_summary_metrics(self, req_stats, task_stats) -> str:
+    async def _add_summary_metrics(self, req_stats, task_stats) -> str:
         """Add summary metrics to the status report"""
         summary = "\n## Summary Metrics\n"
 
@@ -299,15 +299,15 @@ class StatusHandler(BaseHandler):
 
         # Calculate velocity metrics if we have data
         if req_stats or task_stats:
-            summary += self._calculate_velocity_metrics()
+            summary += await self._calculate_velocity_metrics()
 
         return summary
 
-    def _calculate_velocity_metrics(self) -> str:
+    async def _calculate_velocity_metrics(self) -> str:
         """Calculate velocity and trend metrics"""
         try:
             # Get recent activity (last 7 days)
-            recent_reqs = self.db.execute_query(
+            recent_reqs = await self.db.execute_query(
                 """
                 SELECT COUNT(*) as count FROM requirements
                 WHERE updated_at >= datetime('now', '-7 days')
@@ -315,7 +315,7 @@ class StatusHandler(BaseHandler):
                 fetch_one=True,
             )
 
-            recent_tasks = self.db.execute_query(
+            recent_tasks = await self.db.execute_query(
                 """
                 SELECT COUNT(*) as count FROM tasks
                 WHERE updated_at >= datetime('now', '-7 days')
@@ -324,7 +324,7 @@ class StatusHandler(BaseHandler):
             )
 
             # Get completed items in last 7 days
-            completed_reqs = self.db.execute_query(
+            completed_reqs = await self.db.execute_query(
                 """
                 SELECT COUNT(*) as count FROM requirements
                 WHERE status = 'Validated' AND updated_at >= datetime('now', '-7 days')
@@ -332,7 +332,7 @@ class StatusHandler(BaseHandler):
                 fetch_one=True,
             )
 
-            completed_tasks = self.db.execute_query(
+            completed_tasks = await self.db.execute_query(
                 """
                 SELECT COUNT(*) as count FROM tasks
                 WHERE status = 'Complete' AND updated_at >= datetime('now', '-7 days')
@@ -352,13 +352,13 @@ class StatusHandler(BaseHandler):
             self.logger.warning(f"Failed to calculate velocity metrics: {str(e)}")
             return ""
 
-    def get_detailed_metrics(self) -> dict[str, Any]:
+    async def get_detailed_metrics(self) -> dict[str, Any]:
         """Get detailed metrics for programmatic use"""
         try:
             metrics = {"requirements": {}, "tasks": {}, "architecture": {}, "summary": {}}
 
             # Requirements metrics
-            req_stats = self.db.execute_query(
+            req_stats = await self.db.execute_query(
                 """
                 SELECT status, COUNT(*) as count, priority,
                        AVG(CASE WHEN task_count = 0 THEN 0
@@ -381,7 +381,7 @@ class StatusHandler(BaseHandler):
                 }
 
             # Task metrics
-            task_stats = self.db.execute_query(
+            task_stats = await self.db.execute_query(
                 """
                 SELECT status, priority, COUNT(*) as count
                 FROM tasks
@@ -399,7 +399,7 @@ class StatusHandler(BaseHandler):
                 metrics["tasks"][status][stat["priority"]] = stat["count"]
 
             # Architecture metrics
-            arch_stats = self.db.execute_query(
+            arch_stats = await self.db.execute_query(
                 """
                 SELECT status, type, COUNT(*) as count
                 FROM architecture

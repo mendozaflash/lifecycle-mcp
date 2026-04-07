@@ -4,6 +4,7 @@ Interview Handler for MCP Lifecycle Management Server
 Handles interactive interview operations for requirements and architecture
 """
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -26,6 +27,10 @@ class InterviewHandler(BaseHandler):
         # Session storage (in-memory for simplicity)
         self.interview_sessions = {}
         self.architectural_sessions = {}
+
+        # Locks for session concurrency protection (Issue 1)
+        self._interview_lock = asyncio.Lock()
+        self._architectural_lock = asyncio.Lock()
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return interview tool definitions"""
@@ -82,9 +87,9 @@ class InterviewHandler(BaseHandler):
             elif tool_name == "continue_requirement_interview":
                 return await self._continue_requirement_interview(**arguments)
             elif tool_name == "start_architectural_conversation":
-                return self._start_architectural_conversation(**arguments)
+                return await self._start_architectural_conversation(**arguments)
             elif tool_name == "continue_architectural_conversation":
-                return self._continue_architectural_conversation(**arguments)
+                return await self._continue_architectural_conversation(**arguments)
             else:
                 return self._create_error_response(f"Unknown tool: {tool_name}")
         except Exception as e:
@@ -93,16 +98,7 @@ class InterviewHandler(BaseHandler):
     async def _start_requirement_interview(self, **params) -> list[TextContent]:
         """Start interactive requirement gathering interview"""
         try:
-            session_id = str(uuid.uuid4())[:8]
-
-            # Initialize interview session
-            self.interview_sessions[session_id] = {
-                "project_context": params.get("project_context", ""),
-                "stakeholder_role": params.get("stakeholder_role", ""),
-                "gathered_data": {},
-                "current_stage": InterviewStage.PROBLEM_IDENTIFICATION,
-                "questions_asked": [],
-            }
+            session_id = str(uuid.uuid4())
 
             # Generate intelligent questions using LLM
             questions = await self.question_generator.generate_questions(
@@ -111,7 +107,16 @@ class InterviewHandler(BaseHandler):
                 stakeholder_role=params.get("stakeholder_role", ""),
             )
 
-            self.interview_sessions[session_id]["current_questions"] = questions
+            # Initialize interview session under lock
+            async with self._interview_lock:
+                self.interview_sessions[session_id] = {
+                    "project_context": params.get("project_context", ""),
+                    "stakeholder_role": params.get("stakeholder_role", ""),
+                    "gathered_data": {},
+                    "current_stage": InterviewStage.PROBLEM_IDENTIFICATION,
+                    "questions_asked": [],
+                    "current_questions": questions,
+                }
 
             response = f"""# Requirement Interview Started
 **Session ID**: {session_id}
@@ -152,21 +157,24 @@ Please answer these questions to help gather your requirement:
             session_id = params["session_id"]
             answers = params["answers"]
 
-            if session_id not in self.interview_sessions:
-                return self._create_error_response("Interview session not found or expired")
+            async with self._interview_lock:
+                if session_id not in self.interview_sessions:
+                    return self._create_error_response("Interview session not found or expired")
 
-            session = self.interview_sessions[session_id]
+                session = self.interview_sessions[session_id]
 
-            # Store answers
-            for key, value in answers.items():
-                session["gathered_data"][key] = value
+                # Store answers
+                for key, value in answers.items():
+                    session["gathered_data"][key] = value
 
-            # Move to next stage based on current progress
-            current_stage = session["current_stage"]
+                # Move to next stage based on current progress
+                current_stage = session["current_stage"]
+
             next_questions = []
 
             if current_stage == InterviewStage.PROBLEM_IDENTIFICATION:
-                session["current_stage"] = InterviewStage.SOLUTION_DEFINITION
+                async with self._interview_lock:
+                    self.interview_sessions[session_id]["current_stage"] = InterviewStage.SOLUTION_DEFINITION
                 next_questions = await self.question_generator.generate_questions(
                     stage=InterviewStage.SOLUTION_DEFINITION,
                     previous_answers=session["gathered_data"],
@@ -174,7 +182,8 @@ Please answer these questions to help gather your requirement:
                 )
 
             elif current_stage == InterviewStage.SOLUTION_DEFINITION:
-                session["current_stage"] = InterviewStage.DETAILS_GATHERING
+                async with self._interview_lock:
+                    self.interview_sessions[session_id]["current_stage"] = InterviewStage.DETAILS_GATHERING
                 next_questions = await self.question_generator.generate_questions(
                     stage=InterviewStage.DETAILS_GATHERING,
                     previous_answers=session["gathered_data"],
@@ -182,7 +191,8 @@ Please answer these questions to help gather your requirement:
                 )
 
             elif current_stage == InterviewStage.DETAILS_GATHERING:
-                session["current_stage"] = InterviewStage.VALIDATION
+                async with self._interview_lock:
+                    self.interview_sessions[session_id]["current_stage"] = InterviewStage.VALIDATION
                 next_questions = await self.question_generator.generate_questions(
                     stage=InterviewStage.VALIDATION,
                     previous_answers=session["gathered_data"],
@@ -193,7 +203,9 @@ Please answer these questions to help gather your requirement:
                 # Interview complete - generate requirement
                 return await self._complete_requirement_interview(session_id)
 
-            session["current_questions"] = next_questions
+            async with self._interview_lock:
+                self.interview_sessions[session_id]["current_questions"] = next_questions
+                current_stage_value = self.interview_sessions[session_id]["current_stage"]
 
             response = f"""# Interview Progress - Session {session_id}
 
@@ -205,13 +217,13 @@ Please answer these questions to help gather your requirement:
             for i, question in enumerate(next_questions, 1):
                 response += f"{i}. {question}\n"
 
-            response += f"\nStage: {session['current_stage'].value.replace('_', ' ').title()}"
+            response += f"\nStage: {current_stage_value.value.replace('_', ' ').title()}"
             response += "\nContinue with `continue_requirement_interview` and your answers."
 
             # Create above-the-fold response for interview continuation
             key_info = f"Interview session {session_id} continued"
-            current_stage = session["current_stage"].value.replace("_", " ").title()
-            action_info = f"🎤 {len(next_questions)} more questions | Stage: {current_stage}"
+            stage_display = current_stage_value.value.replace("_", " ").title()
+            action_info = f"🎤 {len(next_questions)} more questions | Stage: {stage_display}"
             return self._create_above_fold_response("SUCCESS", key_info, action_info, response)
 
         except Exception as e:
@@ -220,8 +232,9 @@ Please answer these questions to help gather your requirement:
     async def _complete_requirement_interview(self, session_id: str) -> list[TextContent]:
         """Complete interview and create requirement"""
         try:
-            session = self.interview_sessions[session_id]
-            data = session["gathered_data"]
+            async with self._interview_lock:
+                session = self.interview_sessions[session_id]
+                data = session["gathered_data"]
 
             # Map interview data to requirement fields
             requirement_data = {
@@ -241,7 +254,8 @@ Please answer these questions to help gather your requirement:
             result = await self.requirement_handler._create_requirement(**requirement_data)
 
             # Clean up session
-            del self.interview_sessions[session_id]
+            async with self._interview_lock:
+                del self.interview_sessions[session_id]
 
             interview_summary = f"""# Interview Complete!
 
@@ -270,31 +284,18 @@ You can now use other tools to further develop this requirement, create tasks, o
 
     async def _get_existing_requirements(self) -> list[dict[str, Any]]:
         """Get existing requirements for context in question generation"""
-        try:
-            async with self.db_manager.get_connection() as conn:
-                cursor = await conn.execute(
-                    "SELECT id, type, title, priority, status FROM requirements ORDER BY created_at DESC LIMIT 10"
-                )
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-        except Exception:
-            # Return empty list if query fails
-            return []
+        rows = await self.db.get_records(
+            "requirements",
+            "id, type, title, priority, status",
+            order_by="created_at DESC",
+            limit=10,
+        )
+        return [dict(row) for row in rows]
 
-    def _start_architectural_conversation(self, **params) -> list[TextContent]:
+    async def _start_architectural_conversation(self, **params) -> list[TextContent]:
         """Start interactive architectural conversation"""
         try:
-            session_id = str(uuid.uuid4())[:8]
-
-            # Initialize architectural session
-            self.architectural_sessions[session_id] = {
-                "project_context": params.get("project_context", ""),
-                "diagram_purpose": params.get("diagram_purpose", ""),
-                "complexity_level": params.get("complexity_level", "medium"),
-                "gathered_data": {},
-                "current_stage": "context_gathering",
-                "questions_asked": [],
-            }
+            session_id = str(uuid.uuid4())
 
             # Determine first questions based on complexity and context
             questions = []
@@ -319,7 +320,17 @@ You can now use other tools to further develop this requirement, create tasks, o
                     "Are there any compliance, security, or performance considerations to show?",
                 ]
 
-            self.architectural_sessions[session_id]["current_questions"] = questions
+            # Initialize architectural session under lock
+            async with self._architectural_lock:
+                self.architectural_sessions[session_id] = {
+                    "project_context": params.get("project_context", ""),
+                    "diagram_purpose": params.get("diagram_purpose", ""),
+                    "complexity_level": params.get("complexity_level", "medium"),
+                    "gathered_data": {},
+                    "current_stage": "context_gathering",
+                    "questions_asked": [],
+                    "current_questions": questions,
+                }
 
             response = f"""# Architectural Conversation Started
 **Session ID**: {session_id}
@@ -350,7 +361,7 @@ Please answer these questions to help create the most useful architectural diagr
         except Exception as e:
             return self._create_error_response("Failed to start architectural conversation", e)
 
-    def _continue_architectural_conversation(self, **params) -> list[TextContent]:
+    async def _continue_architectural_conversation(self, **params) -> list[TextContent]:
         """Continue architectural conversation with responses"""
         # Validate required parameters
         error = self._validate_required_params(params, ["session_id", "responses"])
@@ -361,28 +372,32 @@ Please answer these questions to help create the most useful architectural diagr
             session_id = params["session_id"]
             responses = params["responses"]
 
-            if session_id not in self.architectural_sessions:
-                return self._create_error_response("Architectural conversation session not found or expired")
+            async with self._architectural_lock:
+                if session_id not in self.architectural_sessions:
+                    return self._create_error_response("Architectural conversation session not found or expired")
 
-            session = self.architectural_sessions[session_id]
+                session = self.architectural_sessions[session_id]
 
-            # Store responses
-            for key, value in responses.items():
-                session["gathered_data"][key] = value
+                # Store responses
+                for key, value in responses.items():
+                    session["gathered_data"][key] = value
 
-            # Move to next stage based on current progress
-            current_stage = session["current_stage"]
+                # Move to next stage based on current progress
+                current_stage = session["current_stage"]
+
             next_questions = []
 
             if current_stage == "context_gathering":
-                session["current_stage"] = "diagram_specification"
+                async with self._architectural_lock:
+                    self.architectural_sessions[session_id]["current_stage"] = "diagram_specification"
                 next_questions = [
                     "What type of diagram would be most effective (flowchart, sequence, component, etc.)?",
                     "Should the diagram focus on a specific subset of requirements or the entire project?",
                 ]
 
             elif current_stage == "diagram_specification":
-                session["current_stage"] = "detail_refinement"
+                async with self._architectural_lock:
+                    self.architectural_sessions[session_id]["current_stage"] = "detail_refinement"
                 next_questions = [
                     "Are there specific visual elements or styling preferences?",
                     "Should certain elements be highlighted or emphasized?",
@@ -390,9 +405,11 @@ Please answer these questions to help create the most useful architectural diagr
 
             elif current_stage == "detail_refinement":
                 # Conversation complete - generate diagram
-                return self._complete_architectural_conversation(session_id)
+                return await self._complete_architectural_conversation(session_id)
 
-            session["current_questions"] = next_questions
+            async with self._architectural_lock:
+                self.architectural_sessions[session_id]["current_questions"] = next_questions
+                current_stage_value = self.architectural_sessions[session_id]["current_stage"]
 
             response = f"""# Architectural Conversation Progress - Session {session_id}
 
@@ -404,23 +421,24 @@ Please answer these questions to help create the most useful architectural diagr
             for i, question in enumerate(next_questions, 1):
                 response += f"{i}. {question}\n"
 
-            response += f"\nStage: {session['current_stage'].replace('_', ' ').title()}"
+            response += f"\nStage: {current_stage_value.replace('_', ' ').title()}"
             response += "\nContinue with `continue_architectural_conversation` and your responses."
 
             # Create above-the-fold response for architectural conversation continuation
             key_info = f"Architectural session {session_id} continued"
-            current_stage = session["current_stage"].replace("_", " ").title()
-            action_info = f"🏢 {len(next_questions)} more questions | Stage: {current_stage}"
+            stage_display = current_stage_value.replace("_", " ").title()
+            action_info = f"🏢 {len(next_questions)} more questions | Stage: {stage_display}"
             return self._create_above_fold_response("SUCCESS", key_info, action_info, response)
 
         except Exception as e:
             return self._create_error_response("Failed to continue architectural conversation", e)
 
-    def _complete_architectural_conversation(self, session_id: str) -> list[TextContent]:
+    async def _complete_architectural_conversation(self, session_id: str) -> list[TextContent]:
         """Complete architectural conversation and generate diagram"""
         try:
-            session = self.architectural_sessions[session_id]
-            data = session["gathered_data"]
+            async with self._architectural_lock:
+                session = self.architectural_sessions[session_id]
+                data = session["gathered_data"]
 
             # Determine diagram parameters based on conversation
             diagram_type = "full_project"  # Default
@@ -436,7 +454,8 @@ Please answer these questions to help create the most useful architectural diagr
                 diagram_type = "full_project"
 
             # Clean up session
-            del self.architectural_sessions[session_id]
+            async with self._architectural_lock:
+                del self.architectural_sessions[session_id]
 
             conversation_summary = f"""# Architectural Conversation Complete!
 

@@ -140,17 +140,17 @@ class RelationshipHandler(BaseHandler):
             )
 
         # Check if relationship already exists
-        if self._relationship_exists(source_id, target_id, rel_type):
+        if await self._relationship_exists(source_id, target_id, rel_type):
             return self._create_error_response(
                 f"Relationship already exists: {source_id} -> {target_id} ({rel_type})"
             )
 
         # Create the relationship in appropriate table
-        success = self._insert_relationship(source_id, target_id, source_type, target_type, rel_type)
+        success = await self._insert_relationship(source_id, target_id, source_type, target_type, rel_type)
 
         if success:
             # Log the operation
-            self._log_operation("relationship", f"{source_id}-{target_id}", "created")
+            await self._log_operation("relationship", f"{source_id}-{target_id}", "created")
 
             return self._create_above_fold_response(
                 "SUCCESS",
@@ -178,11 +178,11 @@ class RelationshipHandler(BaseHandler):
             return self._create_error_response(f"Invalid entity IDs: {source_id}, {target_id}")
 
         # Delete the relationship
-        deleted_count = self._delete_relationship_record(source_id, target_id, source_type, target_type, rel_type)
+        deleted_count = await self._delete_relationship_record(source_id, target_id, source_type, target_type, rel_type)
 
         if deleted_count > 0:
             # Log the operation
-            self._log_operation("relationship", f"{source_id}-{target_id}", "deleted")
+            await self._log_operation("relationship", f"{source_id}-{target_id}", "deleted")
 
             return self._create_above_fold_response(
                 "SUCCESS",
@@ -198,7 +198,7 @@ class RelationshipHandler(BaseHandler):
         entity_id = args.get("entity_id")
         rel_type = args.get("relationship_type")
 
-        relationships = self._fetch_all_relationships()
+        relationships = await self._fetch_all_relationships()
 
         # Filter by entity_id if specified
         if entity_id:
@@ -225,7 +225,7 @@ class RelationshipHandler(BaseHandler):
             return self._create_error_response(error)
 
         entity_id = args["entity_id"]
-        all_relationships = self._fetch_all_relationships()
+        all_relationships = await self._fetch_all_relationships()
 
         # Filter to only relationships involving this entity
         relationships = [r for r in all_relationships if r["source_id"] == entity_id or r["target_id"] == entity_id]
@@ -239,7 +239,7 @@ class RelationshipHandler(BaseHandler):
         """Get all relationships for graph visualization"""
         entity_types = args.get("entity_types", ["requirement", "task", "architecture"])
 
-        all_relationships = self._fetch_all_relationships()
+        all_relationships = await self._fetch_all_relationships()
 
         # Filter by entity types if specified
         if entity_types != ["requirement", "task", "architecture"]:
@@ -286,7 +286,7 @@ class RelationshipHandler(BaseHandler):
 
         return valid_combinations.get((source_type, target_type, rel_type), False)
 
-    def _relationship_exists(self, source_id: str, target_id: str, rel_type: str) -> bool:
+    async def _relationship_exists(self, source_id: str, target_id: str, rel_type: str) -> bool:
         """Check if relationship already exists in unified relationships table"""
         source_type = self._get_entity_type(source_id)
         target_type = self._get_entity_type(target_id)
@@ -295,7 +295,7 @@ class RelationshipHandler(BaseHandler):
             return False
 
         # Check unified relationships table
-        results = self.db.get_records(
+        results = await self.db.get_records(
             "relationships",
             "1",
             "source_type = ? AND source_id = ? AND target_type = ? AND target_id = ? AND relationship_type = ?",
@@ -303,14 +303,14 @@ class RelationshipHandler(BaseHandler):
         )
         return len(results) > 0
 
-    def _insert_relationship(self, source_id: str, target_id: str, source_type: str, target_type: str, rel_type: str) -> bool:
+    async def _insert_relationship(self, source_id: str, target_id: str, source_type: str, target_type: str, rel_type: str) -> bool:
         """Insert relationship into unified relationships table"""
         try:
             # Generate unique relationship ID
             relationship_id = f"rel-{source_id}-{target_id}-{rel_type}"
 
             # Insert into unified relationships table
-            self.db.insert_record("relationships", {
+            await self.db.insert_record("relationships", {
                 "id": relationship_id,
                 "source_type": source_type,
                 "source_id": source_id,
@@ -324,7 +324,7 @@ class RelationshipHandler(BaseHandler):
             self.logger.error(f"Failed to insert relationship: {str(e)}")
             return False
 
-    def _delete_relationship_record(self, source_id: str, target_id: str, source_type: str, target_type: str, rel_type: str | None = None) -> int:
+    async def _delete_relationship_record(self, source_id: str, target_id: str, source_type: str, target_type: str, rel_type: str | None = None) -> int:
         """Delete relationship record from unified relationships table and return count of deleted records"""
         try:
             if not source_type or not target_type:
@@ -339,11 +339,11 @@ class RelationshipHandler(BaseHandler):
                 params = [source_type, source_id, target_type, target_id]
 
             # Get count before deletion for return value
-            existing = self.db.get_records("relationships", "COUNT(*) as count", where_clause, params)
+            existing = await self.db.get_records("relationships", "COUNT(*) as count", where_clause, params)
             count = existing[0]["count"] if existing else 0
 
             if count > 0:
-                self.db.delete_record("relationships", where_clause, params)
+                await self.db.delete_record("relationships", where_clause, params)
                 return count
 
             return 0
@@ -352,12 +352,12 @@ class RelationshipHandler(BaseHandler):
             self.logger.error(f"Failed to delete relationship: {str(e)}")
             return 0
 
-    def _fetch_all_relationships(self) -> list[dict[str, Any]]:
+    async def _fetch_all_relationships(self) -> list[dict[str, Any]]:
         """Fetch all relationships from unified relationships table"""
         relationships = []
 
         # Get all relationships from unified table
-        relationship_rows = self.db.get_records("relationships", "*")
+        relationship_rows = await self.db.get_records("relationships", "*")
 
         for row in relationship_rows:
             source_id = row["source_id"]
@@ -368,30 +368,30 @@ class RelationshipHandler(BaseHandler):
             # Get source entity title
             source_title = source_id  # Default fallback
             if source_type == "requirement":
-                source_rows = self.db.get_records("requirements", "title", "id = ?", [source_id])
+                source_rows = await self.db.get_records("requirements", "title", "id = ?", [source_id])
                 if source_rows:
                     source_title = source_rows[0]["title"]
             elif source_type == "task":
-                source_rows = self.db.get_records("tasks", "title", "id = ?", [source_id])
+                source_rows = await self.db.get_records("tasks", "title", "id = ?", [source_id])
                 if source_rows:
                     source_title = source_rows[0]["title"]
             elif source_type == "architecture":
-                source_rows = self.db.get_records("architecture", "title", "id = ?", [source_id])
+                source_rows = await self.db.get_records("architecture", "title", "id = ?", [source_id])
                 if source_rows:
                     source_title = source_rows[0]["title"]
 
             # Get target entity title
             target_title = target_id  # Default fallback
             if target_type == "requirement":
-                target_rows = self.db.get_records("requirements", "title", "id = ?", [target_id])
+                target_rows = await self.db.get_records("requirements", "title", "id = ?", [target_id])
                 if target_rows:
                     target_title = target_rows[0]["title"]
             elif target_type == "task":
-                target_rows = self.db.get_records("tasks", "title", "id = ?", [target_id])
+                target_rows = await self.db.get_records("tasks", "title", "id = ?", [target_id])
                 if target_rows:
                     target_title = target_rows[0]["title"]
             elif target_type == "architecture":
-                target_rows = self.db.get_records("architecture", "title", "id = ?", [target_id])
+                target_rows = await self.db.get_records("architecture", "title", "id = ?", [target_id])
                 if target_rows:
                     target_title = target_rows[0]["title"]
 
