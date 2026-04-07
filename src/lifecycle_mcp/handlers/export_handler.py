@@ -310,8 +310,8 @@ class ExportHandler(BaseHandler):
             linked_reqs = self.db.execute_query(
                 """
                 SELECT r.id, r.title FROM requirements r
-                JOIN requirement_architecture ra ON r.id = ra.requirement_id
-                WHERE ra.architecture_id = ?
+                JOIN relationships ra ON r.id = ra.source_id AND ra.source_type='requirement' AND ra.target_type='architecture'
+                WHERE ra.target_id = ?
             """,
                 [arch["id"]],
                 fetch_all=True,
@@ -518,8 +518,17 @@ class ExportHandler(BaseHandler):
             mermaid_content += f"    style {node_id} {status_color}\n"
 
             # Add parent-child relationships
-            if task["parent_task_id"]:
-                parent_id = task["parent_task_id"].replace("-", "_")
+            parent_rels = self.db.execute_query(
+                """
+                SELECT target_id FROM relationships
+                WHERE source_id = ? AND source_type='task' AND target_type='task' AND relationship_type='parent'
+            """,
+                [task["id"]],
+                fetch_all=True,
+                row_factory=True,
+            )
+            for pr in parent_rels:
+                parent_id = pr["target_id"].replace("-", "_")
                 mermaid_content += f"    {parent_id} --> {node_id}\n"
 
         return mermaid_content
@@ -532,8 +541,8 @@ class ExportHandler(BaseHandler):
             architecture = self.db.execute_query(
                 f"""
                 SELECT DISTINCT a.* FROM architecture a
-                JOIN requirement_architecture ra ON a.id = ra.architecture_id
-                WHERE ra.requirement_id IN ({placeholders})
+                JOIN relationships ra ON a.id = ra.target_id AND ra.source_type='requirement' AND ra.target_type='architecture'
+                WHERE ra.source_id IN ({placeholders})
                 ORDER BY a.created_at DESC
             """,
                 requirement_ids,
@@ -589,8 +598,8 @@ class ExportHandler(BaseHandler):
             architecture = self.db.execute_query(
                 f"""
                 SELECT DISTINCT a.* FROM architecture a
-                JOIN requirement_architecture ra ON a.id = ra.architecture_id
-                WHERE ra.requirement_id IN ({placeholders})
+                JOIN relationships ra ON a.id = ra.target_id AND ra.source_type='requirement' AND ra.target_type='architecture'
+                WHERE ra.source_id IN ({placeholders})
                 ORDER BY a.created_at DESC
             """,
                 requirement_ids,
@@ -678,12 +687,13 @@ class ExportHandler(BaseHandler):
                 task_placeholders = ",".join(["?"] * len(task_ids))
                 dependencies = self.db.execute_query(
                     f"""
-                    SELECT td.task_id, td.depends_on_task_id
-                    FROM task_dependencies td
-                    JOIN tasks t1 ON td.task_id = t1.id
-                    JOIN tasks t2 ON td.depends_on_task_id = t2.id
-                    WHERE td.task_id IN ({task_placeholders})
-                       OR td.depends_on_task_id IN ({task_placeholders})
+                    SELECT td.source_id AS task_id, td.target_id AS depends_on_task_id
+                    FROM relationships td
+                    JOIN tasks t1 ON td.source_id = t1.id
+                    JOIN tasks t2 ON td.target_id = t2.id
+                    WHERE td.source_type='task' AND td.target_type='task' AND td.relationship_type IN ('depends', 'blocks')
+                      AND (td.source_id IN ({task_placeholders})
+                       OR td.target_id IN ({task_placeholders}))
                 """,
                     task_ids + task_ids,
                     fetch_all=True,
@@ -694,10 +704,11 @@ class ExportHandler(BaseHandler):
         else:
             dependencies = self.db.execute_query(
                 """
-                SELECT td.task_id, td.depends_on_task_id
-                FROM task_dependencies td
-                JOIN tasks t1 ON td.task_id = t1.id
-                JOIN tasks t2 ON td.depends_on_task_id = t2.id
+                SELECT td.source_id AS task_id, td.target_id AS depends_on_task_id
+                FROM relationships td
+                JOIN tasks t1 ON td.source_id = t1.id
+                JOIN tasks t2 ON td.target_id = t2.id
+                WHERE td.source_type='task' AND td.target_type='task' AND td.relationship_type IN ('depends', 'blocks')
             """,
                 fetch_all=True,
                 row_factory=True,

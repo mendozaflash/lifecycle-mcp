@@ -629,7 +629,11 @@ def apply_relationship_cleanup_migration(db_path: str) -> bool:
         columns_info_check = cursor.fetchall()
         has_parent_task_id_check = any(col[1] == 'parent_task_id' for col in columns_info_check)
 
-        if not existing_tables and not has_parent_task_id_check:
+        # Detect partial migration: tasks was dropped but tasks_new was never renamed
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks_new'")
+        tasks_new_exists = cursor.fetchone() is not None
+
+        if not existing_tables and not has_parent_task_id_check and not tasks_new_exists:
             print("Relationship cleanup migration already applied")
             return True
 
@@ -637,13 +641,19 @@ def apply_relationship_cleanup_migration(db_path: str) -> bool:
         if has_parent_task_id_check:
             print("parent_task_id column needs to be removed")
 
-        # Verify data has been migrated to relationships table
+        # Drop all views that depend on tables being modified in this migration.
+        # SQLite validates ALL views during any DDL operation, so views referencing
+        # dropped tables will cause rename/create operations to fail unless pre-dropped.
+        # All of these are recreated by steps 7-9 below (plus task_hierarchy in step 4).
+        cursor.execute("DROP VIEW IF EXISTS requirement_progress")
+        cursor.execute("DROP VIEW IF EXISTS requirement_hierarchy")
+        cursor.execute("DROP VIEW IF EXISTS blocked_items")
+        cursor.execute("DROP VIEW IF EXISTS task_hierarchy")
+
+        # Count relationships for informational purposes only
+        # (zero is valid on a fresh database with no data yet)
         cursor.execute("SELECT COUNT(*) FROM relationships")
         relationship_count = cursor.fetchone()[0]
-
-        if relationship_count == 0:
-            raise Exception("Cannot cleanup: no relationships found in unified table. Data consolidation may not have completed.")
-
         print(f"Found {relationship_count} relationships in unified table, proceeding with cleanup...")
 
         # 1. Drop task_dependencies table (verify data migrated to unified table)
@@ -768,6 +778,12 @@ def apply_relationship_cleanup_migration(db_path: str) -> bool:
             columns_to_keep = [col[1] for col in columns_info if col[1] != 'parent_task_id']
             columns_str = ', '.join(columns_to_keep)
 
+            # Drop views that reference tasks BEFORE recreating the table.
+            # SQLite validates view references on ALTER TABLE RENAME, so dropping
+            # tasks without first dropping dependent views causes the rename to fail.
+            cursor.execute("DROP VIEW IF EXISTS task_hierarchy")
+            cursor.execute("DROP VIEW IF EXISTS blocked_items")
+
             # Create new tasks table without parent_task_id
             cursor.execute(f"""
                 CREATE TABLE tasks_new AS
@@ -810,7 +826,99 @@ def apply_relationship_cleanup_migration(db_path: str) -> bool:
                 END
             """)
 
+            # Recreate task_hierarchy using relationships table (parent_task_id is gone)
+            cursor.execute("""
+                CREATE VIEW task_hierarchy AS
+                WITH RECURSIVE task_tree AS (
+                    SELECT
+                        t.id,
+                        t.title,
+                        t.status,
+                        NULL as parent_task_id,
+                        0 as level,
+                        t.id as root_task_id
+                    FROM tasks t
+                    WHERE t.id NOT IN (
+                        SELECT source_id FROM relationships
+                        WHERE source_type = 'task'
+                        AND target_type = 'task'
+                        AND relationship_type = 'parent'
+                    )
+                    UNION ALL
+                    SELECT
+                        t.id,
+                        t.title,
+                        t.status,
+                        rel.target_id as parent_task_id,
+                        tt.level + 1,
+                        tt.root_task_id
+                    FROM tasks t
+                    JOIN relationships rel ON t.id = rel.source_id
+                    JOIN task_tree tt ON rel.target_id = tt.id
+                    WHERE rel.source_type = 'task'
+                    AND rel.target_type = 'task'
+                    AND rel.relationship_type = 'parent'
+                    AND tt.level < 10
+                )
+                SELECT * FROM task_tree
+            """)
+
             print("Removed parent_task_id column from tasks table")
+
+        elif tasks_new_exists:
+            # Partial migration recovery: tasks was dropped but tasks_new was never renamed.
+            # Complete the rename and recreate all dependent objects.
+            print("Recovering partial migration: renaming tasks_new -> tasks")
+            cursor.execute("DROP VIEW IF EXISTS task_hierarchy")
+            cursor.execute("DROP VIEW IF EXISTS blocked_items")
+            cursor.execute("ALTER TABLE tasks_new RENAME TO tasks")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee)")
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS update_task_timestamp
+                AFTER UPDATE ON tasks
+                BEGIN
+                    UPDATE tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS log_task_status_change
+                AFTER UPDATE OF status ON tasks
+                WHEN OLD.status != NEW.status
+                BEGIN
+                    INSERT INTO lifecycle_events (entity_type, entity_id, event_type, from_value, to_value)
+                    VALUES ('task', NEW.id, 'status_change', OLD.status, NEW.status);
+                    UPDATE tasks
+                    SET completed_at = CASE
+                        WHEN NEW.status = 'Complete' THEN CURRENT_TIMESTAMP
+                        ELSE NULL
+                    END
+                    WHERE id = NEW.id;
+                END
+            """)
+            cursor.execute("""
+                CREATE VIEW task_hierarchy AS
+                WITH RECURSIVE task_tree AS (
+                    SELECT t.id, t.title, t.status, NULL as parent_task_id,
+                           0 as level, t.id as root_task_id
+                    FROM tasks t
+                    WHERE t.id NOT IN (
+                        SELECT source_id FROM relationships
+                        WHERE source_type = 'task' AND target_type = 'task'
+                        AND relationship_type = 'parent'
+                    )
+                    UNION ALL
+                    SELECT t.id, t.title, t.status, rel.target_id as parent_task_id,
+                           tt.level + 1, tt.root_task_id
+                    FROM tasks t
+                    JOIN relationships rel ON t.id = rel.source_id
+                    JOIN task_tree tt ON rel.target_id = tt.id
+                    WHERE rel.source_type = 'task' AND rel.target_type = 'task'
+                    AND rel.relationship_type = 'parent' AND tt.level < 10
+                )
+                SELECT * FROM task_tree
+            """)
+            print("Partial migration recovery complete")
 
         # 5. Update requirement task completion trigger to use new relationships table
         cursor.execute("DROP TRIGGER IF EXISTS update_requirement_task_completion")

@@ -177,8 +177,15 @@ class ArchitectureHandler(BaseHandler):
             # Link to requirements
             for req_id in params["requirement_ids"]:
                 self.db.insert_record(
-                    "requirement_architecture",
-                    {"requirement_id": req_id, "architecture_id": adr_id, "relationship_type": "addresses"},
+                    "relationships",
+                    {
+                        "id": f"rel-{req_id}-{adr_id}-addresses",
+                        "source_type": "requirement",
+                        "source_id": req_id,
+                        "target_type": "architecture",
+                        "target_id": adr_id,
+                        "relationship_type": "addresses",
+                    },
                 )
 
             # Analyze ADR for diagram suggestions using LLM
@@ -248,8 +255,8 @@ class ArchitectureHandler(BaseHandler):
             if params.get("requirement_id"):
                 base_query = """
                     SELECT a.* FROM architecture a
-                    JOIN requirement_architecture ra ON a.id = ra.architecture_id
-                    WHERE ra.requirement_id = ?
+                    JOIN relationships ra ON a.id = ra.target_id
+                    WHERE ra.source_type = 'requirement' AND ra.target_type = 'architecture' AND ra.source_id = ?
                 """
                 where_params.append(params["requirement_id"])
 
@@ -326,8 +333,8 @@ class ArchitectureHandler(BaseHandler):
             if params.get("requirement_id"):
                 base_query = """
                     SELECT a.* FROM architecture a
-                    JOIN requirement_architecture ra ON a.id = ra.architecture_id
-                    WHERE ra.requirement_id = ?
+                    JOIN relationships ra ON a.id = ra.target_id
+                    WHERE ra.source_type = 'requirement' AND ra.target_type = 'architecture' AND ra.source_id = ?
                 """
                 where_params.append(params["requirement_id"])
 
@@ -445,8 +452,8 @@ class ArchitectureHandler(BaseHandler):
             requirements = self.db.execute_query(
                 """
                 SELECT r.id, r.title FROM requirements r
-                JOIN requirement_architecture ra ON r.id = ra.requirement_id
-                WHERE ra.architecture_id = ?
+                JOIN relationships ra ON r.id = ra.source_id
+                WHERE ra.source_type = 'requirement' AND ra.target_type = 'architecture' AND ra.target_id = ?
             """,
                 [params["architecture_id"]],
                 fetch_all=True,

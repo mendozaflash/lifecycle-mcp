@@ -443,12 +443,16 @@ Guidelines:
     def _create_requirement_dependency(self, requirement_id: str, depends_on_id: str, dependency_type: str):
         """Create a requirement dependency relationship"""
         try:
+            relationship_id = f"rel-{requirement_id}-{depends_on_id}-{dependency_type}"
             self.db.insert_record(
-                "requirement_dependencies",
+                "relationships",
                 {
-                    "requirement_id": requirement_id,
-                    "depends_on_requirement_id": depends_on_id,
-                    "dependency_type": dependency_type,
+                    "id": relationship_id,
+                    "source_type": "requirement",
+                    "source_id": requirement_id,
+                    "target_type": "requirement",
+                    "target_id": depends_on_id,
+                    "relationship_type": dependency_type,
                 },
             )
             self._log_operation(
@@ -747,8 +751,8 @@ Guidelines:
             parent_requirements = self.db.execute_query(
                 """
                 SELECT r.* FROM requirements r
-                JOIN requirement_dependencies rd ON r.id = rd.depends_on_requirement_id
-                WHERE rd.requirement_id = ? AND rd.dependency_type = 'parent'
+                JOIN relationships rel ON r.id = rel.target_id
+                WHERE rel.source_id = ? AND rel.source_type = 'requirement' AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
             """,
                 [params["requirement_id"]],
                 fetch_all=True,
@@ -759,8 +763,8 @@ Guidelines:
             child_requirements = self.db.execute_query(
                 """
                 SELECT r.* FROM requirements r
-                JOIN requirement_dependencies rd ON r.id = rd.requirement_id
-                WHERE rd.depends_on_requirement_id = ? AND rd.dependency_type = 'parent'
+                JOIN relationships rel ON r.id = rel.source_id
+                WHERE rel.target_id = ? AND rel.source_type = 'requirement' AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
                 ORDER BY r.created_at
             """,
                 [params["requirement_id"]],
@@ -785,8 +789,8 @@ Guidelines:
             architecture = self.db.execute_query(
                 """
                 SELECT a.* FROM architecture a
-                JOIN requirement_architecture ra ON a.id = ra.architecture_id
-                WHERE ra.requirement_id = ?
+                JOIN relationships rel ON a.id = rel.target_id
+                WHERE rel.source_id = ? AND rel.source_type = 'requirement' AND rel.target_type = 'architecture'
             """,
                 [params["requirement_id"]],
                 fetch_all=True,
