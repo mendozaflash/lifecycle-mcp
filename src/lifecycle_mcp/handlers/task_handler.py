@@ -302,6 +302,14 @@ class TaskHandler(BaseHandler):
             return self._create_error_response(error)
 
         try:
+            # Validate status value
+            valid_statuses = {"Not Started", "In Progress", "Blocked", "Complete", "Abandoned"}
+            new_status = params["new_status"]
+            if new_status not in valid_statuses:
+                return self._create_error_response(
+                    f"Invalid status '{new_status}'. Valid statuses: {', '.join(sorted(valid_statuses))}"
+                )
+
             # Get current task with GitHub info
             current_tasks = await self.db.get_records(
                 "tasks", "status, assignee, github_issue_number, github_issue_url", "id = ?", [params["task_id"]]
