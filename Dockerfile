@@ -6,6 +6,8 @@ COPY . .
 
 RUN pip install --no-cache-dir .
 
+RUN mkdir -p /data
+
 ENV LIFECYCLE_DB=/data/lifecycle.db
 ENV PYTHONUNBUFFERED=1
 
