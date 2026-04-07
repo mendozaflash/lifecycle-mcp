@@ -113,11 +113,11 @@ class TaskHandler(BaseHandler):
             elif tool_name == "update_task_status":
                 return await self._update_task_status(**arguments)
             elif tool_name == "query_tasks":
-                return self._query_tasks(**arguments)
+                return await self._query_tasks(**arguments)
             elif tool_name == "query_tasks_json":
-                return self._query_tasks_json(**arguments)
+                return await self._query_tasks_json(**arguments)
             elif tool_name == "get_task_details":
-                return self._get_task_details(**arguments)
+                return await self._get_task_details(**arguments)
             elif tool_name == "sync_task_from_github":
                 task_id = arguments.get("task_id", "")
                 if not task_id:
@@ -142,7 +142,7 @@ class TaskHandler(BaseHandler):
         unapproved_reqs = []
 
         for req_id in params["requirement_ids"]:
-            req_status = self.db.get_records("requirements", "status", "id = ?", [req_id])
+            req_status = await self.db.get_records("requirements", "status", "id = ?", [req_id])
 
             if not req_status:
                 return self._create_error_response(f"Requirement {req_id} not found")
@@ -160,65 +160,81 @@ class TaskHandler(BaseHandler):
             return self._create_error_response(error_msg)
 
         try:
-            # Get next task number
-            task_number = self.db.get_next_id("tasks", "task_number")
+            parent_task_id = params.get("parent_task_id")
 
-            # Determine subtask number
-            subtask_number = 0
-            if params.get("parent_task_id"):
-                # For subtasks, find the parent's task number and get next subtask number
-                parent_info = self.db.get_records("tasks", "task_number", "id = ?", [params["parent_task_id"]])
-
-                if parent_info:
-                    parent_task_number = parent_info[0]["task_number"]
-                    # Count existing subtasks using relationships table
-                    existing_subtasks = self.db.get_records(
-                        "relationships", "COUNT(*) as count",
-                        "target_type = 'task' AND target_id = ? AND relationship_type = 'parent'",
-                        [params["parent_task_id"]]
+            # Use transaction for atomic task_number assignment + insert
+            async with self.db.transaction() as conn:
+                if parent_task_id:
+                    # Subtask: get parent's task_number and count existing subtasks
+                    cursor = await conn.execute(
+                        "SELECT task_number FROM tasks WHERE id = ?", [parent_task_id]
                     )
-                    subtask_number = existing_subtasks[0]["count"] + 1 if existing_subtasks else 1
-                    task_number = parent_task_number
+                    parent_row = await cursor.fetchone()
+                    if not parent_row:
+                        raise ValueError(f"Parent task {parent_task_id} not found")
+
+                    task_number = parent_row[0]
+
+                    # Count existing subtasks using relationships table
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM relationships "
+                        "WHERE target_type = 'task' AND target_id = ? AND relationship_type = 'parent'",
+                        [parent_task_id],
+                    )
+                    count_row = await cursor.fetchone()
+                    subtask_number = (count_row[0] if count_row else 0) + 1
                 else:
-                    # Parent task not found
-                    return self._create_error_response(f"Parent task {params['parent_task_id']} not found")
+                    # Top-level task: get next task_number
+                    cursor = await conn.execute(
+                        "SELECT COALESCE(MAX(task_number), 0) + 1 FROM tasks"
+                    )
+                    row = await cursor.fetchone()
+                    task_number = row[0] if row else 1
+                    subtask_number = 0
 
-            task_id = f"TASK-{task_number:04d}-{subtask_number:02d}-00"
+                task_id = f"TASK-{task_number:04d}-{subtask_number:02d}-00"
 
-            # Prepare task data (removed parent_task_id column)
-            task_data = {
-                "id": task_id,
-                "task_number": task_number,
-                "subtask_number": subtask_number,
-                "version": 0,
-                "title": params["title"],
-                "priority": params["priority"],
-                "effort": params.get("effort"),
-                "user_story": params.get("user_story"),
-                "acceptance_criteria": self._safe_json_dumps(params.get("acceptance_criteria", [])),
-                "assignee": params.get("assignee"),
-                "status": "Not Started",
-            }
+                # Prepare task data
+                task_data = {
+                    "id": task_id,
+                    "task_number": task_number,
+                    "subtask_number": subtask_number,
+                    "version": 0,
+                    "title": params["title"],
+                    "priority": params["priority"],
+                    "effort": params.get("effort"),
+                    "user_story": params.get("user_story"),
+                    "acceptance_criteria": self._safe_json_dumps(params.get("acceptance_criteria", [])),
+                    "assignee": params.get("assignee"),
+                    "status": "Not Started",
+                }
 
-            # Insert task
-            self.db.insert_record("tasks", task_data)
+                # Insert task inside the transaction
+                columns = ", ".join(task_data.keys())
+                placeholders = ", ".join(["?"] * len(task_data))
+                await conn.execute(
+                    f"INSERT INTO tasks ({columns}) VALUES ({placeholders})",
+                    list(task_data.values()),
+                )
+
+            # Outside transaction: create relationships and links
 
             # Create parent-child relationship if this is a subtask
-            if params.get("parent_task_id"):
-                relationship_id = f"rel-{task_id}-{params['parent_task_id']}-parent"
+            if parent_task_id:
+                relationship_id = f"rel-{task_id}-{parent_task_id}-parent"
                 relationship_data = {
                     "id": relationship_id,
                     "source_type": "task",
                     "source_id": task_id,
                     "target_type": "task",
-                    "target_id": params["parent_task_id"],
-                    "relationship_type": "parent"
+                    "target_id": parent_task_id,
+                    "relationship_type": "parent",
                 }
-                self.db.insert_record("relationships", relationship_data)
+                await self.db.insert_record("relationships", relationship_data)
 
             # Link to requirements
             for req_id in params["requirement_ids"]:
-                self.db.insert_record("requirement_tasks", {"requirement_id": req_id, "task_id": task_id})
+                await self.db.insert_record("requirement_tasks", {"requirement_id": req_id, "task_id": task_id})
 
             # Create GitHub issue if available
             github_url = None
@@ -251,7 +267,7 @@ class TaskHandler(BaseHandler):
                                 "github_etag": github_issue.get("etag") if github_issue else None,
                             }
 
-                            self.db.update_record("tasks", github_data, "id = ?", [task_id])
+                            await self.db.update_record("tasks", github_data, "id = ?", [task_id])
                     else:
                         github_error = "GitHub issue creation returned no URL"
 
@@ -273,6 +289,8 @@ class TaskHandler(BaseHandler):
 
             return self._create_above_fold_response("SUCCESS", key_info, action_info, github_info)
 
+        except ValueError as ve:
+            return self._create_error_response(str(ve))
         except Exception as e:
             return self._create_error_response("Failed to create task", e)
 
@@ -285,7 +303,7 @@ class TaskHandler(BaseHandler):
 
         try:
             # Get current task with GitHub info
-            current_tasks = self.db.get_records(
+            current_tasks = await self.db.get_records(
                 "tasks", "status, assignee, github_issue_number, github_issue_url", "id = ?", [params["task_id"]]
             )
 
@@ -303,11 +321,11 @@ class TaskHandler(BaseHandler):
                 update_data["assignee"] = params["assignee"]
 
             # Update task
-            self.db.update_record("tasks", update_data, "id = ?", [params["task_id"]])
+            await self.db.update_record("tasks", update_data, "id = ?", [params["task_id"]])
 
             # Add comment if provided
             if params.get("comment"):
-                self._add_review_comment("task", params["task_id"], params["comment"])
+                await self._add_review_comment("task", params["task_id"], params["comment"])
 
             # Update GitHub issue if it exists using sync-safe operations
             github_updated = False
@@ -343,7 +361,7 @@ class TaskHandler(BaseHandler):
                     if success and updated_issue:
                         github_updated = True
                         # Update stored ETag and sync timestamp
-                        self.db.update_record(
+                        await self.db.update_record(
                             "tasks",
                             {"github_etag": updated_issue.get("etag"), "github_last_sync": datetime.now().isoformat()},
                             "id = ?",
@@ -375,7 +393,7 @@ class TaskHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to update task", e)
 
-    def _query_tasks(self, **params) -> list[TextContent]:
+    async def _query_tasks(self, **params) -> list[TextContent]:
         """Query tasks with filters"""
         try:
             where_clauses = []
@@ -383,7 +401,7 @@ class TaskHandler(BaseHandler):
 
             # Handle requirement_id filter specially (requires join)
             if params.get("requirement_id"):
-                tasks = self.db.execute_query(
+                tasks = await self.db.execute_query(
                     """
                     SELECT t.* FROM tasks t
                     JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -410,7 +428,7 @@ class TaskHandler(BaseHandler):
 
                 where_clause = " AND ".join(where_clauses) if where_clauses else ""
 
-                tasks = self.db.get_records("tasks", "*", where_clause, where_params, "priority, created_at DESC")
+                tasks = await self.db.get_records("tasks", "*", where_clause, where_params, "priority, created_at DESC")
 
             if not tasks:
                 return self._create_above_fold_response("INFO", "No tasks found", "Try adjusting search criteria")
@@ -441,7 +459,7 @@ class TaskHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to query tasks", e)
 
-    def _query_tasks_json(self, **params) -> list[TextContent]:
+    async def _query_tasks_json(self, **params) -> list[TextContent]:
         """Query tasks and return structured JSON data for UI"""
         try:
             import json
@@ -451,7 +469,7 @@ class TaskHandler(BaseHandler):
 
             # Handle requirement_id filter specially (requires join)
             if params.get("requirement_id"):
-                tasks = self.db.execute_query(
+                tasks = await self.db.execute_query(
                     """
                     SELECT t.* FROM tasks t
                     JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -478,7 +496,7 @@ class TaskHandler(BaseHandler):
 
                 where_clause = " AND ".join(where_clauses) if where_clauses else ""
 
-                tasks = self.db.get_records("tasks", "*", where_clause, where_params, "priority, created_at DESC")
+                tasks = await self.db.get_records("tasks", "*", where_clause, where_params, "priority, created_at DESC")
 
             # Convert to list of dictionaries with JSON parsing
             tasks_list = []
@@ -505,7 +523,7 @@ class TaskHandler(BaseHandler):
         """Sync task from GitHub issue changes"""
         try:
             # Get current task with GitHub info
-            tasks = self.db.get_records("tasks", "*", "id = ?", [task_id])
+            tasks = await self.db.get_records("tasks", "*", "id = ?", [task_id])
 
             if not tasks:
                 return self._create_error_response("Task not found")
@@ -546,7 +564,7 @@ class TaskHandler(BaseHandler):
                     new_status = "In Progress"
 
                 if new_status:
-                    self.db.update_record(
+                    await self.db.update_record(
                         "tasks",
                         {
                             "status": new_status,
@@ -564,7 +582,7 @@ class TaskHandler(BaseHandler):
                 current_assignee = task.get("assignee")
 
                 if github_assignee != current_assignee:
-                    self.db.update_record("tasks", {"assignee": github_assignee}, "id = ?", [task_id])
+                    await self.db.update_record("tasks", {"assignee": github_assignee}, "id = ?", [task_id])
                     updates_applied.append(f"Assignee: {current_assignee or 'None'} → {github_assignee or 'None'}")
 
             # Create response
@@ -583,7 +601,7 @@ class TaskHandler(BaseHandler):
         """Sync all tasks with GitHub issues"""
         try:
             # Get all tasks with GitHub issues
-            tasks_with_github = self.db.get_records(
+            tasks_with_github = await self.db.get_records(
                 "tasks",
                 "id, title, status, github_issue_number, github_last_sync",
                 "github_issue_number IS NOT NULL AND github_issue_number != ''",
@@ -648,7 +666,7 @@ class TaskHandler(BaseHandler):
                                 task_updates.append(f"Assignee: {from_assignee} → {to_assignee}")
 
                             if task_updates:
-                                self.db.update_record("tasks", update_data, "id = ?", [task["id"]])
+                                await self.db.update_record("tasks", update_data, "id = ?", [task["id"]])
                                 updates_applied.append(f"🔄 {task['id']}: {' | '.join(task_updates)}")
                             else:
                                 sync_results.append(f"✅ {task['id']}: Updated sync metadata")
@@ -687,7 +705,7 @@ class TaskHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to bulk sync with GitHub", e)
 
-    def _get_task_details(self, **params) -> list[TextContent]:
+    async def _get_task_details(self, **params) -> list[TextContent]:
         """Get full task details"""
         # Validate required parameters
         error = self._validate_required_params(params, ["task_id"])
@@ -696,7 +714,7 @@ class TaskHandler(BaseHandler):
 
         try:
             # Get task
-            tasks = self.db.get_records("tasks", "*", "id = ?", [params["task_id"]])
+            tasks = await self.db.get_records("tasks", "*", "id = ?", [params["task_id"]])
 
             if not tasks:
                 return self._create_error_response("Task not found")
@@ -737,7 +755,7 @@ class TaskHandler(BaseHandler):
                 task_info += "No acceptance criteria defined\n"
 
             # Get linked requirements
-            requirements = self.db.execute_query(
+            requirements = await self.db.execute_query(
                 """
                 SELECT r.id, r.title FROM requirements r
                 JOIN requirement_tasks rt ON r.id = rt.requirement_id
@@ -755,7 +773,7 @@ class TaskHandler(BaseHandler):
 
             # Get subtasks if this is a parent task
             # Query relationships table for child tasks
-            child_relationship_records = self.db.get_records(
+            child_relationship_records = await self.db.get_records(
                 "relationships", "source_id",
                 "target_type = 'task' AND target_id = ? AND relationship_type = 'parent'",
                 [params["task_id"]]
@@ -764,8 +782,8 @@ class TaskHandler(BaseHandler):
             subtasks = []
             if child_relationship_records:
                 child_task_ids = [r["source_id"] for r in child_relationship_records]
-                for task_id in child_task_ids:
-                    task_records = self.db.get_records("tasks", "id, title, status", "id = ?", [task_id])
+                for child_task_id in child_task_ids:
+                    task_records = await self.db.get_records("tasks", "id, title, status", "id = ?", [child_task_id])
                     if task_records:
                         subtasks.extend(task_records)
 
@@ -776,7 +794,7 @@ class TaskHandler(BaseHandler):
 
             # Show parent task if this is a subtask
             # Query relationships table for parent tasks
-            parent_relationship_records = self.db.get_records(
+            parent_relationship_records = await self.db.get_records(
                 "relationships", "target_id",
                 "source_type = 'task' AND source_id = ? AND relationship_type = 'parent'",
                 [params["task_id"]]
@@ -784,7 +802,7 @@ class TaskHandler(BaseHandler):
 
             if parent_relationship_records:
                 parent_task_id = parent_relationship_records[0]["target_id"]
-                parent_tasks = self.db.get_records("tasks", "id, title, status", "id = ?", [parent_task_id])
+                parent_tasks = await self.db.get_records("tasks", "id, title, status", "id = ?", [parent_task_id])
 
                 if parent_tasks:
                     parent = dict(parent_tasks[0])  # Convert Row to dict for consistency

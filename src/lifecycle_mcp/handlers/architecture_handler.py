@@ -123,15 +123,15 @@ class ArchitectureHandler(BaseHandler):
             if tool_name == "create_architecture_decision":
                 return await self._create_architecture_decision(**arguments)
             elif tool_name == "update_architecture_status":
-                return self._update_architecture_status(**arguments)
+                return await self._update_architecture_status(**arguments)
             elif tool_name == "query_architecture_decisions":
-                return self._query_architecture_decisions(**arguments)
+                return await self._query_architecture_decisions(**arguments)
             elif tool_name == "query_architecture_decisions_json":
-                return self._query_architecture_decisions_json(**arguments)
+                return await self._query_architecture_decisions_json(**arguments)
             elif tool_name == "get_architecture_details":
-                return self._get_architecture_details(**arguments)
+                return await self._get_architecture_details(**arguments)
             elif tool_name == "add_architecture_review":
-                return self._add_architecture_review(**arguments)
+                return await self._add_architecture_review(**arguments)
             else:
                 return self._create_error_response(f"Unknown tool: {tool_name}")
         except Exception as e:
@@ -145,38 +145,43 @@ class ArchitectureHandler(BaseHandler):
             return self._create_error_response(error)
 
         try:
-            # Get next ADR number
-            adr_number = self.db.execute_query(
-                """
-                SELECT COALESCE(MAX(CAST(SUBSTR(id, 5, 4) AS INTEGER)), 0) + 1
-                FROM architecture
-                WHERE type = 'ADR'
-            """,
-                fetch_one=True,
-            )[0]
+            # Use transaction for atomic ADR number assignment + insert
+            async with self.db.transaction() as conn:
+                # Get next ADR number
+                cursor = await conn.execute(
+                    "SELECT COALESCE(MAX(CAST(SUBSTR(id, 5, 4) AS INTEGER)), 0) + 1 "
+                    "FROM architecture WHERE type = 'ADR'"
+                )
+                row = await cursor.fetchone()
+                adr_number = row[0] if row else 1
 
-            adr_id = f"ADR-{adr_number:04d}"
+                adr_id = f"ADR-{adr_number:04d}"
 
-            # Prepare architecture data
-            arch_data = {
-                "id": adr_id,
-                "type": "ADR",
-                "title": params["title"],
-                "status": "Proposed",
-                "context": params["context"],
-                "decision_outcome": params["decision"],
-                "decision_drivers": self._safe_json_dumps(params.get("decision_drivers", [])),
-                "considered_options": self._safe_json_dumps(params.get("considered_options", [])),
-                "consequences": self._safe_json_dumps(params.get("consequences", {})),
-                "authors": self._safe_json_dumps(params.get("authors", ["MCP User"])),
-            }
+                # Prepare architecture data
+                arch_data = {
+                    "id": adr_id,
+                    "type": "ADR",
+                    "title": params["title"],
+                    "status": "Proposed",
+                    "context": params["context"],
+                    "decision_outcome": params["decision"],
+                    "decision_drivers": self._safe_json_dumps(params.get("decision_drivers", [])),
+                    "considered_options": self._safe_json_dumps(params.get("considered_options", [])),
+                    "consequences": self._safe_json_dumps(params.get("consequences", {})),
+                    "authors": self._safe_json_dumps(params.get("authors", ["MCP User"])),
+                }
 
-            # Insert ADR
-            self.db.insert_record("architecture", arch_data)
+                # Insert ADR inside the transaction
+                columns = ", ".join(arch_data.keys())
+                placeholders = ", ".join(["?"] * len(arch_data))
+                await conn.execute(
+                    f"INSERT INTO architecture ({columns}) VALUES ({placeholders})",
+                    list(arch_data.values()),
+                )
 
-            # Link to requirements
+            # Outside transaction: link to requirements
             for req_id in params["requirement_ids"]:
-                self.db.insert_record(
+                await self.db.insert_record(
                     "relationships",
                     {
                         "id": f"rel-{req_id}-{adr_id}-addresses",
@@ -207,7 +212,7 @@ class ArchitectureHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to create architecture decision", e)
 
-    def _update_architecture_status(self, **params) -> list[TextContent]:
+    async def _update_architecture_status(self, **params) -> list[TextContent]:
         """Update architecture decision status"""
         # Validate required parameters
         error = self._validate_required_params(params, ["architecture_id", "new_status"])
@@ -216,7 +221,7 @@ class ArchitectureHandler(BaseHandler):
 
         try:
             # Get current status
-            current_arch = self.db.get_records("architecture", "status", "id = ?", [params["architecture_id"]])
+            current_arch = await self.db.get_records("architecture", "status", "id = ?", [params["architecture_id"]])
 
             if not current_arch:
                 return self._create_error_response("Architecture decision not found")
@@ -225,7 +230,7 @@ class ArchitectureHandler(BaseHandler):
             new_status = params["new_status"]
 
             # Update status
-            self.db.update_record(
+            await self.db.update_record(
                 "architecture",
                 {"status": new_status, "updated_at": "CURRENT_TIMESTAMP"},
                 "id = ?",
@@ -234,7 +239,7 @@ class ArchitectureHandler(BaseHandler):
 
             # Add review comment if provided
             if params.get("comment"):
-                self._add_review_comment("architecture", params["architecture_id"], params["comment"])
+                await self._add_review_comment("architecture", params["architecture_id"], params["comment"])
 
             # Create above-the-fold response
             key_info = f"Architecture {params['architecture_id']} updated"
@@ -244,7 +249,7 @@ class ArchitectureHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to update architecture status", e)
 
-    def _query_architecture_decisions(self, **params) -> list[TextContent]:
+    async def _query_architecture_decisions(self, **params) -> list[TextContent]:
         """Query architecture decisions with filters"""
         try:
             where_clauses = []
@@ -289,7 +294,7 @@ class ArchitectureHandler(BaseHandler):
 
             base_query += " ORDER BY created_at DESC"
 
-            decisions = self.db.execute_query(base_query, where_params, fetch_all=True, row_factory=True)
+            decisions = await self.db.execute_query(base_query, where_params, fetch_all=True, row_factory=True)
 
             if not decisions:
                 return self._create_above_fold_response(
@@ -320,7 +325,7 @@ class ArchitectureHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to query architecture decisions", e)
 
-    def _query_architecture_decisions_json(self, **params) -> list[TextContent]:
+    async def _query_architecture_decisions_json(self, **params) -> list[TextContent]:
         """Query architecture decisions and return structured JSON data for UI"""
         try:
             import json
@@ -367,7 +372,7 @@ class ArchitectureHandler(BaseHandler):
 
             base_query += " ORDER BY created_at DESC"
 
-            decisions = self.db.execute_query(base_query, where_params, fetch_all=True, row_factory=True)
+            decisions = await self.db.execute_query(base_query, where_params, fetch_all=True, row_factory=True)
 
             # Convert to list of dictionaries with JSON parsing
             decisions_list = []
@@ -390,7 +395,7 @@ class ArchitectureHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to query architecture decisions for JSON", e)
 
-    def _get_architecture_details(self, **params) -> list[TextContent]:
+    async def _get_architecture_details(self, **params) -> list[TextContent]:
         """Get full architecture decision details"""
         # Validate required parameters
         error = self._validate_required_params(params, ["architecture_id"])
@@ -399,7 +404,7 @@ class ArchitectureHandler(BaseHandler):
 
         try:
             # Get architecture decision
-            arch_decisions = self.db.get_records("architecture", "*", "id = ?", [params["architecture_id"]])
+            arch_decisions = await self.db.get_records("architecture", "*", "id = ?", [params["architecture_id"]])
 
             if not arch_decisions:
                 return self._create_error_response("Architecture decision not found")
@@ -449,7 +454,7 @@ class ArchitectureHandler(BaseHandler):
                         report += f"{consequences}\n"
 
             # Get linked requirements
-            requirements = self.db.execute_query(
+            requirements = await self.db.execute_query(
                 """
                 SELECT r.id, r.title FROM requirements r
                 JOIN relationships ra ON r.id = ra.source_id
@@ -466,7 +471,7 @@ class ArchitectureHandler(BaseHandler):
                     report += f"- {req['id']}: {req['title']}\n"
 
             # Get reviews
-            reviews = self.db.execute_query(
+            reviews = await self.db.execute_query(
                 """
                 SELECT reviewer, comment, created_at FROM reviews
                 WHERE entity_type = 'architecture' AND entity_id = ?
@@ -490,7 +495,7 @@ class ArchitectureHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to get architecture details", e)
 
-    def _add_architecture_review(self, **params) -> list[TextContent]:
+    async def _add_architecture_review(self, **params) -> list[TextContent]:
         """Add review comment to architecture decision"""
         # Validate required parameters
         error = self._validate_required_params(params, ["architecture_id", "comment"])
@@ -499,11 +504,11 @@ class ArchitectureHandler(BaseHandler):
 
         try:
             # Verify architecture exists
-            if not self.db.check_exists("architecture", "id = ?", [params["architecture_id"]]):
+            if not await self.db.check_exists("architecture", "id = ?", [params["architecture_id"]]):
                 return self._create_error_response("Architecture decision not found")
 
             # Add review
-            self._add_review_comment(
+            await self._add_review_comment(
                 "architecture", params["architecture_id"], params["comment"], params.get("reviewer", "MCP User")
             )
 

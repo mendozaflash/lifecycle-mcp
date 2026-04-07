@@ -122,13 +122,13 @@ class RequirementHandler(BaseHandler):
             elif tool_name == "update_requirement_status":
                 return await self._update_requirement_status(**arguments)
             elif tool_name == "query_requirements":
-                return self._query_requirements(**arguments)
+                return await self._query_requirements(**arguments)
             elif tool_name == "query_requirements_json":
-                return self._query_requirements_json(**arguments)
+                return await self._query_requirements_json(**arguments)
             elif tool_name == "get_requirement_details":
-                return self._get_requirement_details(**arguments)
+                return await self._get_requirement_details(**arguments)
             elif tool_name == "trace_requirement":
-                return self._trace_requirement(**arguments)
+                return await self._trace_requirement(**arguments)
             else:
                 return self._create_error_response(f"Unknown tool: {tool_name}")
         except Exception as e:
@@ -158,7 +158,7 @@ class RequirementHandler(BaseHandler):
                 analysis_warning = "\n⚠️  LLM analysis not available - proceeding with standard creation"
 
             # Standard requirement creation (single requirement)
-            req_id = self._create_single_requirement(params)
+            req_id = await self._create_single_requirement(params)
 
             # Create above-the-fold response
             key_info = f"Requirement {req_id} created"
@@ -317,34 +317,50 @@ Guidelines:
         action_info = f"🔄 {len(suggestions)} sub-requirements suggested | Complex scope detected"
         return self._create_above_fold_response("INFO", key_info, action_info, response)
 
-    def _create_single_requirement(self, params: dict[str, Any]) -> str:
-        """Create a single requirement (extracted from original logic)"""
-        # Get next requirement number
-        req_number = self.db.get_next_id("requirements", "requirement_number", "type = ?", [params["type"]])
-        req_id = f"REQ-{req_number:04d}-{params['type']}-00"
+    async def _create_single_requirement(self, params: dict[str, Any]) -> str:
+        """Create a single requirement (extracted from original logic)
 
-        # Prepare requirement data
-        req_data = {
-            "id": req_id,
-            "requirement_number": req_number,
-            "type": params["type"],
-            "version": 0,
-            "title": params["title"],
-            "priority": params["priority"],
-            "current_state": params["current_state"],
-            "desired_state": params["desired_state"],
-            "functional_requirements": self._safe_json_dumps(params.get("functional_requirements", [])),
-            "acceptance_criteria": self._safe_json_dumps(params.get("acceptance_criteria", [])),
-            "author": params.get("author", "MCP User"),
-            "business_value": params.get("business_value", ""),
-            "risk_level": params.get("risk_level", "Medium"),
-        }
+        Uses an atomic transaction for SELECT MAX + INSERT to prevent
+        concurrent callers from receiving the same requirement_number.
+        """
+        async with self.db.transaction() as conn:
+            # Atomically get next requirement number
+            cursor = await conn.execute(
+                "SELECT COALESCE(MAX(requirement_number), 0) + 1 FROM requirements WHERE type = ?",
+                [params["type"]],
+            )
+            row = await cursor.fetchone()
+            req_number = row[0] if row else 1
 
-        # Insert requirement
-        self.db.insert_record("requirements", req_data)
+            req_id = f"REQ-{req_number:04d}-{params['type']}-00"
 
-        # Log event
-        self._log_operation("requirement", req_id, "created", params.get("author", "MCP User"))
+            # Prepare requirement data
+            req_data = {
+                "id": req_id,
+                "requirement_number": req_number,
+                "type": params["type"],
+                "version": 0,
+                "title": params["title"],
+                "priority": params["priority"],
+                "current_state": params["current_state"],
+                "desired_state": params["desired_state"],
+                "functional_requirements": self._safe_json_dumps(params.get("functional_requirements", [])),
+                "acceptance_criteria": self._safe_json_dumps(params.get("acceptance_criteria", [])),
+                "author": params.get("author", "MCP User"),
+                "business_value": params.get("business_value", ""),
+                "risk_level": params.get("risk_level", "Medium"),
+            }
+
+            # Insert requirement inside the transaction
+            columns = ", ".join(req_data.keys())
+            placeholders = ", ".join(["?"] * len(req_data))
+            await conn.execute(
+                f"INSERT INTO requirements ({columns}) VALUES ({placeholders})",
+                list(req_data.values()),
+            )
+
+        # Log event (outside transaction — uses its own connection)
+        await self._log_operation("requirement", req_id, "created", params.get("author", "MCP User"))
 
         return req_id
 
@@ -357,7 +373,7 @@ Guidelines:
 
             if not suggestions:
                 # Fallback to single requirement if no suggestions
-                req_id = self._create_single_requirement(original_params)
+                req_id = await self._create_single_requirement(original_params)
                 key_info = f"Requirement {req_id} created"
                 req_type = original_params["type"]
                 priority = original_params["priority"]
@@ -365,7 +381,7 @@ Guidelines:
                 return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
             # Create parent requirement first
-            parent_req_id = self._create_single_requirement(
+            parent_req_id = await self._create_single_requirement(
                 {
                     **original_params,
                     "title": f"{original_params['title']} (Parent)",
@@ -396,11 +412,11 @@ Guidelines:
                     "acceptance_criteria": original_params.get("acceptance_criteria", []),
                 }
 
-                sub_req_id = self._create_single_requirement(sub_req_data)
+                sub_req_id = await self._create_single_requirement(sub_req_data)
                 sub_req_ids.append(sub_req_id)
 
                 # Create parent-child relationship
-                self._create_requirement_dependency(sub_req_id, parent_req_id, "parent")
+                await self._create_requirement_dependency(sub_req_id, parent_req_id, "parent")
 
             # Build comprehensive response
             response = f"""# Automatic Requirement Decomposition Complete
@@ -435,16 +451,16 @@ Guidelines:
         except Exception as e:
             # Fallback to single requirement creation if decomposition fails
             self.logger.warning(f"Automatic decomposition failed, creating single requirement: {e}")
-            req_id = self._create_single_requirement(original_params)
+            req_id = await self._create_single_requirement(original_params)
             key_info = f"Requirement {req_id} created"
             action_info = f"📄 {original_params['title']} | Decomposition failed, created single requirement"
             return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
-    def _create_requirement_dependency(self, requirement_id: str, depends_on_id: str, dependency_type: str):
+    async def _create_requirement_dependency(self, requirement_id: str, depends_on_id: str, dependency_type: str):
         """Create a requirement dependency relationship"""
         try:
             relationship_id = f"rel-{requirement_id}-{depends_on_id}-{dependency_type}"
-            self.db.insert_record(
+            await self.db.insert_record(
                 "relationships",
                 {
                     "id": relationship_id,
@@ -455,7 +471,7 @@ Guidelines:
                     "relationship_type": dependency_type,
                 },
             )
-            self._log_operation(
+            await self._log_operation(
                 "requirement_dependency",
                 requirement_id,
                 f"created_{dependency_type}_relationship",
@@ -473,7 +489,7 @@ Guidelines:
 
         try:
             # Get current status
-            current_req = self.db.get_records("requirements", "status", "id = ?", [params["requirement_id"]])
+            current_req = await self.db.get_records("requirements", "status", "id = ?", [params["requirement_id"]])
 
             if not current_req:
                 return self._create_error_response("Requirement not found")
@@ -483,7 +499,7 @@ Guidelines:
 
             # Validate task completion before allowing Validated status
             if new_status == "Validated":
-                incomplete_tasks = self.db.execute_query(
+                incomplete_tasks = await self.db.execute_query(
                     """
                     SELECT t.id, t.title, t.status FROM tasks t
                     JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -521,7 +537,7 @@ Guidelines:
                 return self._create_error_response(f"Invalid transition from {current_status} to {new_status}")
 
             # Update status
-            self.db.update_record(
+            await self.db.update_record(
                 "requirements",
                 {"status": new_status, "updated_at": "CURRENT_TIMESTAMP"},
                 "id = ?",
@@ -530,7 +546,7 @@ Guidelines:
 
             # Add review comment if provided
             if params.get("comment"):
-                self._add_review_comment("requirement", params["requirement_id"], params["comment"])
+                await self._add_review_comment("requirement", params["requirement_id"], params["comment"])
 
             # Create above-the-fold response
             key_info = f"Requirement {params['requirement_id']} updated"
@@ -541,7 +557,7 @@ Guidelines:
         except Exception as e:
             return self._create_error_response("Failed to update requirement status", e)
 
-    def _query_requirements(self, **params) -> list[TextContent]:
+    async def _query_requirements(self, **params) -> list[TextContent]:
         """Query requirements with filters"""
         try:
             where_clauses = []
@@ -566,7 +582,7 @@ Guidelines:
 
             where_clause = " AND ".join(where_clauses) if where_clauses else ""
 
-            requirements = self.db.get_records(
+            requirements = await self.db.get_records(
                 "requirements", "*", where_clause, where_params, "priority, created_at DESC"
             )
 
@@ -601,7 +617,7 @@ Guidelines:
         except Exception as e:
             return self._create_error_response("Failed to query requirements", e)
 
-    def _query_requirements_json(self, **params) -> list[TextContent]:
+    async def _query_requirements_json(self, **params) -> list[TextContent]:
         """Query requirements and return structured JSON data for UI"""
         try:
             where_clauses = []
@@ -626,7 +642,7 @@ Guidelines:
 
             where_clause = " AND ".join(where_clauses) if where_clauses else ""
 
-            requirements = self.db.get_records(
+            requirements = await self.db.get_records(
                 "requirements", "*", where_clause, where_params, "priority, created_at DESC"
             )
 
@@ -653,7 +669,7 @@ Guidelines:
         except Exception as e:
             return self._create_error_response("Failed to query requirements as JSON", e)
 
-    def _get_requirement_details(self, **params) -> list[TextContent]:
+    async def _get_requirement_details(self, **params) -> list[TextContent]:
         """Get full requirement details"""
         # Validate required parameters
         error = self._validate_required_params(params, ["requirement_id"])
@@ -662,7 +678,7 @@ Guidelines:
 
         try:
             # Get requirement
-            requirements = self.db.get_records("requirements", "*", "id = ?", [params["requirement_id"]])
+            requirements = await self.db.get_records("requirements", "*", "id = ?", [params["requirement_id"]])
 
             if not requirements:
                 return self._create_error_response("Requirement not found")
@@ -707,7 +723,7 @@ Guidelines:
                         report += f"- {ac}\n"
 
             # Get linked tasks
-            tasks = self.db.execute_query(
+            tasks = await self.db.execute_query(
                 """
                 SELECT t.* FROM tasks t
                 JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -731,7 +747,7 @@ Guidelines:
         except Exception as e:
             return self._create_error_response("Failed to get requirement details", e)
 
-    def _trace_requirement(self, **params) -> list[TextContent]:
+    async def _trace_requirement(self, **params) -> list[TextContent]:
         """Trace requirement through full lifecycle including decomposition relationships"""
         # Validate required parameters
         error = self._validate_required_params(params, ["requirement_id"])
@@ -740,7 +756,7 @@ Guidelines:
 
         try:
             # Get requirement
-            requirements = self.db.get_records("requirements", "*", "id = ?", [params["requirement_id"]])
+            requirements = await self.db.get_records("requirements", "*", "id = ?", [params["requirement_id"]])
 
             if not requirements:
                 return self._create_error_response("Requirement not found")
@@ -748,7 +764,7 @@ Guidelines:
             req = requirements[0]
 
             # Get parent requirements (if this is a child requirement)
-            parent_requirements = self.db.execute_query(
+            parent_requirements = await self.db.execute_query(
                 """
                 SELECT r.* FROM requirements r
                 JOIN relationships rel ON r.id = rel.target_id
@@ -760,7 +776,7 @@ Guidelines:
             )
 
             # Get child requirements (if this is a parent requirement)
-            child_requirements = self.db.execute_query(
+            child_requirements = await self.db.execute_query(
                 """
                 SELECT r.* FROM requirements r
                 JOIN relationships rel ON r.id = rel.source_id
@@ -773,7 +789,7 @@ Guidelines:
             )
 
             # Get tasks
-            tasks = self.db.execute_query(
+            tasks = await self.db.execute_query(
                 """
                 SELECT t.* FROM tasks t
                 JOIN requirement_tasks rt ON t.id = rt.task_id
@@ -786,7 +802,7 @@ Guidelines:
             )
 
             # Get architecture
-            architecture = self.db.execute_query(
+            architecture = await self.db.execute_query(
                 """
                 SELECT a.* FROM architecture a
                 JOIN relationships rel ON a.id = rel.target_id
