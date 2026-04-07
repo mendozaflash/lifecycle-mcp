@@ -110,20 +110,20 @@ class BaseHandler(ABC):
             self.logger.warning(f"Failed to serialize to JSON: {str(e)}")
             return "[]"
 
-    def _log_operation(self, entity_type: str, entity_id: str, event_type: str, actor: str = "MCP User"):
+    async def _log_operation(self, entity_type: str, entity_id: str, event_type: str, actor: str = "MCP User"):
         """Log lifecycle events"""
         try:
-            self.db.insert_record(
+            await self.db.insert_record(
                 "lifecycle_events",
                 {"entity_type": entity_type, "entity_id": entity_id, "event_type": event_type, "actor": actor},
             )
         except Exception as e:
             self.logger.warning(f"Failed to log event: {str(e)}")
 
-    def _add_review_comment(self, entity_type: str, entity_id: str, comment: str, reviewer: str = "MCP User"):
+    async def _add_review_comment(self, entity_type: str, entity_id: str, comment: str, reviewer: str = "MCP User"):
         """Add review comment to an entity"""
         try:
-            self.db.insert_record(
+            await self.db.insert_record(
                 "reviews",
                 {"entity_type": entity_type, "entity_id": entity_id, "reviewer": reviewer, "comment": comment},
             )

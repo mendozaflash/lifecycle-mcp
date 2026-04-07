@@ -79,12 +79,12 @@ def temp_db():
 
 
 @pytest.fixture
-def db_manager(temp_db):
-    """Create a DatabaseManager instance with temporary database"""
+async def db_manager(temp_db):
+    """Create an async DatabaseManager instance with temporary database"""
     manager = DatabaseManager(temp_db)
+    await manager.initialize()
     yield manager
-    # Ensure all connections are closed before cleanup
-    manager.close()
+    await manager.close()
 
 
 @pytest.fixture
