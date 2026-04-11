@@ -39,7 +39,7 @@ CREATE TABLE requirements (
     project_id TEXT NOT NULL REFERENCES projects(id),
     type TEXT NOT NULL CHECK(type IN ('FUNC', 'NFUNC', 'TECH', 'BUS', 'INTF')),
     title TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Draft' CHECK(status IN ('Draft', 'Under Review', 'Approved', 'Architecture', 'Ready', 'Implemented', 'Validated', 'Deprecated')),
+    status TEXT NOT NULL DEFAULT 'Under Review' CHECK(status IN ('Under Review', 'Approved', 'Partially Implemented', 'Partially Implemented Validated', 'Implemented', 'Partially Validated', 'Validated', 'Deprecated')),
     priority TEXT NOT NULL CHECK(priority IN ('P0', 'P1', 'P2', 'P3')),
     current_state TEXT,
     desired_state TEXT,
@@ -63,7 +63,7 @@ CREATE TABLE tasks (
     id TEXT PRIMARY KEY,           -- TASK-XXXX
     project_id TEXT NOT NULL REFERENCES projects(id),
     title TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Not Started' CHECK(status IN ('Not Started', 'In Progress', 'Blocked', 'Complete', 'Abandoned')),
+    status TEXT NOT NULL DEFAULT 'Under Review' CHECK(status IN ('Under Review', 'Approved', 'Implemented', 'Validated', 'Deprecated')),
     priority TEXT NOT NULL CHECK(priority IN ('P0', 'P1', 'P2', 'P3')),
     effort TEXT CHECK(effort IN ('XS', 'S', 'M', 'L', 'XL')),
     user_story TEXT,
@@ -163,7 +163,7 @@ SELECT
     p.id, p.name, p.status,
     (SELECT COUNT(*) FROM requirements r WHERE r.project_id = p.id AND r.is_archived = 0) AS requirement_count,
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.is_archived = 0) AS task_count,
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'Complete' AND t.is_archived = 0) AS tasks_completed,
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.status = 'Validated' AND t.is_archived = 0) AS tasks_completed,
     (SELECT COUNT(*) FROM architecture a WHERE a.project_id = p.id AND a.is_archived = 0) AS adr_count
 FROM projects p WHERE p.is_archived = 0;
 
@@ -177,13 +177,6 @@ WITH RECURSIVE task_tree AS (
     WHERE t.is_archived = 0
 )
 SELECT * FROM task_tree;
-
-CREATE VIEW blocked_tasks AS
-SELECT t.id, t.title, t.project_id,
-    r.source_id AS blocked_by_id
-FROM tasks t
-JOIN relationships r ON r.target_id = t.id AND r.relationship_type = 'blocks'
-WHERE t.status = 'Blocked' AND t.is_archived = 0;
 
 -- ============================================================
 -- Triggers: auto-update updated_at
@@ -202,14 +195,167 @@ CREATE TRIGGER update_architecture_timestamp AFTER UPDATE ON architecture
 BEGIN UPDATE architecture SET updated_at = datetime('now') WHERE id = NEW.id; END;
 
 -- ============================================================
+-- Triggers: auto-progression (requirement status from task status)
+-- ============================================================
+
+-- Trigger 1: Approved -> Partially Implemented (first task reaches Implemented)
+CREATE TRIGGER auto_progress_requirement_partial_impl AFTER UPDATE OF status ON tasks
+WHEN NEW.status = 'Implemented'
+BEGIN
+    UPDATE requirements SET status = 'Partially Implemented'
+    WHERE status = 'Approved'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      );
+END;
+
+-- Trigger 2: Partially Implemented -> Implemented (all non-deprecated tasks Implemented or Validated)
+CREATE TRIGGER auto_progress_requirement_full_impl AFTER UPDATE OF status ON tasks
+WHEN NEW.status = 'Implemented'
+BEGIN
+    UPDATE requirements SET status = 'Implemented'
+    WHERE status = 'Partially Implemented'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM tasks t WHERE t.id IN (
+              SELECT rel2.source_id FROM relationships rel2
+              WHERE rel2.target_type = 'requirement' AND rel2.target_id = requirements.id
+                AND rel2.source_type = 'task' AND rel2.relationship_type = 'implements'
+              UNION
+              SELECT rel2.target_id FROM relationships rel2
+              WHERE rel2.source_type = 'requirement' AND rel2.source_id = requirements.id
+                AND rel2.target_type = 'task' AND rel2.relationship_type = 'implements'
+          ) AND t.status != 'Deprecated'
+            AND t.status NOT IN ('Implemented', 'Validated')
+      );
+END;
+
+-- Trigger 3: Partially Implemented -> Partially Implemented Validated (task jumps to Validated)
+CREATE TRIGGER auto_progress_requirement_partial_impl_valid AFTER UPDATE OF status ON tasks
+WHEN NEW.status = 'Validated'
+BEGIN
+    UPDATE requirements SET status = 'Partially Implemented Validated'
+    WHERE status = 'Partially Implemented'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      );
+END;
+
+-- Trigger 4: Partially Implemented Validated -> Validated (all non-deprecated tasks Validated)
+CREATE TRIGGER auto_progress_requirement_full_impl_valid AFTER UPDATE OF status ON tasks
+WHEN NEW.status = 'Validated'
+BEGIN
+    UPDATE requirements SET status = 'Validated'
+    WHERE status = 'Partially Implemented Validated'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM tasks t WHERE t.id IN (
+              SELECT rel2.source_id FROM relationships rel2
+              WHERE rel2.target_type = 'requirement' AND rel2.target_id = requirements.id
+                AND rel2.source_type = 'task' AND rel2.relationship_type = 'implements'
+              UNION
+              SELECT rel2.target_id FROM relationships rel2
+              WHERE rel2.source_type = 'requirement' AND rel2.source_id = requirements.id
+                AND rel2.target_type = 'task' AND rel2.relationship_type = 'implements'
+          ) AND t.status != 'Deprecated'
+            AND t.status != 'Validated'
+      );
+END;
+
+-- Trigger 5: Implemented -> Partially Validated (first task reaches Validated)
+CREATE TRIGGER auto_progress_requirement_partial_valid AFTER UPDATE OF status ON tasks
+WHEN NEW.status = 'Validated'
+BEGIN
+    UPDATE requirements SET status = 'Partially Validated'
+    WHERE status = 'Implemented'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      );
+END;
+
+-- Trigger 6: Partially Validated -> Validated (all non-deprecated tasks Validated)
+CREATE TRIGGER auto_progress_requirement_full_valid AFTER UPDATE OF status ON tasks
+WHEN NEW.status = 'Validated'
+BEGIN
+    UPDATE requirements SET status = 'Validated'
+    WHERE status = 'Partially Validated'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM tasks t WHERE t.id IN (
+              SELECT rel2.source_id FROM relationships rel2
+              WHERE rel2.target_type = 'requirement' AND rel2.target_id = requirements.id
+                AND rel2.source_type = 'task' AND rel2.relationship_type = 'implements'
+              UNION
+              SELECT rel2.target_id FROM relationships rel2
+              WHERE rel2.source_type = 'requirement' AND rel2.source_id = requirements.id
+                AND rel2.target_type = 'task' AND rel2.relationship_type = 'implements'
+          ) AND t.status != 'Deprecated'
+            AND t.status != 'Validated'
+      );
+END;
+
+-- ============================================================
 -- Triggers: status change logging
 -- ============================================================
 
 CREATE TRIGGER log_requirement_status_change AFTER UPDATE OF status ON requirements
 WHEN OLD.status != NEW.status
 BEGIN
-    INSERT INTO lifecycle_events (entity_type, entity_id, event_type, from_value, to_value, project_id)
-    VALUES ('requirement', NEW.id, 'status_change', OLD.status, NEW.status, NEW.project_id);
+    INSERT INTO lifecycle_events (entity_type, entity_id, event_type, from_value, to_value, actor, project_id)
+    VALUES ('requirement', NEW.id, 'status_change', OLD.status, NEW.status,
+        CASE WHEN (
+            (OLD.status = 'Approved' AND NEW.status = 'Partially Implemented') OR
+            (OLD.status = 'Partially Implemented' AND NEW.status = 'Implemented') OR
+            (OLD.status = 'Partially Implemented' AND NEW.status = 'Partially Implemented Validated') OR
+            (OLD.status = 'Implemented' AND NEW.status = 'Partially Validated') OR
+            (OLD.status = 'Partially Validated' AND NEW.status = 'Validated') OR
+            (OLD.status = 'Partially Implemented Validated' AND NEW.status = 'Validated')
+        ) THEN 'system:auto-progression'
+        ELSE 'MCP User'
+        END,
+        NEW.project_id);
 END;
 
 CREATE TRIGGER log_task_status_change AFTER UPDATE OF status ON tasks
@@ -218,7 +364,7 @@ BEGIN
     INSERT INTO lifecycle_events (entity_type, entity_id, event_type, from_value, to_value, project_id)
     VALUES ('task', NEW.id, 'status_change', OLD.status, NEW.status, NEW.project_id);
     -- Auto-set completed_at
-    UPDATE tasks SET completed_at = CASE WHEN NEW.status = 'Complete' THEN datetime('now') ELSE NULL END WHERE id = NEW.id;
+    UPDATE tasks SET completed_at = CASE WHEN NEW.status = 'Validated' THEN datetime('now') ELSE NULL END WHERE id = NEW.id;
 END;
 
 -- ============================================================
