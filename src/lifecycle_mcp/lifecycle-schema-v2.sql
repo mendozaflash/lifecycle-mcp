@@ -197,11 +197,18 @@ BEGIN UPDATE architecture SET updated_at = datetime('now') WHERE id = NEW.id; EN
 -- ============================================================
 -- Triggers: auto-progression (requirement status from task status)
 -- ============================================================
+-- Consolidated into 2 triggers to avoid SQLite multi-trigger visibility
+-- limitation: when multiple AFTER triggers fire on the same event, later
+-- triggers do NOT see changes made by earlier triggers to other tables.
+-- By combining cascading steps into a single trigger body, each UPDATE
+-- sees the effects of prior UPDATEs within the same trigger.
 
--- Trigger 1: Approved -> Partially Implemented (first task reaches Implemented)
-CREATE TRIGGER auto_progress_requirement_partial_impl AFTER UPDATE OF status ON tasks
+-- Trigger 1: Task reaches Implemented → cascade requirement through
+-- Approved → Partially Implemented → Implemented
+CREATE TRIGGER auto_progress_requirement_on_task_implemented AFTER UPDATE OF status ON tasks
 WHEN NEW.status = 'Implemented'
 BEGIN
+    -- Step 1: Approved → Partially Implemented (first task implemented)
     UPDATE requirements SET status = 'Partially Implemented'
     WHERE status = 'Approved'
       AND id IN (
@@ -213,12 +220,9 @@ BEGIN
           WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
             AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
       );
-END;
 
--- Trigger 2: Partially Implemented -> Implemented (all non-deprecated tasks Implemented or Validated)
-CREATE TRIGGER auto_progress_requirement_full_impl AFTER UPDATE OF status ON tasks
-WHEN NEW.status = 'Implemented'
-BEGIN
+    -- Step 2: Partially Implemented → Implemented (all non-deprecated tasks done)
+    -- This sees step 1's changes because both UPDATEs are in the same trigger body.
     UPDATE requirements SET status = 'Implemented'
     WHERE status = 'Partially Implemented'
       AND id IN (
@@ -244,10 +248,14 @@ BEGIN
       );
 END;
 
--- Trigger 3: Partially Implemented -> Partially Implemented Validated (task jumps to Validated)
-CREATE TRIGGER auto_progress_requirement_partial_impl_valid AFTER UPDATE OF status ON tasks
+-- Trigger 2: Task reaches Validated → cascade requirement through
+-- PI → PIV, Implemented → PV → Validated, PIV → Validated
+CREATE TRIGGER auto_progress_requirement_on_task_validated AFTER UPDATE OF status ON tasks
 WHEN NEW.status = 'Validated'
 BEGIN
+    -- Step 1: Partially Implemented → Partially Implemented Validated
+    -- (task validated while other tasks still not implemented)
+    -- Must come before steps 3-4 so PI doesn't skip through to Validated.
     UPDATE requirements SET status = 'Partially Implemented Validated'
     WHERE status = 'Partially Implemented'
       AND id IN (
@@ -259,14 +267,25 @@ BEGIN
           WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
             AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
       );
-END;
 
--- Trigger 4: Partially Implemented Validated -> Validated (all non-deprecated tasks Validated)
-CREATE TRIGGER auto_progress_requirement_full_impl_valid AFTER UPDATE OF status ON tasks
-WHEN NEW.status = 'Validated'
-BEGIN
+    -- Step 2: Implemented → Partially Validated (first task validated)
+    -- Must come before step 3 so the cascade PV → Validated can fire.
+    UPDATE requirements SET status = 'Partially Validated'
+    WHERE status = 'Implemented'
+      AND id IN (
+          SELECT rel.target_id FROM relationships rel
+          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
+            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
+          UNION
+          SELECT rel.source_id FROM relationships rel
+          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
+            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
+      );
+
+    -- Step 3: Partially Validated → Validated (all non-deprecated tasks validated)
+    -- Catches both already-PV and those moved to PV by step 2.
     UPDATE requirements SET status = 'Validated'
-    WHERE status = 'Partially Implemented Validated'
+    WHERE status = 'Partially Validated'
       AND id IN (
           SELECT rel.target_id FROM relationships rel
           WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
@@ -288,31 +307,11 @@ BEGIN
           ) AND t.status != 'Deprecated'
             AND t.status != 'Validated'
       );
-END;
 
--- Trigger 5: Implemented -> Partially Validated (first task reaches Validated)
-CREATE TRIGGER auto_progress_requirement_partial_valid AFTER UPDATE OF status ON tasks
-WHEN NEW.status = 'Validated'
-BEGIN
-    UPDATE requirements SET status = 'Partially Validated'
-    WHERE status = 'Implemented'
-      AND id IN (
-          SELECT rel.target_id FROM relationships rel
-          WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
-            AND rel.target_type = 'requirement' AND rel.relationship_type = 'implements'
-          UNION
-          SELECT rel.source_id FROM relationships rel
-          WHERE rel.target_type = 'task' AND rel.target_id = NEW.id
-            AND rel.source_type = 'requirement' AND rel.relationship_type = 'implements'
-      );
-END;
-
--- Trigger 6: Partially Validated -> Validated (all non-deprecated tasks Validated)
-CREATE TRIGGER auto_progress_requirement_full_valid AFTER UPDATE OF status ON tasks
-WHEN NEW.status = 'Validated'
-BEGIN
+    -- Step 4: Partially Implemented Validated → Validated (all non-deprecated tasks validated)
+    -- Catches both already-PIV and those moved to PIV by step 1.
     UPDATE requirements SET status = 'Validated'
-    WHERE status = 'Partially Validated'
+    WHERE status = 'Partially Implemented Validated'
       AND id IN (
           SELECT rel.target_id FROM relationships rel
           WHERE rel.source_type = 'task' AND rel.source_id = NEW.id
