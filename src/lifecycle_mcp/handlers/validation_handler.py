@@ -47,6 +47,14 @@ class ValidationHandler(BaseHandler):
                                 "TASK_STATUS.md, ADR_STATUS.md to this directory"
                             ),
                         },
+                        "summary_only": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "If true (default), return a compact summary line. "
+                                "If false, return the full JSON with all details."
+                            ),
+                        },
                     },
                     "required": ["project_id"],
                 },
@@ -319,6 +327,20 @@ class ValidationHandler(BaseHandler):
                 project_id,
             )
             result["files_written"] = 3
+
+        # ----------------------------------------------------------
+        # summary_only mode (default: true)
+        # ----------------------------------------------------------
+        summary_only = params.get("summary_only", True)
+        if summary_only:
+            summary = f"Errors: {errors}, Warnings: {warnings}, Info: {infos}"
+            if errors > 0:
+                first_error = next(
+                    (d for d in details if d["severity"] == "error"), None
+                )
+                if first_error:
+                    summary += f"\n{first_error['message']}"
+            return self._create_response(summary)
 
         return self._create_response(json.dumps(result))
 

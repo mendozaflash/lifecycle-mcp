@@ -85,7 +85,7 @@ async def setup(v2_db_manager):
 
 @pytest.mark.asyncio
 async def test_tool_definitions(setup):
-    """Both tools must be defined with project_id as required."""
+    """Both tools must be defined with required output parameters."""
     handler, _ = setup
     tools = handler.get_tool_definitions()
     assert len(tools) == 2
@@ -98,6 +98,46 @@ async def test_tool_definitions(setup):
         schema = tool["inputSchema"]
         assert "project_id" in schema["properties"]
         assert "project_id" in schema.get("required", [])
+
+    # export_project_documentation requires output_directory
+    export_tool = next(t for t in tools if t["name"] == "export_project_documentation")
+    assert "output_directory" in export_tool["inputSchema"]["required"]
+
+    # create_architectural_diagrams requires output_path
+    diagram_tool = next(t for t in tools if t["name"] == "create_architectural_diagrams")
+    assert "output_path" in diagram_tool["inputSchema"]["required"]
+
+    # interactive parameter must NOT be present on create_architectural_diagrams
+    assert "interactive" not in diagram_tool["inputSchema"]["properties"]
+
+
+# =============================================================================
+#  Required parameter enforcement
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_export_requires_output_directory(setup):
+    """export_project_documentation must fail when output_directory is missing."""
+    handler, _ = setup
+    result = await handler.handle_tool_call(
+        "export_project_documentation",
+        {"project_id": "PROJ-0001"},
+    )
+    assert len(result) == 1
+    assert "ERROR" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_diagrams_requires_output_path(setup):
+    """create_architectural_diagrams must fail when output_path is missing."""
+    handler, _ = setup
+    result = await handler.handle_tool_call(
+        "create_architectural_diagrams",
+        {"project_id": "PROJ-0001", "diagram_type": "requirements"},
+    )
+    assert len(result) == 1
+    assert "ERROR" in result[0].text
 
 
 # =============================================================================

@@ -123,7 +123,7 @@ class TestOrphanDetection:
         await _insert_requirement(db, "REQ-0001", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["warnings"] >= 1
@@ -138,7 +138,7 @@ class TestOrphanDetection:
         await _insert_task(db, "TASK-0001", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["warnings"] >= 1
@@ -153,7 +153,7 @@ class TestOrphanDetection:
         await _insert_adr(db, "ADR-0001", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["warnings"] >= 1
@@ -170,7 +170,7 @@ class TestOrphanDetection:
         await _insert_relationship(db, "TASK-0001", "REQ-0001", "implements", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         orphan_reqs = [d for d in data["details"] if d["check"] == "orphan_requirement"]
@@ -185,7 +185,7 @@ class TestOrphanDetection:
         await _insert_relationship(db, "TASK-0001", "REQ-0001", "implements", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         orphan_tasks = [d for d in data["details"] if d["check"] == "orphan_task"]
@@ -210,7 +210,7 @@ class TestCycleDetection:
         await _insert_relationship(db, "TASK-0002", "TASK-0001", "depends", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] >= 1
@@ -229,7 +229,7 @@ class TestCycleDetection:
         await _insert_relationship(db, "TASK-0003", "TASK-0001", "depends", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] >= 1
@@ -244,7 +244,7 @@ class TestCycleDetection:
         await _insert_relationship(db, "TASK-0001", "TASK-0001", "depends", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] >= 1
@@ -262,7 +262,7 @@ class TestCycleDetection:
         await _insert_relationship(db, "TASK-0002", "TASK-0003", "depends", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         cycle_issues = [d for d in data["details"] if d["check"] == "dependency_cycle"]
@@ -278,7 +278,7 @@ class TestCycleDetection:
         await _insert_relationship(db, "TASK-0002", "TASK-0001", "blocks", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] >= 1
@@ -301,7 +301,7 @@ class TestMissingFields:
         await _insert_requirement(db, "REQ-0001", pid, acceptance_criteria=None)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         missing = [d for d in data["details"] if d["check"] == "missing_acceptance_criteria"]
@@ -315,7 +315,7 @@ class TestMissingFields:
         await _insert_requirement(db, "REQ-0001", pid, acceptance_criteria="[]")
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         missing = [d for d in data["details"] if d["check"] == "missing_acceptance_criteria"]
@@ -328,7 +328,7 @@ class TestMissingFields:
         await _insert_requirement(db, "REQ-0001", pid, acceptance_criteria=json.dumps(["AC-1"]))
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         missing = [d for d in data["details"] if d["check"] == "missing_acceptance_criteria"]
@@ -341,7 +341,7 @@ class TestMissingFields:
         await _insert_task(db, "TASK-0001", pid, scope_boundaries=None, technical_outline=None)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         missing = [d for d in data["details"] if d["check"] == "missing_planning_fields"]
@@ -355,7 +355,7 @@ class TestMissingFields:
         await _insert_task(db, "TASK-0001", pid, scope_boundaries="defined", technical_outline=None)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         missing = [d for d in data["details"] if d["check"] == "missing_planning_fields"]
@@ -377,7 +377,7 @@ class TestBlockedAndInvalidStatus:
         await _insert_task(db, "TASK-0001", pid, status="Blocked")
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         blocked = [d for d in data["details"] if d["check"] == "blocked_task"]
@@ -391,7 +391,7 @@ class TestBlockedAndInvalidStatus:
         await _insert_task(db, "TASK-0001", pid, status="In Progress")
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         blocked = [d for d in data["details"] if d["check"] == "blocked_task"]
@@ -405,7 +405,7 @@ class TestBlockedAndInvalidStatus:
         await _insert_adr(db, "ADR-0001", pid, superseded_by="ADR-0002", status="Approved")
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] >= 1
@@ -421,7 +421,7 @@ class TestBlockedAndInvalidStatus:
         await _insert_adr(db, "ADR-0001", pid, superseded_by="ADR-0002", status="Deprecated")
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         invalid = [d for d in data["details"] if d["check"] == "invalid_status_combination"]
@@ -457,7 +457,7 @@ class TestCleanProject:
         await _insert_relationship(db, "ADR-0001", "REQ-0001", "addresses", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] == 0
@@ -469,7 +469,7 @@ class TestCleanProject:
         handler, db, pid = setup
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert data["errors"] == 0
@@ -495,7 +495,7 @@ class TestOutputFiles:
         output_dir = str(tmp_path / "output")
         result = await handler.handle_tool_call(
             "validate_project_plan",
-            {"project_id": pid, "output_directory": output_dir},
+            {"project_id": pid, "output_directory": output_dir, "summary_only": False},
         )
         data = _parse_json(result)
 
@@ -515,7 +515,7 @@ class TestOutputFiles:
         output_dir = str(tmp_path / "output")
         await handler.handle_tool_call(
             "validate_project_plan",
-            {"project_id": pid, "output_directory": output_dir},
+            {"project_id": pid, "output_directory": output_dir, "summary_only": False},
         )
 
         with open(os.path.join(output_dir, "REQUIREMENTS_STATUS.md")) as f:
@@ -537,7 +537,7 @@ class TestOutputFiles:
         await _insert_requirement(db, "REQ-0001", pid)
 
         result = await handler.handle_tool_call(
-            "validate_project_plan", {"project_id": pid}
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         assert "files_written" not in data
@@ -572,6 +572,75 @@ class TestValidateProjectPlanErrors:
         )
         text = _text(result)
         assert "ERROR" in text or "required" in text.lower() or "Missing" in text
+
+
+# ===========================================================================
+# validate_project_plan: summary_only parameter
+# ===========================================================================
+
+
+class TestSummaryOnly:
+    """Test the summary_only parameter for validate_project_plan."""
+
+    @pytest.mark.asyncio
+    async def test_validate_summary_only_default(self, setup):
+        """Default summary_only=true returns a compact summary line, not JSON."""
+        handler, db, pid = setup
+        await _insert_requirement(db, "REQ-0001", pid, acceptance_criteria=None)
+        await _insert_task(db, "TASK-0001", pid)
+
+        # Default call (no summary_only specified) should return a summary line
+        result = await handler.handle_tool_call(
+            "validate_project_plan", {"project_id": pid}
+        )
+        text = _text(result)
+        # Must contain "Errors:" / "Warnings:" / "Info:" counts
+        assert "Errors:" in text
+        assert "Warnings:" in text
+        assert "Info:" in text
+        # Must NOT be parseable as the full JSON details dict
+        try:
+            data = json.loads(text)
+            # If it parses as JSON, it should NOT have the 'details' key
+            assert "details" not in data
+        except json.JSONDecodeError:
+            pass  # expected -- summary is plain text
+
+    @pytest.mark.asyncio
+    async def test_validate_summary_only_false(self, setup):
+        """summary_only=false returns the full JSON with details list."""
+        handler, db, pid = setup
+        await _insert_requirement(db, "REQ-0001", pid, acceptance_criteria=None)
+        await _insert_task(db, "TASK-0001", pid)
+
+        result = await handler.handle_tool_call(
+            "validate_project_plan", {"project_id": pid, "summary_only": False}
+        )
+        data = _parse_json(result)
+        # Must have full structure
+        assert "errors" in data
+        assert "warnings" in data
+        assert "details" in data
+        assert isinstance(data["details"], list)
+        assert data["warnings"] >= 1  # orphan req + orphan task + missing AC
+
+    @pytest.mark.asyncio
+    async def test_validate_summary_only_with_errors_shows_first_error(self, setup):
+        """When summary_only=true and errors > 0, first error message is included."""
+        handler, db, pid = setup
+        # Create a cycle to produce an error
+        await _insert_task(db, "TASK-0001", pid)
+        await _insert_task(db, "TASK-0002", pid)
+        await _insert_relationship(db, "TASK-0001", "TASK-0002", "depends", pid)
+        await _insert_relationship(db, "TASK-0002", "TASK-0001", "depends", pid)
+
+        result = await handler.handle_tool_call(
+            "validate_project_plan", {"project_id": pid}
+        )
+        text = _text(result)
+        assert "Errors: " in text
+        # First error message should be included
+        assert "cycle" in text.lower() or "Dependency" in text
 
 
 # ===========================================================================
@@ -694,6 +763,9 @@ class TestToolDefinitions:
         validate_tool = next(t for t in tools if t["name"] == "validate_project_plan")
         assert "project_id" in validate_tool["inputSchema"]["properties"]
         assert "project_id" in validate_tool["inputSchema"]["required"]
+        # summary_only parameter must exist with boolean type
+        assert "summary_only" in validate_tool["inputSchema"]["properties"]
+        assert validate_tool["inputSchema"]["properties"]["summary_only"]["type"] == "boolean"
 
     @pytest.mark.asyncio
     async def test_unknown_tool_name(self, setup):
