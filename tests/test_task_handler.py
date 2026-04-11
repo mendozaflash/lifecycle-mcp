@@ -1165,76 +1165,101 @@ async def test_clone_task_not_found(task_env):
 
 
 # =============================================================================
-#  Task approval gating
+#  Task approval gating (TestTaskApprovalGating)
 # =============================================================================
 
 
-@pytest.mark.asyncio
-async def test_task_approval_blocked_by_unapproved_req(task_env):
-    """Task approval is rejected when linked requirement is in 'Under Review'."""
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Gated Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Pending Req")
-    # Requirement is in 'Draft' status by default from helper; update to 'Under Review'
-    await db.execute_query(
-        "UPDATE requirements SET status = 'Under Review' WHERE id = 'REQ-0001'", []
-    )
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+class TestTaskApprovalGating:
+    """Integration tests for task approval gating.
 
-    result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
-    )
-    assert "ERROR" in result[0].text
-    assert "REQ-0001" in result[0].text
-    assert "Approved" in result[0].text
+    Verifies end-to-end that tasks can only be approved when their linked
+    requirement(s) are in exactly 'Approved' status.
+    """
 
+    @pytest.mark.asyncio
+    async def test_rejected_when_requirement_under_review(self, task_env):
+        """Task linked to 'Under Review' requirement -> approval rejected with req ID."""
+        handler, db, pid = task_env
+        await _create_task(handler, pid, title="Gated Task")
+        await _create_requirement(db, pid, "REQ-0001", title="Pending Req")
+        # _create_requirement already inserts as 'Under Review'
+        await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
 
-@pytest.mark.asyncio
-async def test_task_approval_allowed_with_approved_req(task_env):
-    """Task approval succeeds when linked requirement is exactly 'Approved'."""
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Gated Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Approved Req")
-    await db.execute_query(
-        "UPDATE requirements SET status = 'Approved' WHERE id = 'REQ-0001'", []
-    )
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+        result = await handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+        )
+        assert "ERROR" in result[0].text
+        assert "REQ-0001" in result[0].text
 
-    result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
-    )
-    assert "SUCCESS" in result[0].text
+    @pytest.mark.asyncio
+    async def test_allowed_when_requirement_approved(self, task_env):
+        """Task linked to 'Approved' requirement -> approval succeeds."""
+        handler, db, pid = task_env
+        await _create_task(handler, pid, title="Gated Task")
+        await _create_requirement(db, pid, "REQ-0001", title="Approved Req")
+        await db.execute_query(
+            "UPDATE requirements SET status = 'Approved' WHERE id = 'REQ-0001'", []
+        )
+        await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
 
+        result = await handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+        )
+        assert "SUCCESS" in result[0].text
 
-@pytest.mark.asyncio
-async def test_task_approval_no_requirements(task_env):
-    """Task approval succeeds when task has no linked requirements (ungated)."""
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Ungated Task")
+    @pytest.mark.asyncio
+    async def test_allowed_when_no_requirements(self, task_env):
+        """Task with no linked requirements -> approval succeeds (ungated)."""
+        handler, db, pid = task_env
+        await _create_task(handler, pid, title="Ungated Task")
 
-    result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
-    )
-    assert "SUCCESS" in result[0].text
+        result = await handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+        )
+        assert "SUCCESS" in result[0].text
 
+    @pytest.mark.asyncio
+    async def test_rejected_when_requirement_partially_implemented(self, task_env):
+        """Task linked to 'Partially Implemented' requirement -> approval rejected (must be exactly 'Approved')."""
+        handler, db, pid = task_env
+        await _create_task(handler, pid, title="Gated Task")
+        await _create_requirement(db, pid, "REQ-0001", title="Partial Req")
+        await db.execute_query(
+            "UPDATE requirements SET status = 'Partially Implemented' WHERE id = 'REQ-0001'", []
+        )
+        await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
 
-@pytest.mark.asyncio
-async def test_task_approval_blocked_by_partially_impl_req(task_env):
-    """Task approval is rejected when linked requirement is 'Partially Implemented' (not exactly 'Approved')."""
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Gated Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Partial Req")
-    await db.execute_query(
-        "UPDATE requirements SET status = 'Partially Implemented' WHERE id = 'REQ-0001'", []
-    )
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+        result = await handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+        )
+        assert "ERROR" in result[0].text
+        assert "REQ-0001" in result[0].text
+        assert "Partially Implemented" in result[0].text
 
-    result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
-    )
-    assert "ERROR" in result[0].text
-    assert "REQ-0001" in result[0].text
-    assert "Partially Implemented" in result[0].text
+    @pytest.mark.asyncio
+    async def test_rejected_when_mixed_requirements(self, task_env):
+        """Task linked to 2 requirements (1 Approved, 1 Under Review) -> rejected listing the non-approved req."""
+        handler, db, pid = task_env
+        await _create_task(handler, pid, title="Multi-Req Task")
+        # First requirement: Approved
+        await _create_requirement(db, pid, "REQ-0001", title="Approved Req")
+        await db.execute_query(
+            "UPDATE requirements SET status = 'Approved' WHERE id = 'REQ-0001'", []
+        )
+        # Second requirement: Under Review (not approved)
+        await _create_requirement(db, pid, "REQ-0002", title="Pending Req")
+        # Link both to the task
+        await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+        await _link(db, "task", "TASK-0001", "requirement", "REQ-0002", "implements", pid)
+
+        result = await handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+        )
+        assert "ERROR" in result[0].text
+        # The non-approved requirement should be listed in the error
+        assert "REQ-0002" in result[0].text
+        # The approved requirement should NOT be listed as a blocker
+        assert "REQ-0001" not in result[0].text
 
 
 # =============================================================================
