@@ -24,7 +24,6 @@ EXPECTED_TABLES = [
 EXPECTED_VIEWS = [
     "project_summary",
     "task_hierarchy",
-    "blocked_tasks",
 ]
 
 EXPECTED_INDEXES = [
@@ -353,7 +352,7 @@ async def test_status_change_trigger_logs_event(tmp_path):
         await conn.commit()
 
         await conn.execute(
-            "UPDATE requirements SET status = 'Under Review' WHERE id = 'REQ-0001'"
+            "UPDATE requirements SET status = 'Approved' WHERE id = 'REQ-0001'"
         )
         await conn.commit()
 
@@ -365,8 +364,8 @@ async def test_status_change_trigger_logs_event(tmp_path):
         event = rows[0]
         assert event["entity_type"] == "requirement"
         assert event["event_type"] == "status_change"
-        assert event["from_value"] == "Draft"
-        assert event["to_value"] == "Under Review"
+        assert event["from_value"] == "Under Review"
+        assert event["to_value"] == "Approved"
         assert event["project_id"] == "PROJ-0001"
     finally:
         await conn.close()
@@ -388,7 +387,7 @@ async def test_task_status_change_trigger_logs_event(tmp_path):
         await conn.commit()
 
         await conn.execute(
-            "UPDATE tasks SET status = 'In Progress' WHERE id = 'TASK-0001'"
+            "UPDATE tasks SET status = 'Approved' WHERE id = 'TASK-0001'"
         )
         await conn.commit()
 
@@ -399,8 +398,8 @@ async def test_task_status_change_trigger_logs_event(tmp_path):
         assert len(rows) == 1
         event = rows[0]
         assert event["entity_type"] == "task"
-        assert event["from_value"] == "Not Started"
-        assert event["to_value"] == "In Progress"
+        assert event["from_value"] == "Under Review"
+        assert event["to_value"] == "Approved"
     finally:
         await conn.close()
 
@@ -410,7 +409,7 @@ async def test_task_status_change_trigger_logs_event(tmp_path):
 
 @pytest.mark.asyncio
 async def test_task_completed_at_trigger(tmp_path):
-    """Task completed_at is set when status changes to Complete, cleared otherwise."""
+    """Task completed_at is set when status changes to Validated, cleared otherwise."""
     db_path = await _init_db(tmp_path)
     conn = await _connect(db_path)
     try:
@@ -428,9 +427,9 @@ async def test_task_completed_at_trigger(tmp_path):
         row = await cursor.fetchone()
         assert row["completed_at"] is None
 
-        # Mark as Complete
+        # Mark as Validated (triggers completed_at)
         await conn.execute(
-            "UPDATE tasks SET status = 'Complete' WHERE id = 'TASK-0001'"
+            "UPDATE tasks SET status = 'Validated' WHERE id = 'TASK-0001'"
         )
         await conn.commit()
 
@@ -438,9 +437,9 @@ async def test_task_completed_at_trigger(tmp_path):
         row = await cursor.fetchone()
         assert row["completed_at"] is not None
 
-        # Un-complete (e.g. back to In Progress)
+        # Un-complete (e.g. back to Approved)
         await conn.execute(
-            "UPDATE tasks SET status = 'In Progress' WHERE id = 'TASK-0001'"
+            "UPDATE tasks SET status = 'Approved' WHERE id = 'TASK-0001'"
         )
         await conn.commit()
 
@@ -485,7 +484,7 @@ async def test_project_summary_view(tmp_path):
         )
         await conn.execute(
             "INSERT INTO tasks (id, project_id, title, priority, status) VALUES (?, ?, ?, ?, ?)",
-            ("TASK-0003", "PROJ-0001", "Task 3", "P1", "Complete"),
+            ("TASK-0003", "PROJ-0001", "Task 3", "P1", "Validated"),
         )
         # Add 1 ADR
         await conn.execute(
@@ -558,39 +557,6 @@ async def test_task_hierarchy_view(tmp_path):
         assert rows[0]["id"] == "TASK-0001"
         assert rows[1]["depth"] == 1
         assert rows[1]["id"] == "TASK-0002"
-    finally:
-        await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_blocked_tasks_view(tmp_path):
-    """blocked_tasks view shows tasks that are blocked by relationships."""
-    db_path = await _init_db(tmp_path)
-    conn = await _connect(db_path)
-    try:
-        await conn.execute(
-            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
-        )
-        await conn.execute(
-            "INSERT INTO tasks (id, project_id, title, priority) VALUES (?, ?, ?, ?)",
-            ("TASK-0001", "PROJ-0001", "Blocker", "P1"),
-        )
-        await conn.execute(
-            "INSERT INTO tasks (id, project_id, title, priority, status) VALUES (?, ?, ?, ?, ?)",
-            ("TASK-0002", "PROJ-0001", "Blocked Task", "P1", "Blocked"),
-        )
-        await conn.execute(
-            "INSERT INTO relationships (id, source_type, source_id, target_type, target_id, "
-            "relationship_type, project_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("REL-1", "task", "TASK-0001", "task", "TASK-0002", "blocks", "PROJ-0001"),
-        )
-        await conn.commit()
-
-        cursor = await conn.execute("SELECT * FROM blocked_tasks")
-        rows = await cursor.fetchall()
-        assert len(rows) == 1
-        assert rows[0]["id"] == "TASK-0002"
-        assert rows[0]["blocked_by_id"] == "TASK-0001"
     finally:
         await conn.close()
 

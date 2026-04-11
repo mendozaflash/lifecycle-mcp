@@ -49,12 +49,12 @@ async def setup(v2_db_manager):
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, type, title, priority, status) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        ["REQ-0001", "PROJ-0001", "FUNC", "Req One", "P1", "Draft"],
+        ["REQ-0001", "PROJ-0001", "FUNC", "Req One", "P1", "Under Review"],
     )
     await db.execute_query(
         "INSERT INTO tasks (id, project_id, title, priority, status) "
         "VALUES (?, ?, ?, ?, ?)",
-        ["TASK-0001", "PROJ-0001", "Task One", "P1", "Not Started"],
+        ["TASK-0001", "PROJ-0001", "Task One", "P1", "Under Review"],
     )
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, context, decision, status) "
@@ -72,7 +72,7 @@ async def setup(v2_db_manager):
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, type, title, priority, status) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        ["REQ-0002", "PROJ-0002", "FUNC", "Req Two", "P1", "Draft"],
+        ["REQ-0002", "PROJ-0002", "FUNC", "Req Two", "P1", "Under Review"],
     )
 
     return handler, db
@@ -437,7 +437,7 @@ async def test_diagram_dependencies(setup):
     await db.execute_query(
         "INSERT INTO tasks (id, project_id, title, priority, status) "
         "VALUES (?, ?, ?, ?, ?)",
-        ["TASK-0002", "PROJ-0001", "Task Two", "P1", "Not Started"],
+        ["TASK-0002", "PROJ-0001", "Task Two", "P1", "Under Review"],
     )
     await db.execute_query(
         "INSERT INTO relationships (id, source_type, source_id, target_type, target_id, "

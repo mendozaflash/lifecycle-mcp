@@ -50,7 +50,7 @@ async def _insert_requirement(db, req_id, project_id, **kwargs):
         "type": "FUNC",
         "title": f"Requirement {req_id}",
         "priority": "P1",
-        "status": "Draft",
+        "status": "Under Review",
         "acceptance_criteria": json.dumps(["AC-1"]),
     }
     defaults.update(kwargs)
@@ -67,7 +67,7 @@ async def _insert_task(db, task_id, project_id, **kwargs):
     defaults = {
         "title": f"Task {task_id}",
         "priority": "P1",
-        "status": "Not Started",
+        "status": "Under Review",
         "scope_boundaries": "some scope",
         "technical_outline": "some outline",
     }
@@ -372,23 +372,23 @@ class TestBlockedAndInvalidStatus:
 
     @pytest.mark.asyncio
     async def test_blocked_task_reported(self, setup):
-        """Task with status=Blocked should be reported as info."""
+        """'Blocked' is no longer a valid task status, so no task can trigger the blocked check."""
         handler, db, pid = setup
-        await _insert_task(db, "TASK-0001", pid, status="Blocked")
+        # Insert a task with a valid status -- none should be flagged as blocked
+        await _insert_task(db, "TASK-0001", pid, status="Under Review")
 
         result = await handler.handle_tool_call(
             "validate_project_plan", {"project_id": pid, "summary_only": False}
         )
         data = _parse_json(result)
         blocked = [d for d in data["details"] if d["check"] == "blocked_task"]
-        assert len(blocked) == 1
-        assert "TASK-0001" in blocked[0]["entity_id"]
+        assert len(blocked) == 0
 
     @pytest.mark.asyncio
     async def test_non_blocked_task_not_reported(self, setup):
-        """Task with status!=Blocked should NOT be reported as blocked."""
+        """Task with a valid status should NOT be reported as blocked."""
         handler, db, pid = setup
-        await _insert_task(db, "TASK-0001", pid, status="In Progress")
+        await _insert_task(db, "TASK-0001", pid, status="Approved")
 
         result = await handler.handle_tool_call(
             "validate_project_plan", {"project_id": pid, "summary_only": False}
@@ -652,15 +652,15 @@ class TestGetValidStatusTransitions:
     """Test status transition lookup."""
 
     @pytest.mark.asyncio
-    async def test_requirement_draft(self, setup):
-        """Draft requirement should transition to Under Review or Deprecated."""
+    async def test_requirement_under_review(self, setup):
+        """Under Review requirement should transition to Approved or Deprecated."""
         handler, _, _ = setup
         result = await handler.handle_tool_call(
             "get_valid_status_transitions",
-            {"entity_type": "requirement", "current_status": "Draft"},
+            {"entity_type": "requirement", "current_status": "Under Review"},
         )
         data = _parse_json(result)
-        assert set(data["valid_transitions"]) == {"Under Review", "Deprecated"}
+        assert set(data["valid_transitions"]) == {"Approved", "Deprecated"}
 
     @pytest.mark.asyncio
     async def test_requirement_deprecated_no_transitions(self, setup):
@@ -674,23 +674,23 @@ class TestGetValidStatusTransitions:
         assert data["valid_transitions"] == []
 
     @pytest.mark.asyncio
-    async def test_task_in_progress(self, setup):
-        """In Progress task should transition to Complete, Blocked, or Abandoned."""
+    async def test_task_approved(self, setup):
+        """Approved task should transition to Implemented or Deprecated."""
         handler, _, _ = setup
         result = await handler.handle_tool_call(
             "get_valid_status_transitions",
-            {"entity_type": "task", "current_status": "In Progress"},
+            {"entity_type": "task", "current_status": "Approved"},
         )
         data = _parse_json(result)
-        assert set(data["valid_transitions"]) == {"Complete", "Blocked", "Abandoned"}
+        assert set(data["valid_transitions"]) == {"Implemented", "Deprecated"}
 
     @pytest.mark.asyncio
-    async def test_task_complete_no_transitions(self, setup):
-        """Complete task should have no transitions."""
+    async def test_task_deprecated_no_transitions(self, setup):
+        """Deprecated task should have no transitions (terminal state)."""
         handler, _, _ = setup
         result = await handler.handle_tool_call(
             "get_valid_status_transitions",
-            {"entity_type": "task", "current_status": "Complete"},
+            {"entity_type": "task", "current_status": "Deprecated"},
         )
         data = _parse_json(result)
         assert data["valid_transitions"] == []

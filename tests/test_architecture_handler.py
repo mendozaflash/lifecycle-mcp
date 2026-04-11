@@ -47,7 +47,7 @@ async def _create_req(db, project_id, req_id, title="Test Requirement"):
     """Insert a requirement directly into the DB for relationship testing."""
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, title, type, priority, status) "
-        "VALUES (?, ?, ?, 'FUNC', 'P1', 'Draft')",
+        "VALUES (?, ?, ?, 'FUNC', 'P1', 'Under Review')",
         [req_id, project_id, title],
     )
 

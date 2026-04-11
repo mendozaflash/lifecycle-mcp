@@ -47,7 +47,7 @@ async def seeded_db(v2_db_manager):
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, type, title, status, priority, is_archived) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ["REQ-0001", "PROJ-0001", "FUNC", "Test Req", "Draft", "P1", 0],
+        ["REQ-0001", "PROJ-0001", "FUNC", "Test Req", "Under Review", "P1", 0],
     )
     # Insert an archived requirement
     await db.execute_query(
@@ -59,7 +59,7 @@ async def seeded_db(v2_db_manager):
     await db.execute_query(
         "INSERT INTO tasks (id, project_id, title, status, priority, is_archived) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        ["TASK-0001", "PROJ-0001", "Test Task", "Not Started", "P1", 0],
+        ["TASK-0001", "PROJ-0001", "Test Task", "Under Review", "P1", 0],
     )
     # Insert an architecture decision under PROJ-0001
     await db.execute_query(

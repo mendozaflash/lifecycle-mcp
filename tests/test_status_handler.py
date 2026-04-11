@@ -46,7 +46,7 @@ def _json(result):
     return json.loads(result[0].text)
 
 
-async def _add_req(db, req_id, project_id, status="Draft", priority="P1"):
+async def _add_req(db, req_id, project_id, status="Under Review", priority="P1"):
     """Insert a requirement directly."""
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, type, title, status, priority) VALUES (?, ?, ?, ?, ?, ?)",
@@ -54,7 +54,7 @@ async def _add_req(db, req_id, project_id, status="Draft", priority="P1"):
     )
 
 
-async def _add_task(db, task_id, project_id, status="Not Started", priority="P1", assignee=None):
+async def _add_task(db, task_id, project_id, status="Under Review", priority="P1", assignee=None):
     """Insert a task directly."""
     await db.execute_query(
         "INSERT INTO tasks (id, project_id, title, status, priority, assignee) VALUES (?, ?, ?, ?, ?, ?)",
@@ -94,13 +94,13 @@ class TestDiffProject:
         """Status changes appear in the diff window."""
         handler, db = setup
 
-        await _add_task(db, "TASK-0001", "PROJ-0001", status="Not Started")
+        await _add_task(db, "TASK-0001", "PROJ-0001", status="Under Review")
         # Trigger a status change via UPDATE -- the trigger will log to lifecycle_events
         await db.execute_query(
-            "UPDATE tasks SET status = 'In Progress' WHERE id = ?", ["TASK-0001"]
+            "UPDATE tasks SET status = 'Approved' WHERE id = ?", ["TASK-0001"]
         )
         await db.execute_query(
-            "UPDATE tasks SET status = 'Complete' WHERE id = ?", ["TASK-0001"]
+            "UPDATE tasks SET status = 'Implemented' WHERE id = ?", ["TASK-0001"]
         )
 
         result = await handler.handle_tool_call(
@@ -118,22 +118,22 @@ class TestDiffProject:
         assert len(task_changes) == 2
         # Verify ordering or content
         statuses = [(c["from_status"], c["to_status"]) for c in task_changes]
-        assert ("Not Started", "In Progress") in statuses
-        assert ("In Progress", "Complete") in statuses
+        assert ("Under Review", "Approved") in statuses
+        assert ("Approved", "Implemented") in statuses
 
     @pytest.mark.asyncio
     async def test_diff_project_scoped(self, setup):
         """Only changes from the requested project are returned."""
         handler, db = setup
 
-        await _add_task(db, "TASK-0001", "PROJ-0001", status="Not Started")
-        await _add_task(db, "TASK-0002", "PROJ-0002", status="Not Started")
+        await _add_task(db, "TASK-0001", "PROJ-0001", status="Under Review")
+        await _add_task(db, "TASK-0002", "PROJ-0002", status="Under Review")
 
         await db.execute_query(
-            "UPDATE tasks SET status = 'In Progress' WHERE id = ?", ["TASK-0001"]
+            "UPDATE tasks SET status = 'Approved' WHERE id = ?", ["TASK-0001"]
         )
         await db.execute_query(
-            "UPDATE tasks SET status = 'In Progress' WHERE id = ?", ["TASK-0002"]
+            "UPDATE tasks SET status = 'Approved' WHERE id = ?", ["TASK-0002"]
         )
 
         result = await handler.handle_tool_call(
@@ -188,9 +188,9 @@ class TestDiffProject:
         """Requirement status changes appear in diff."""
         handler, db = setup
 
-        await _add_req(db, "REQ-0001", "PROJ-0001", status="Draft")
+        await _add_req(db, "REQ-0001", "PROJ-0001", status="Under Review")
         await db.execute_query(
-            "UPDATE requirements SET status = 'Under Review' WHERE id = ?", ["REQ-0001"]
+            "UPDATE requirements SET status = 'Approved' WHERE id = ?", ["REQ-0001"]
         )
 
         result = await handler.handle_tool_call(
@@ -205,8 +205,8 @@ class TestDiffProject:
         assert data["summary"]["requirements_changed"] == 1
         req_changes = [c for c in data["changes"] if c["entity_type"] == "requirement"]
         assert len(req_changes) == 1
-        assert req_changes[0]["from_status"] == "Draft"
-        assert req_changes[0]["to_status"] == "Under Review"
+        assert req_changes[0]["from_status"] == "Under Review"
+        assert req_changes[0]["to_status"] == "Approved"
 
 
 # ===========================================================================
