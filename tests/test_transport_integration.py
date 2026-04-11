@@ -272,7 +272,7 @@ class TestStreamableHTTPToolCall:
     """Full round-trip tool call over streamable-HTTP."""
 
     def test_tool_call_returns_valid_result(self, streamable_http_server):
-        """Initialize, send notification, call get_project_status, verify result."""
+        """Initialize, send notification, call list_projects, verify result."""
         host, port = streamable_http_server
         base_url = f"http://{host}:{port}"
 
@@ -300,7 +300,7 @@ class TestStreamableHTTPToolCall:
             tool_resp, tool_parsed = _post_mcp(
                 client,
                 base_url,
-                _build_tool_call_request("get_project_status"),
+                _build_tool_call_request("list_projects"),
                 session_id=session_id,
             )
             assert tool_resp.status_code == 200

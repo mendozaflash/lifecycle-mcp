@@ -42,7 +42,7 @@ class ExportHandler(BaseHandler):
                             "description": "Directory to save the exported files",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": ["project_id", "output_directory"],
                 },
             },
             {
@@ -77,18 +77,12 @@ class ExportHandler(BaseHandler):
                             "enum": ["mermaid", "markdown_with_mermaid"],
                             "default": "mermaid",
                         },
-                        "interactive": {
-                            "type": "boolean",
-                            "default": False,
-                            "description": "Start interactive conversation for complex diagrams",
-                        },
                         "output_path": {
                             "type": "string",
-                            "default": "exports",
-                            "description": "Directory path to save diagram files (defaults to 'exports')",
+                            "description": "Directory path to save diagram files",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": ["project_id", "output_path"],
                 },
             },
         ]
@@ -135,7 +129,9 @@ class ExportHandler(BaseHandler):
             if project_name is None:
                 return self._create_error_response(f"Project not found: {project_id}")
 
-            output_dir = params.get("output_directory", ".")
+            output_dir = params.get("output_directory")
+            if not output_dir:
+                return self._create_error_response("Missing required parameter: output_directory")
 
             # Create output directory if needed
             os.makedirs(output_dir, exist_ok=True)
@@ -418,14 +414,6 @@ class ExportHandler(BaseHandler):
 
     async def _create_architectural_diagrams(self, **params) -> list[TextContent]:
         """Generate Mermaid diagrams for project architecture"""
-        # Interactive mode redirect
-        if params.get("interactive", False):
-            return self._create_above_fold_response(
-                "INFO",
-                "Interactive mode requires architectural conversation",
-                "Use start_architectural_conversation tool first",
-            )
-
         try:
             project_id = params.get("project_id")
             if not project_id:
@@ -439,7 +427,9 @@ class ExportHandler(BaseHandler):
             diagram_type = params.get("diagram_type", "full_project")
             include_relationships = params.get("include_relationships", True)
             output_format = params.get("output_format", "mermaid")
-            output_path = params.get("output_path", "exports")
+            output_path = params.get("output_path")
+            if not output_path:
+                return self._create_error_response("Missing required parameter: output_path")
 
             # Validate diagram type
             valid_types = [
@@ -483,37 +473,30 @@ class ExportHandler(BaseHandler):
             # Prepare content for output
             if output_format == "markdown_with_mermaid":
                 file_content = f"```mermaid\n{mermaid_content}\n```"
-                result = file_content
             else:
                 file_content = mermaid_content
-                result = mermaid_content
 
-            # Save to file if output_path is provided
-            saved_file_path = None
-            if output_path:
-                if not self._validate_output_path(output_path):
-                    return self._create_error_response("Invalid output path specified")
+            # Save to file (output_path is required)
+            if not self._validate_output_path(output_path):
+                return self._create_error_response("Invalid output path specified")
 
-                if not self._ensure_output_directory(output_path):
-                    return self._create_error_response(f"Cannot create output directory: {output_path}")
+            if not self._ensure_output_directory(output_path):
+                return self._create_error_response(f"Cannot create output directory: {output_path}")
 
-                filename = self._generate_diagram_filename(diagram_type, output_format)
-                full_path = os.path.join(output_path, filename)
+            filename = self._generate_diagram_filename(diagram_type, output_format)
+            full_path = os.path.join(output_path, filename)
 
-                try:
-                    await asyncio.to_thread(
-                        Path(full_path).write_text, file_content, encoding="utf-8"
-                    )
-                    saved_file_path = full_path
-                except (OSError, PermissionError) as e:
-                    return self._create_error_response(f"Failed to save diagram file: {str(e)}")
+            try:
+                await asyncio.to_thread(
+                    Path(full_path).write_text, file_content, encoding="utf-8"
+                )
+            except (OSError, PermissionError) as e:
+                return self._create_error_response(f"Failed to save diagram file: {str(e)}")
 
             key_info = f"{diagram_type.replace('_', ' ').title()} diagram generated"
-            action_info = f"{output_format} format"
-            if saved_file_path:
-                action_info += f" | Saved to {saved_file_path}"
+            action_info = f"{output_format} format | Saved to {full_path}"
 
-            return self._create_above_fold_response("SUCCESS", key_info, action_info, result)
+            return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
         except Exception as e:
             return self._create_error_response("Failed to create architectural diagram", e)

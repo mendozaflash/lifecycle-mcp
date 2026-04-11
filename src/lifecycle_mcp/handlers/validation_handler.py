@@ -13,45 +13,13 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from lifecycle_mcp.constants import STATE_MACHINES
+
 from .base_handler import BaseHandler
 
 
 class ValidationHandler(BaseHandler):
     """Handler for validation and status-transition MCP tools."""
-
-    # ------------------------------------------------------------------
-    # State machines
-    # ------------------------------------------------------------------
-
-    STATE_MACHINES: dict[str, dict[str, list[str]]] = {
-        "requirement": {
-            "Draft": ["Under Review", "Deprecated"],
-            "Under Review": ["Draft", "Approved", "Deprecated"],
-            "Approved": ["Architecture", "Ready", "Deprecated"],
-            "Architecture": ["Ready", "Approved"],
-            "Ready": ["Implemented", "Deprecated"],
-            "Implemented": ["Validated", "Ready"],
-            "Validated": ["Deprecated"],
-            "Deprecated": [],
-        },
-        "task": {
-            "Not Started": ["In Progress", "Abandoned"],
-            "In Progress": ["Complete", "Blocked", "Abandoned"],
-            "Blocked": ["In Progress", "Abandoned"],
-            "Complete": [],
-            "Abandoned": [],
-        },
-        "architecture": {
-            "Draft": ["Under Review", "Deprecated"],
-            "Under Review": ["Proposed", "Approved", "Deprecated"],
-            "Proposed": ["Accepted", "Rejected", "Deprecated"],
-            "Accepted": ["Implemented", "Deprecated"],
-            "Rejected": ["Deprecated"],
-            "Deprecated": [],
-            "Approved": ["Implemented", "Deprecated"],
-            "Implemented": ["Deprecated"],
-        },
-    }
 
     # ------------------------------------------------------------------
     # Tool definitions
@@ -77,6 +45,14 @@ class ValidationHandler(BaseHandler):
                             "description": (
                                 "If provided, writes REQUIREMENTS_STATUS.md, "
                                 "TASK_STATUS.md, ADR_STATUS.md to this directory"
+                            ),
+                        },
+                        "summary_only": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": (
+                                "If true (default), return a compact summary line. "
+                                "If false, return the full JSON with all details."
                             ),
                         },
                     },
@@ -352,6 +328,20 @@ class ValidationHandler(BaseHandler):
             )
             result["files_written"] = 3
 
+        # ----------------------------------------------------------
+        # summary_only mode (default: true)
+        # ----------------------------------------------------------
+        summary_only = params.get("summary_only", True)
+        if summary_only:
+            summary = f"Errors: {errors}, Warnings: {warnings}, Info: {infos}"
+            if errors > 0:
+                first_error = next(
+                    (d for d in details if d["severity"] == "error"), None
+                )
+                if first_error:
+                    summary += f"\n{first_error['message']}"
+            return self._create_response(summary)
+
         return self._create_response(json.dumps(result))
 
     # ----------------------------------------------------------
@@ -468,11 +458,11 @@ class ValidationHandler(BaseHandler):
         entity_type: str = params["entity_type"]
         current_status: str = params["current_status"]
 
-        machine = self.STATE_MACHINES.get(entity_type)
+        machine = STATE_MACHINES.get(entity_type)
         if machine is None:
             return self._create_error_response(
                 f"Unknown entity type: '{entity_type}'. "
-                f"Valid types: {', '.join(sorted(self.STATE_MACHINES))}"
+                f"Valid types: {', '.join(sorted(STATE_MACHINES))}"
             )
 
         transitions = machine.get(current_status)

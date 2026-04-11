@@ -1,12 +1,15 @@
-"""Tests for TaskHandler v2 (DB-05).
+"""Tests for TaskHandler v2 (BF-04 tool simplification).
 
-Validates all 12 MCP tools:
+Validates all 8 MCP tools:
   create_task, update_task, update_task_status, archive_task,
-  query_tasks, query_tasks_json, get_task_details,
-  batch_create_tasks, clone_task,
-  get_task_requirement_context, get_task_adr_context, get_task_full_context
+  query_tasks, get_task_details,
+  batch_create_tasks, clone_task
 
-No GitHub tools should be present.
+Removed tools (merged into query_tasks / get_task_details):
+  query_tasks_json -> query_tasks(output_format="json")
+  get_task_requirement_context -> get_task_details(sections=["requirements"])
+  get_task_adr_context -> get_task_details(sections=["adrs"])
+  get_task_full_context -> get_task_details(sections=["requirements","adrs"])
 """
 
 import json
@@ -16,7 +19,7 @@ import pytest
 from lifecycle_mcp.handlers.task_handler import TaskHandler
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────
+# -- Fixtures ----------------------------------------------------------------
 
 
 @pytest.fixture
@@ -30,7 +33,7 @@ async def task_env(v2_db_manager):
     return handler, v2_db_manager, "PROJ-0001"
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# -- Helpers -----------------------------------------------------------------
 
 
 async def _create_task(handler, project_id, title="Test Task", priority="P1", **extra):
@@ -75,9 +78,9 @@ async def _link(db, source_type, source_id, target_type, target_id, rel_type, pr
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  Tool definitions
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -91,17 +94,28 @@ async def test_tool_definitions_list(task_env):
         "update_task_status",
         "archive_task",
         "query_tasks",
-        "query_tasks_json",
         "get_task_details",
         "batch_create_tasks",
         "clone_task",
+    ]
+    for name in expected:
+        assert name in names, f"Missing tool definition: {name}"
+    assert len(tools) == 8
+
+
+@pytest.mark.asyncio
+async def test_removed_tools_not_present(task_env):
+    handler, _, _ = task_env
+    tools = handler.get_tool_definitions()
+    names = [t["name"] for t in tools]
+    removed = [
+        "query_tasks_json",
         "get_task_requirement_context",
         "get_task_adr_context",
         "get_task_full_context",
     ]
-    for name in expected:
-        assert name in names, f"Missing tool definition: {name}"
-    assert len(tools) == 12
+    for name in removed:
+        assert name not in names, f"Tool should have been removed: {name}"
 
 
 @pytest.mark.asyncio
@@ -113,9 +127,9 @@ async def test_no_github_tools(task_env):
     assert "bulk_sync_github_tasks" not in names
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  create_task
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -211,9 +225,9 @@ async def test_create_task_with_parent(task_env):
     assert row["parent_task_id"] == "TASK-0001"
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  update_task (new broad-update tool)
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -286,9 +300,9 @@ async def test_update_task_rejects_nonexistent(task_env):
     assert "not found" in result[0].text.lower()
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  update_task_status (narrow write)
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -419,9 +433,9 @@ async def test_update_task_status_not_found(task_env):
     assert "not found" in result[0].text.lower()
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  archive_task
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -446,9 +460,9 @@ async def test_archive_task_not_found(task_env):
     assert "ERROR" in result[0].text
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  query_tasks
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  query_tasks — output_format, limit, offset
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -541,41 +555,129 @@ async def test_query_tasks_no_results(task_env):
     assert "No tasks found" in result[0].text or "0" in result[0].text
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  query_tasks_json
-# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_query_tasks_summary_format(task_env):
+    """Default output_format='summary' returns one-line-per-task pipe-delimited."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Sum Task", priority="P1")
+    await _create_task(handler, pid, title="Another Task", priority="P0")
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "output_format": "summary"}
+    )
+    text = result[0].text
+    # Each task should appear as a pipe-delimited line
+    assert "TASK-0001" in text
+    assert "|" in text
+    assert "Sum Task" in text
+    assert "TASK-0002" in text
 
 
 @pytest.mark.asyncio
-async def test_query_tasks_json_format(task_env):
+async def test_query_tasks_json_output_format(task_env):
+    """output_format='json' returns a JSON array of task objects."""
     handler, db, pid = task_env
-    await _create_task(handler, pid, title="JSON Task", acceptance_criteria=["AC1"])
+    await _create_task(handler, pid, title="JSON Task", priority="P1", acceptance_criteria=["AC1"])
 
-    result = await handler.handle_tool_call("query_tasks_json", {"project_id": pid})
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "output_format": "json"}
+    )
     data = json.loads(result[0].text)
     assert isinstance(data, list)
     assert len(data) == 1
     assert data[0]["title"] == "JSON Task"
-    # acceptance_criteria should be parsed from JSON string
-    assert data[0]["acceptance_criteria"] == ["AC1"]
+    assert data[0]["id"] == "TASK-0001"
+    assert data[0]["status"] == "Not Started"
+    assert data[0]["priority"] == "P1"
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_markdown_format(task_env):
+    """output_format='markdown' returns the verbose markdown-style format."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="MD Task", priority="P2", assignee="Bob")
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "output_format": "markdown"}
+    )
+    text = result[0].text
+    # Markdown format uses the bullet-style format with square-bracket status
+    assert "TASK-0001" in text
+    assert "MD Task" in text
+    assert "Bob" in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_default_format_is_summary(task_env):
+    """When no output_format given, should behave like 'summary'."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Default Task", priority="P1")
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid}
+    )
+    text = result[0].text
+    # Summary format uses pipe delimiter
+    assert "TASK-0001" in text
+    assert "|" in text
+    assert "Default Task" in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_limit(task_env):
+    """limit parameter restricts the number of returned tasks."""
+    handler, db, pid = task_env
+    for i in range(5):
+        await _create_task(handler, pid, title=f"Task {i}", priority="P1")
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "limit": 2}
+    )
+    text = result[0].text
+    # Should only contain 2 tasks
+    assert "2" in text  # count in the summary line
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_offset(task_env):
+    """offset parameter skips tasks for pagination."""
+    handler, db, pid = task_env
+    for i in range(5):
+        await _create_task(handler, pid, title=f"Task {i}", priority="P1")
+
+    # Get first 2
+    result1 = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "limit": 2, "offset": 0}
+    )
+    # Get next 2
+    result2 = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "limit": 2, "offset": 2}
+    )
+    text1 = result1[0].text
+    text2 = result2[0].text
+    # The two result sets should not overlap (different tasks)
+    assert text1 != text2
 
 
 @pytest.mark.asyncio
 async def test_query_tasks_json_excludes_archived(task_env):
+    """JSON format should also respect include_archived flag."""
     handler, db, pid = task_env
     await _create_task(handler, pid, title="Visible")
     await _create_task(handler, pid, title="Hidden")
     await handler.handle_tool_call("archive_task", {"task_id": "TASK-0002"})
 
-    result = await handler.handle_tool_call("query_tasks_json", {"project_id": pid})
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "output_format": "json"}
+    )
     data = json.loads(result[0].text)
     assert len(data) == 1
     assert data[0]["title"] == "Visible"
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  get_task_details
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  get_task_details — sections parameter
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -597,6 +699,180 @@ async def test_get_task_details_full_record(task_env):
     assert "P0" in text
     assert "XL" in text
     assert "Bob" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_default_sections(task_env):
+    """Default sections=['planning','requirements'] should show planning + requirements."""
+    handler, db, pid = task_env
+    await _create_task(
+        handler,
+        pid,
+        title="Default Sections Task",
+        scope_boundaries="Module A",
+        technical_outline="Pattern X",
+        risk_notes="Low risk",
+    )
+    await _create_requirement(db, pid, "REQ-0001", title="Linked Req")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    # Planning section should be present
+    assert "Planning" in text
+    assert "Module A" in text
+    assert "Pattern X" in text
+    # Requirements section should be present
+    assert "REQ-0001" in text
+    assert "Linked Req" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_requirements_section(task_env):
+    """sections=['requirements'] should include linked requirements."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Req Section Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Linked Req")
+    await _create_requirement(db, pid, "REQ-0002", title="Unlinked Req")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": ["requirements"]}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "Linked Req" in text
+    assert "REQ-0002" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_adrs_section(task_env):
+    """sections=['adrs'] should include linked ADRs but not requirements."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="ADR Section Task")
+    await _create_adr(db, pid, "ADR-0001", title="Design Decision")
+    await _create_adr(db, pid, "ADR-0002", title="Unlinked ADR")
+    await _link(db, "task", "TASK-0001", "architecture", "ADR-0001", "addresses", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": ["adrs"]}
+    )
+    text = result[0].text
+    assert "ADR-0001" in text
+    assert "Design Decision" in text
+    assert "ADR-0002" not in text
+    # Requirements section should NOT be present since not requested
+    assert "Linked Requirement" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_all_sections(task_env):
+    """All sections requested should include planning, execution, requirements, adrs, subtasks."""
+    handler, db, pid = task_env
+    await _create_task(
+        handler,
+        pid,
+        title="Full Task",
+        scope_boundaries="Full scope",
+        technical_outline="Full outline",
+        risk_notes="Full risk",
+    )
+    # Set execution fields via status transition
+    await handler.handle_tool_call(
+        "update_task_status",
+        {
+            "task_id": "TASK-0001",
+            "new_status": "In Progress",
+            "execution_notes": "Work started",
+            "deviation_from_plan": "Minor deviation",
+        },
+    )
+    # Create subtask
+    await _create_task(handler, pid, title="Child Task", parent_task_id="TASK-0001")
+    # Create linked requirement and ADR
+    await _create_requirement(db, pid, "REQ-0001", title="Full Req")
+    await _create_adr(db, pid, "ADR-0001", title="Full ADR")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+    await _link(db, "task", "TASK-0001", "architecture", "ADR-0001", "addresses", pid)
+
+    all_sections = ["planning", "execution", "requirements", "adrs", "subtasks"]
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": all_sections}
+    )
+    text = result[0].text
+    # Planning
+    assert "Planning" in text
+    assert "Full scope" in text
+    # Execution
+    assert "Execution" in text
+    assert "Work started" in text
+    assert "Minor deviation" in text
+    # Requirements
+    assert "REQ-0001" in text
+    assert "Full Req" in text
+    # ADRs
+    assert "ADR-0001" in text
+    assert "Full ADR" in text
+    # Subtasks
+    assert "Subtask" in text or "Child Task" in text
+    assert "TASK-0002" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_execution_section_only(task_env):
+    """sections=['execution'] should show execution fields only, not planning."""
+    handler, db, pid = task_env
+    await _create_task(
+        handler,
+        pid,
+        title="Exec Task",
+        scope_boundaries="Some scope",
+    )
+    await handler.handle_tool_call(
+        "update_task_status",
+        {
+            "task_id": "TASK-0001",
+            "new_status": "In Progress",
+            "execution_notes": "Doing work",
+        },
+    )
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": ["execution"]}
+    )
+    text = result[0].text
+    assert "Execution" in text
+    assert "Doing work" in text
+    # Planning section should NOT be present
+    assert "## Planning" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_subtasks_section(task_env):
+    """sections=['subtasks'] should show child tasks and parent info."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Parent Task")
+    await _create_task(handler, pid, title="Child A", parent_task_id="TASK-0001")
+    await _create_task(handler, pid, title="Child B", parent_task_id="TASK-0001")
+
+    # Check parent's subtasks
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": ["subtasks"]}
+    )
+    text = result[0].text
+    assert "Child A" in text
+    assert "Child B" in text
+    assert "TASK-0002" in text
+    assert "TASK-0003" in text
+
+    # Check child shows parent
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0002", "sections": ["subtasks"]}
+    )
+    text = result[0].text
+    assert "Parent Task" in text or "TASK-0001" in text
 
 
 @pytest.mark.asyncio
@@ -624,9 +900,47 @@ async def test_get_task_details_not_found(task_env):
     assert "not found" in result[0].text.lower()
 
 
-# ═════════════════════════════════════════════════════════════════════════
+@pytest.mark.asyncio
+async def test_get_task_details_reverse_requirement_link(task_env):
+    """Relationships where requirement is the source should also appear."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Context Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Reverse Linked Req")
+    await _link(db, "requirement", "REQ-0001", "task", "TASK-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": ["requirements"]}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "Reverse Linked Req" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_excludes_archived_entities(task_env):
+    """Archived requirements/ADRs should not appear in sections."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Context Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Active Req")
+    await _create_requirement(db, pid, "REQ-0002", title="Archived Req")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0002", "implements", pid)
+    # Archive REQ-0002
+    await db.execute_query(
+        "UPDATE requirements SET is_archived = 1 WHERE id = 'REQ-0002'", []
+    )
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001", "sections": ["requirements"]}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "REQ-0002" not in text
+
+
+# =============================================================================
 #  batch_create_tasks
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -690,9 +1004,9 @@ async def test_batch_create_tasks_validates_project(task_env):
     assert "ERROR" in result[0].text
 
 
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  clone_task
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio
@@ -855,114 +1169,9 @@ async def test_clone_task_not_found(task_env):
     assert "ERROR" in result[0].text
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  Context tools
-# ═════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.asyncio
-async def test_get_task_requirement_context(task_env):
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Context Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Linked Req")
-    await _create_requirement(db, pid, "REQ-0002", title="Unlinked Req")
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
-
-    result = await handler.handle_tool_call(
-        "get_task_requirement_context", {"task_id": "TASK-0001"}
-    )
-    text = result[0].text
-    assert "REQ-0001" in text
-    assert "Linked Req" in text
-    assert "REQ-0002" not in text
-
-
-@pytest.mark.asyncio
-async def test_get_task_requirement_context_reverse_link(task_env):
-    """Test that relationships where requirement is the source also work."""
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Context Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Reverse Linked Req")
-    # Link from requirement -> task (reverse direction)
-    await _link(db, "requirement", "REQ-0001", "task", "TASK-0001", "implements", pid)
-
-    result = await handler.handle_tool_call(
-        "get_task_requirement_context", {"task_id": "TASK-0001"}
-    )
-    text = result[0].text
-    assert "REQ-0001" in text
-    assert "Reverse Linked Req" in text
-
-
-@pytest.mark.asyncio
-async def test_get_task_adr_context(task_env):
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="ADR Task")
-    await _create_adr(db, pid, "ADR-0001", title="Design Decision")
-    await _create_adr(db, pid, "ADR-0002", title="Unlinked ADR")
-    await _link(db, "task", "TASK-0001", "architecture", "ADR-0001", "addresses", pid)
-
-    result = await handler.handle_tool_call(
-        "get_task_adr_context", {"task_id": "TASK-0001"}
-    )
-    text = result[0].text
-    assert "ADR-0001" in text
-    assert "Design Decision" in text
-    assert "ADR-0002" not in text
-
-
-@pytest.mark.asyncio
-async def test_get_task_full_context(task_env):
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Full Context Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Req For Context")
-    await _create_adr(db, pid, "ADR-0001", title="ADR For Context")
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
-    await _link(db, "task", "TASK-0001", "architecture", "ADR-0001", "addresses", pid)
-
-    result = await handler.handle_tool_call(
-        "get_task_full_context", {"task_id": "TASK-0001"}
-    )
-    text = result[0].text
-    assert "REQ-0001" in text
-    assert "Req For Context" in text
-    assert "ADR-0001" in text
-    assert "ADR For Context" in text
-
-
-@pytest.mark.asyncio
-async def test_context_tools_task_not_found(task_env):
-    handler, db, pid = task_env
-    for tool in ["get_task_requirement_context", "get_task_adr_context", "get_task_full_context"]:
-        result = await handler.handle_tool_call(tool, {"task_id": "TASK-9999"})
-        assert "ERROR" in result[0].text
-
-
-@pytest.mark.asyncio
-async def test_context_excludes_archived_entities(task_env):
-    """Archived requirements/ADRs should not appear in context."""
-    handler, db, pid = task_env
-    await _create_task(handler, pid, title="Context Task")
-    await _create_requirement(db, pid, "REQ-0001", title="Active Req")
-    await _create_requirement(db, pid, "REQ-0002", title="Archived Req")
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
-    await _link(db, "task", "TASK-0001", "requirement", "REQ-0002", "implements", pid)
-    # Archive REQ-0002
-    await db.execute_query(
-        "UPDATE requirements SET is_archived = 1 WHERE id = 'REQ-0002'", []
-    )
-
-    result = await handler.handle_tool_call(
-        "get_task_requirement_context", {"task_id": "TASK-0001"}
-    )
-    text = result[0].text
-    assert "REQ-0001" in text
-    assert "REQ-0002" not in text
-
-
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  Handle unknown tool
-# ═════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 
 @pytest.mark.asyncio

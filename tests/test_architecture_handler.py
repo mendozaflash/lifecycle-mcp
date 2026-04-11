@@ -1,10 +1,10 @@
-"""Tests for ArchitectureHandler v2 (DB-06).
+"""Tests for ArchitectureHandler v2 (DB-06 / BF-05).
 
-Validates all 8 MCP tools:
+Validates all 7 MCP tools:
   create_architecture_decision, update_architecture_decision,
   update_architecture_status, archive_architecture_decision,
-  query_architecture_decisions, query_architecture_decisions_json,
-  get_architecture_details, add_architecture_review
+  query_architecture_decisions, get_architecture_details,
+  add_architecture_review
 """
 
 import json
@@ -21,7 +21,6 @@ from lifecycle_mcp.handlers.architecture_handler import ArchitectureHandler
 async def setup(v2_db_manager):
     """Set up an ArchitectureHandler + a test project. Returns (handler, db, project_id)."""
     handler = ArchitectureHandler(v2_db_manager)
-    handler._testing_mode = True
     await v2_db_manager.execute_query(
         "INSERT INTO projects (id, name) VALUES (?, ?)",
         ["PROJ-0001", "Test Project"],
@@ -86,13 +85,13 @@ async def test_tool_definitions_list(setup):
         "update_architecture_status",
         "archive_architecture_decision",
         "query_architecture_decisions",
-        "query_architecture_decisions_json",
         "get_architecture_details",
         "add_architecture_review",
     ]
     for name in expected:
         assert name in names, f"Missing tool definition: {name}"
-    assert len(tools) == 8
+    assert "query_architecture_decisions_json" not in names, "Removed tool still present"
+    assert len(tools) == 7
 
 
 # =============================================================================
@@ -377,6 +376,64 @@ async def test_update_status_not_found(setup):
 
 
 # =============================================================================
+#  ADR shortcut transitions
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_adr_draft_to_accepted_shortcut(setup):
+    """Draft -> Accepted shortcut transition works in one call."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid)  # starts as Draft
+
+    result = await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Accepted"},
+    )
+    assert "SUCCESS" in result[0].text
+    assert "Draft" in result[0].text
+    assert "Accepted" in result[0].text
+
+    # Verify DB
+    row = await db.execute_query(
+        "SELECT status FROM architecture WHERE id = 'ADR-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["status"] == "Accepted"
+
+
+@pytest.mark.asyncio
+async def test_adr_under_review_to_accepted_shortcut(setup):
+    """Under Review -> Accepted shortcut transition works in one call."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid)
+
+    # First: Draft -> Under Review
+    await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Under Review"},
+    )
+
+    # Shortcut: Under Review -> Accepted
+    result = await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Accepted"},
+    )
+    assert "SUCCESS" in result[0].text
+    assert "Under Review" in result[0].text
+    assert "Accepted" in result[0].text
+
+    # Verify DB
+    row = await db.execute_query(
+        "SELECT status FROM architecture WHERE id = 'ADR-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["status"] == "Accepted"
+
+
+# =============================================================================
 #  archive_architecture_decision
 # =============================================================================
 
@@ -495,12 +552,13 @@ async def test_query_no_results(setup):
 
 
 # =============================================================================
-#  query_architecture_decisions_json
+#  query_architecture_decisions — output_format, limit, offset
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_query_json_format(setup):
+async def test_query_architecture_json_output_format(setup):
+    """output_format=json returns a JSON array with parsed JSON fields."""
     handler, db, pid = setup
     await _create_adr(
         handler,
@@ -510,27 +568,142 @@ async def test_query_json_format(setup):
         consequences={"pro": "fast"},
     )
 
-    result = await handler.handle_tool_call("query_architecture_decisions_json", {"project_id": pid})
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "json"},
+    )
     data = json.loads(result[0].text)
     assert isinstance(data, list)
     assert len(data) == 1
     assert data[0]["title"] == "JSON ADR"
+    assert data[0]["id"] == "ADR-0001"
+    assert data[0]["status"] == "Draft"
     # JSON fields should be parsed
     assert data[0]["decision_drivers"] == ["Speed"]
     assert data[0]["consequences"] == {"pro": "fast"}
 
 
 @pytest.mark.asyncio
-async def test_query_json_excludes_archived(setup):
+async def test_query_architecture_json_excludes_archived(setup):
+    """output_format=json respects include_archived flag."""
     handler, db, pid = setup
     await _create_adr(handler, pid, title="Visible")
     await _create_adr(handler, pid, title="Hidden")
     await handler.handle_tool_call("archive_architecture_decision", {"architecture_id": "ADR-0002"})
 
-    result = await handler.handle_tool_call("query_architecture_decisions_json", {"project_id": pid})
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "json"},
+    )
     data = json.loads(result[0].text)
     assert len(data) == 1
     assert data[0]["title"] == "Visible"
+
+
+@pytest.mark.asyncio
+async def test_query_architecture_summary_format(setup):
+    """output_format=summary (default) returns one-line-per-ADR: 'ADR-XXXX | title | status'."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid, title="Summary ADR")
+
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "summary"},
+    )
+    text = result[0].text
+    assert "ADR-0001 | Summary ADR | Draft" in text
+
+
+@pytest.mark.asyncio
+async def test_query_architecture_summary_is_default(setup):
+    """When output_format is omitted, summary format is used by default."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid, title="Default Format ADR")
+
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid},
+    )
+    text = result[0].text
+    assert "ADR-0001 | Default Format ADR | Draft" in text
+
+
+@pytest.mark.asyncio
+async def test_query_architecture_markdown_format(setup):
+    """output_format=markdown returns the verbose/detailed format."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid, title="Markdown ADR")
+
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "markdown"},
+    )
+    text = result[0].text
+    # Markdown format should contain the ADR-ID and title in verbose style
+    assert "ADR-0001" in text
+    assert "Markdown ADR" in text
+    assert "Draft" in text
+
+
+@pytest.mark.asyncio
+async def test_query_architecture_limit(setup):
+    """limit parameter restricts the number of returned results."""
+    handler, db, pid = setup
+    for i in range(5):
+        await _create_adr(handler, pid, title=f"ADR {i}")
+
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "limit": 2},
+    )
+    text = result[0].text
+    # With limit=2 and ORDER BY created_at DESC, we should get 2 results
+    # Count the ADR-XXXX occurrences in summary format
+    adr_count = text.count("ADR-")
+    # Could have ADR- in header too, so count pipe-separated lines
+    lines = [l for l in text.split("\n") if " | " in l and "ADR-" in l]
+    assert len(lines) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_architecture_offset(setup):
+    """offset parameter skips initial results."""
+    handler, db, pid = setup
+    for i in range(5):
+        await _create_adr(handler, pid, title=f"ADR {i}")
+
+    # Get all results first (ordered by created_at DESC -> ADR-0005 first)
+    all_result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "json"},
+    )
+    all_data = json.loads(all_result[0].text)
+
+    # Now with offset=2
+    offset_result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "json", "offset": 2},
+    )
+    offset_data = json.loads(offset_result[0].text)
+
+    assert len(offset_data) == 3  # 5 total - 2 skipped = 3
+    assert offset_data[0]["id"] == all_data[2]["id"]
+
+
+@pytest.mark.asyncio
+async def test_query_architecture_limit_and_offset(setup):
+    """limit and offset work together for pagination."""
+    handler, db, pid = setup
+    for i in range(5):
+        await _create_adr(handler, pid, title=f"ADR {i}")
+
+    # Get page 2 (offset=2, limit=2)
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions",
+        {"project_id": pid, "output_format": "json", "limit": 2, "offset": 2},
+    )
+    data = json.loads(result[0].text)
+    assert len(data) == 2
 
 
 # =============================================================================
@@ -734,4 +907,33 @@ async def test_supersession_full_flow(setup):
 async def test_unknown_tool(setup):
     handler, _, _ = setup
     result = await handler.handle_tool_call("nonexistent_tool", {})
+    assert "ERROR" in result[0].text or "Unknown" in result[0].text
+
+
+# =============================================================================
+#  Dead code removal verification
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_no_mcp_client_parameter(setup):
+    """Constructor should only accept db_manager, not mcp_client."""
+    handler, _, _ = setup
+    assert not hasattr(handler, "mcp_client")
+
+
+@pytest.mark.asyncio
+async def test_no_analyze_adr_for_diagrams(setup):
+    """Dead LLM sampling code should be removed."""
+    handler, _, _ = setup
+    assert not hasattr(handler, "_analyze_adr_for_diagrams")
+    assert not hasattr(handler, "_build_adr_context")
+    assert not hasattr(handler, "_get_diagram_analysis_system_prompt")
+
+
+@pytest.mark.asyncio
+async def test_no_query_json_route(setup):
+    """query_architecture_decisions_json should not be routed."""
+    handler, db, pid = setup
+    result = await handler.handle_tool_call("query_architecture_decisions_json", {})
     assert "ERROR" in result[0].text or "Unknown" in result[0].text

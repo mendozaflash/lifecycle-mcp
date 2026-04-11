@@ -1,11 +1,11 @@
-"""Tests for ProjectHandler (DB-03).
+"""Tests for ProjectHandler (DB-03 / BF-06).
 
 Validates:
 - create_project: returns PROJ-XXXX, sequential IDs, optional fields stored
 - update_project: updates fields, rejects archived/nonexistent project
 - archive_project: cascading archive of project + children
-- query_projects: default excludes archived, include_archived flag, status filter
-- get_project_details: correct entity counts, zero counts for empty project
+- list_projects: default excludes archived, include_archived flag, status filter, slim output
+- get_project_details: detail_level summary/status/metrics
 """
 
 import json
@@ -234,27 +234,27 @@ async def test_archive_project_nonexistent(project_handler):
     assert "ERROR" in result[0].text
 
 
-# ── query_projects ───────────────────────────────────────────────────
+# ── list_projects ────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_query_projects_excludes_archived(project_handler):
-    """query_projects excludes archived by default."""
+async def test_list_projects_excludes_archived(project_handler):
+    """list_projects excludes archived by default."""
     await project_handler.handle_tool_call("create_project", {"name": "Active"})
     await project_handler.handle_tool_call("create_project", {"name": "To Archive"})
     await project_handler.handle_tool_call(
         "archive_project", {"project_id": "PROJ-0002"}
     )
 
-    result = await project_handler.handle_tool_call("query_projects", {})
+    result = await project_handler.handle_tool_call("list_projects", {})
     text = result[0].text
     assert "Active" in text
     assert "To Archive" not in text
 
 
 @pytest.mark.asyncio
-async def test_query_projects_includes_archived(project_handler):
-    """query_projects with include_archived=True shows all."""
+async def test_list_projects_includes_archived(project_handler):
+    """list_projects with include_archived=True shows all."""
     await project_handler.handle_tool_call("create_project", {"name": "Active"})
     await project_handler.handle_tool_call("create_project", {"name": "Archived One"})
     await project_handler.handle_tool_call(
@@ -262,7 +262,7 @@ async def test_query_projects_includes_archived(project_handler):
     )
 
     result = await project_handler.handle_tool_call(
-        "query_projects", {"include_archived": True}
+        "list_projects", {"include_archived": True}
     )
     text = result[0].text
     assert "Active" in text
@@ -270,13 +270,13 @@ async def test_query_projects_includes_archived(project_handler):
 
 
 @pytest.mark.asyncio
-async def test_query_projects_status_filter(project_handler):
-    """query_projects can filter by status."""
+async def test_list_projects_status_filter(project_handler):
+    """list_projects can filter by status."""
     await project_handler.handle_tool_call("create_project", {"name": "Active One"})
     await project_handler.handle_tool_call("create_project", {"name": "Active Two"})
 
     result = await project_handler.handle_tool_call(
-        "query_projects", {"status": "active"}
+        "list_projects", {"status": "active"}
     )
     text = result[0].text
     assert "Active One" in text
@@ -284,48 +284,87 @@ async def test_query_projects_status_filter(project_handler):
 
 
 @pytest.mark.asyncio
-async def test_query_projects_empty(project_handler):
-    """query_projects with no projects returns appropriate message."""
-    result = await project_handler.handle_tool_call("query_projects", {})
+async def test_list_projects_empty(project_handler):
+    """list_projects with no projects returns appropriate message."""
+    result = await project_handler.handle_tool_call("list_projects", {})
     text = result[0].text
     assert "0" in text or "no" in text.lower() or "Found 0" in text
 
 
-# ── get_project_details ──────────────────────────────────────────────
-
-
 @pytest.mark.asyncio
-async def test_get_project_details_with_counts(project_handler):
-    """get_project_details returns correct entity counts."""
-    db = project_handler.db
-    await project_handler.handle_tool_call("create_project", {"name": "CountTest"})
+async def test_list_projects_slim_output(project_handler):
+    """list_projects returns only id, name, status per project (no entity counts)."""
+    await project_handler.handle_tool_call("create_project", {"name": "Alpha"})
+    await project_handler.handle_tool_call("create_project", {"name": "Beta"})
 
-    # Insert children
+    # Add children to ensure counts are NOT in the output
+    db = project_handler.db
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, type, title, status, priority) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         ["REQ-0001", "PROJ-0001", "FUNC", "Req1", "Draft", "P1"],
     )
+
+    result = await project_handler.handle_tool_call("list_projects", {})
+    text = result[0].text
+    # Should contain id, name, status
+    assert "PROJ-0001" in text
+    assert "Alpha" in text
+    assert "PROJ-0002" in text
+    assert "Beta" in text
+    assert "active" in text.lower()
+    # Should NOT contain entity count aggregation (e.g. "Requirements:", "Tasks:")
+    assert "Requirements:" not in text
+    assert "Tasks:" not in text
+
+
+# ── get_project_details ──────────────────────────────────────────────
+
+
+# Helper functions for inserting test data
+async def _add_req(db, req_id, project_id, status="Draft", priority="P1"):
     await db.execute_query(
-        "INSERT INTO requirements (id, project_id, type, title, status, priority) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ["REQ-0002", "PROJ-0001", "TECH", "Req2", "Draft", "P0"],
+        "INSERT INTO requirements (id, project_id, type, title, status, priority) VALUES (?, ?, ?, ?, ?, ?)",
+        [req_id, project_id, "FUNC", f"Req {req_id}", status, priority],
     )
+
+
+async def _add_task(db, task_id, project_id, status="Not Started", priority="P1", assignee=None):
     await db.execute_query(
-        "INSERT INTO tasks (id, project_id, title, status, priority) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ["TASK-0001", "PROJ-0001", "Task1", "Not Started", "P1"],
+        "INSERT INTO tasks (id, project_id, title, status, priority, assignee) VALUES (?, ?, ?, ?, ?, ?)",
+        [task_id, project_id, f"Task {task_id}", status, priority, assignee],
     )
+
+
+async def _add_adr(db, adr_id, project_id, status="Draft"):
     await db.execute_query(
-        "INSERT INTO tasks (id, project_id, title, status, priority) "
-        "VALUES (?, ?, ?, ?, ?)",
-        ["TASK-0002", "PROJ-0001", "Task2", "Complete", "P1"],
+        "INSERT INTO architecture (id, project_id, title, context, decision, status) VALUES (?, ?, ?, ?, ?, ?)",
+        [adr_id, project_id, f"ADR {adr_id}", "ctx", "dec", status],
     )
+
+
+async def _add_blocking_relationship(db, blocker_id, blocked_id, project_id):
+    import uuid
+    rel_id = f"rel-{uuid.uuid4().hex[:8]}"
     await db.execute_query(
-        "INSERT INTO architecture (id, project_id, title, status) "
-        "VALUES (?, ?, ?, ?)",
-        ["ADR-0001", "PROJ-0001", "ADR1", "Draft"],
+        "INSERT INTO relationships (id, source_type, source_id, target_type, target_id, relationship_type, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [rel_id, "task", blocker_id, "task", blocked_id, "blocks", project_id],
     )
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_summary_default(project_handler):
+    """get_project_details defaults to summary level with metadata + total counts."""
+    db = project_handler.db
+    await project_handler.handle_tool_call("create_project", {"name": "CountTest"})
+
+    # Insert children
+    await _add_req(db, "REQ-0001", "PROJ-0001")
+    await _add_req(db, "REQ-0002", "PROJ-0001")
+    await _add_task(db, "TASK-0001", "PROJ-0001", status="Not Started")
+    await _add_task(db, "TASK-0002", "PROJ-0001", status="Complete")
+    await _add_adr(db, "ADR-0001", "PROJ-0001")
 
     result = await project_handler.handle_tool_call(
         "get_project_details", {"project_id": "PROJ-0001"}
@@ -333,10 +372,23 @@ async def test_get_project_details_with_counts(project_handler):
     text = result[0].text
     assert "PROJ-0001" in text
     assert "CountTest" in text
-    # Should show requirement count: 2
-    assert "2" in text
-    # Should show task info and ADR count
-    assert "1" in text  # 1 complete or 1 ADR
+    # Summary shows total counts
+    assert "Requirements: 2" in text
+    assert "Tasks: 2" in text
+    assert "ADRs: 1" in text
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_summary_explicit(project_handler):
+    """get_project_details with detail_level=summary returns same as default."""
+    await project_handler.handle_tool_call("create_project", {"name": "Explicit"})
+
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "summary"}
+    )
+    text = result[0].text
+    assert "PROJ-0001" in text
+    assert "Explicit" in text
 
 
 @pytest.mark.asyncio
@@ -359,6 +411,115 @@ async def test_get_project_details_nonexistent(project_handler):
         "get_project_details", {"project_id": "PROJ-9999"}
     )
     assert "ERROR" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_status(project_handler):
+    """get_project_details with detail_level=status shows per-status breakdowns and completion %."""
+    db = project_handler.db
+    await project_handler.handle_tool_call("create_project", {"name": "StatusTest"})
+
+    await _add_req(db, "REQ-0001", "PROJ-0001", status="Draft")
+    await _add_req(db, "REQ-0002", "PROJ-0001", status="Draft")
+    await _add_req(db, "REQ-0003", "PROJ-0001", status="Approved")
+    await _add_task(db, "TASK-0001", "PROJ-0001", status="Not Started")
+    await _add_task(db, "TASK-0002", "PROJ-0001", status="In Progress")
+    await _add_task(db, "TASK-0003", "PROJ-0001", status="Complete")
+    await _add_task(db, "TASK-0004", "PROJ-0001", status="Complete")
+    await _add_adr(db, "ADR-0001", "PROJ-0001", status="Draft")
+    await _add_adr(db, "ADR-0002", "PROJ-0001", status="Accepted")
+
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "status"}
+    )
+    text = result[0].text
+
+    # Per-status breakdowns
+    assert "2 Draft" in text  # requirements
+    assert "1 Approved" in text
+    assert "1 Not Started" in text
+    assert "1 In Progress" in text
+    assert "2 Complete" in text
+    # Completion percentage
+    assert "50%" in text
+    # ADR breakdown
+    assert "1 Draft" in text
+    assert "1 Accepted" in text
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_status_blocked_items(project_handler):
+    """get_project_details with detail_level=status shows blocked tasks."""
+    db = project_handler.db
+    await project_handler.handle_tool_call("create_project", {"name": "BlockTest"})
+
+    await _add_task(db, "TASK-0001", "PROJ-0001", status="In Progress")
+    await _add_task(db, "TASK-0002", "PROJ-0001", status="Blocked")
+    await _add_blocking_relationship(db, "TASK-0001", "TASK-0002", "PROJ-0001")
+
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "status"}
+    )
+    text = result[0].text
+    assert "Blocked" in text
+    assert "TASK-0002" in text
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_metrics(project_handler):
+    """get_project_details with detail_level=metrics returns JSON with all breakdowns."""
+    db = project_handler.db
+    await project_handler.handle_tool_call("create_project", {"name": "MetricsTest"})
+
+    await _add_req(db, "REQ-0001", "PROJ-0001", status="Draft", priority="P0")
+    await _add_req(db, "REQ-0002", "PROJ-0001", status="Approved", priority="P1")
+    await _add_task(db, "TASK-0001", "PROJ-0001", status="Complete", priority="P1", assignee="Alice")
+    await _add_task(db, "TASK-0002", "PROJ-0001", status="In Progress", priority="P2", assignee="Bob")
+    await _add_task(db, "TASK-0003", "PROJ-0001", status="Not Started", priority="P1", assignee=None)
+    await _add_adr(db, "ADR-0001", "PROJ-0001", status="Accepted")
+
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "metrics"}
+    )
+    metrics = json.loads(result[0].text)
+
+    assert metrics["project_id"] == "PROJ-0001"
+    # Requirements
+    assert metrics["requirements"]["total"] == 2
+    assert metrics["requirements"]["by_status"]["Draft"] == 1
+    assert metrics["requirements"]["by_status"]["Approved"] == 1
+    assert metrics["requirements"]["by_priority"]["P0"] == 1
+    assert metrics["requirements"]["by_priority"]["P1"] == 1
+    # Tasks
+    assert metrics["tasks"]["total"] == 3
+    assert metrics["tasks"]["by_status"]["Complete"] == 1
+    assert metrics["tasks"]["by_status"]["In Progress"] == 1
+    assert metrics["tasks"]["by_status"]["Not Started"] == 1
+    assert metrics["tasks"]["by_assignee"]["Alice"] == 1
+    assert metrics["tasks"]["by_assignee"]["Bob"] == 1
+    assert metrics["tasks"]["by_assignee"]["Unassigned"] == 1
+    assert metrics["tasks"]["completion_pct"] == pytest.approx(33.3, abs=0.1)
+    # Architecture
+    assert metrics["architecture"]["total"] == 1
+    assert metrics["architecture"]["by_status"]["Accepted"] == 1
+    # Blocked count
+    assert "blocked_count" in metrics
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_metrics_empty(project_handler):
+    """get_project_details with detail_level=metrics on empty project returns zero counts."""
+    await project_handler.handle_tool_call("create_project", {"name": "EmptyMetrics"})
+
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "metrics"}
+    )
+    metrics = json.loads(result[0].text)
+    assert metrics["requirements"]["total"] == 0
+    assert metrics["tasks"]["total"] == 0
+    assert metrics["tasks"]["completion_pct"] == 0
+    assert metrics["architecture"]["total"] == 0
+    assert metrics["blocked_count"] == 0
 
 
 @pytest.mark.asyncio

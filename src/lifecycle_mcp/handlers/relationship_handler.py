@@ -4,9 +4,12 @@ Relationship Handler for MCP Lifecycle Management Server
 Handles all entity relationship operations (CRUD)
 """
 
+import json
 from typing import Any
 
 from mcp.types import TextContent
+
+from lifecycle_mcp.constants import VALID_RELATIONSHIP_COMBINATIONS
 
 from .base_handler import BaseHandler
 
@@ -60,41 +63,32 @@ class RelationshipHandler(BaseHandler):
             },
             {
                 "name": "query_relationships",
-                "description": "Query relationships for visualization",
+                "description": "Query relationships with filtering, pagination, and output format control",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "entity_id": {"type": "string"},
-                        "relationship_type": {"type": "string"},
-                        "include_incoming": {"type": "boolean", "default": True},
-                        "include_outgoing": {"type": "boolean", "default": True},
-                        "project_id": {"type": "string", "description": "Filter by project"},
-                    },
-                },
-            },
-            {
-                "name": "get_entity_relationships",
-                "description": "Get all relationships for a specific entity",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "entity_id": {"type": "string"},
-                    },
-                    "required": ["entity_id"],
-                },
-            },
-            {
-                "name": "query_all_relationships",
-                "description": "Get all relationships for visualization graph building",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "entity_types": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": ["requirement", "task", "architecture"]},
-                            "default": ["requirement", "task", "architecture"],
+                        "entity_id": {
+                            "type": "string",
+                            "description": "Filter to relationships involving this entity (as source or target)",
                         },
+                        "relationship_type": {"type": "string"},
                         "project_id": {"type": "string", "description": "Filter by project"},
+                        "output_format": {
+                            "type": "string",
+                            "enum": ["summary", "json"],
+                            "default": "summary",
+                            "description": "Output format: summary (human-readable) or json (structured)",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                            "description": "Maximum number of relationships to return",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "Number of relationships to skip (for pagination)",
+                        },
                     },
                 },
             },
@@ -109,10 +103,6 @@ class RelationshipHandler(BaseHandler):
                 return await self._delete_relationship(arguments)
             elif tool_name == "query_relationships":
                 return await self._query_relationships(arguments)
-            elif tool_name == "get_entity_relationships":
-                return await self._get_entity_relationships(arguments)
-            elif tool_name == "query_all_relationships":
-                return await self._query_all_relationships(arguments)
             else:
                 return self._create_error_response(f"Unknown tool: {tool_name}")
 
@@ -208,67 +198,31 @@ class RelationshipHandler(BaseHandler):
             )
 
     async def _query_relationships(self, args: dict[str, Any]) -> list[TextContent]:
-        """Query relationships for a specific entity or type"""
+        """Query relationships with filtering, pagination, and output format support."""
         entity_id = args.get("entity_id")
         rel_type = args.get("relationship_type")
         project_id = args.get("project_id")
+        output_format = args.get("output_format", "summary")
+        limit = args.get("limit", 50)
+        offset = args.get("offset", 0)
 
-        relationships = await self._fetch_all_relationships(project_id=project_id)
-
-        # Filter by entity_id if specified
-        if entity_id:
-            relationships = [r for r in relationships if r["source_id"] == entity_id or r["target_id"] == entity_id]
-
-        # Filter by relationship type if specified
-        if rel_type:
-            relationships = [r for r in relationships if r.get("type") == rel_type]
+        relationships = await self._fetch_all_relationships(
+            project_id=project_id,
+            entity_id=entity_id,
+            relationship_type=rel_type,
+            limit=limit,
+            offset=offset,
+        )
 
         if entity_id:
             key_info = f"Found {len(relationships)} relationship(s) for {entity_id}"
         else:
             key_info = f"Found {len(relationships)} relationship(s) of type {rel_type or 'all'}"
 
-        # Format relationships for display
-        details = self._format_relationships_details(relationships)
-
-        return self._create_above_fold_response("SUCCESS", key_info, "", details)
-
-    async def _get_entity_relationships(self, args: dict[str, Any]) -> list[TextContent]:
-        """Get all relationships for a specific entity"""
-        error = self._validate_required_params(args, ["entity_id"])
-        if error:
-            return self._create_error_response(error)
-
-        entity_id = args["entity_id"]
-        all_relationships = await self._fetch_all_relationships()
-
-        # Filter to only relationships involving this entity
-        relationships = [r for r in all_relationships if r["source_id"] == entity_id or r["target_id"] == entity_id]
-
-        key_info = f"Entity {entity_id} has {len(relationships)} relationship(s)"
-        details = self._format_entity_relationships_details(entity_id, relationships)
-
-        return self._create_above_fold_response("SUCCESS", key_info, "", details)
-
-    async def _query_all_relationships(self, args: dict[str, Any]) -> list[TextContent]:
-        """Get all relationships for graph visualization"""
-        entity_types = args.get("entity_types", ["requirement", "task", "architecture"])
-        project_id = args.get("project_id")
-
-        all_relationships = await self._fetch_all_relationships(project_id=project_id)
-
-        # Filter by entity types if specified
-        if entity_types != ["requirement", "task", "architecture"]:
-            filtered_relationships = []
-            for rel in all_relationships:
-                source_type = self._get_entity_type(rel["source_id"])
-                target_type = self._get_entity_type(rel["target_id"])
-                if source_type in entity_types and target_type in entity_types:
-                    filtered_relationships.append(rel)
-            all_relationships = filtered_relationships
-
-        key_info = f"Found {len(all_relationships)} total relationship(s)"
-        details = self._format_all_relationships_json(all_relationships)
+        if output_format == "json":
+            details = self._format_relationships_json(relationships)
+        else:
+            details = self._format_relationships_summary(relationships)
 
         return self._create_above_fold_response("SUCCESS", key_info, "", details)
 
@@ -286,23 +240,7 @@ class RelationshipHandler(BaseHandler):
 
     def _validate_relationship(self, source_type: str, target_type: str, rel_type: str) -> bool:
         """Validate that relationship type is valid for entity types"""
-        valid_combinations = {
-            ("requirement", "task", "implements"): True,
-            ("task", "requirement", "implements"): True,  # Reverse is also valid
-            ("requirement", "architecture", "addresses"): True,
-            ("architecture", "requirement", "addresses"): True,
-            ("task", "task", "depends"): True,
-            ("task", "task", "blocks"): True,
-            ("task", "task", "informs"): True,
-            ("task", "task", "requires"): True,
-            ("requirement", "requirement", "depends"): True,
-            ("requirement", "requirement", "parent"): True,
-            ("requirement", "requirement", "refines"): True,
-            ("requirement", "requirement", "conflicts"): True,
-            ("requirement", "requirement", "relates"): True,
-        }
-
-        return valid_combinations.get((source_type, target_type, rel_type), False)
+        return (source_type, target_type, rel_type) in VALID_RELATIONSHIP_COMBINATIONS
 
     async def _relationship_exists(self, source_id: str, target_id: str, rel_type: str) -> bool:
         """Check if relationship already exists in unified relationships table"""
@@ -374,66 +312,71 @@ class RelationshipHandler(BaseHandler):
             self.logger.error(f"Failed to delete relationship: {str(e)}")
             return 0
 
-    async def _fetch_all_relationships(self, project_id: str | None = None) -> list[dict[str, Any]]:
-        """Fetch all relationships from unified relationships table"""
-        relationships = []
+    async def _fetch_all_relationships(
+        self,
+        project_id: str | None = None,
+        entity_id: str | None = None,
+        relationship_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Fetch relationships using a single JOIN query (no N+1 per-row lookups).
 
-        # Get all relationships from unified table, optionally filtered by project
+        Resolves source/target titles via LEFT JOINs against requirements, tasks,
+        and architecture tables. Falls back to the entity ID if no title is found.
+        """
+        query = """
+            SELECT r.source_id, r.target_id, r.source_type, r.target_type,
+                   r.relationship_type,
+                   COALESCE(req_s.title, task_s.title, adr_s.title) AS source_title,
+                   COALESCE(req_t.title, task_t.title, adr_t.title) AS target_title
+            FROM relationships r
+            LEFT JOIN requirements req_s ON r.source_id = req_s.id AND r.source_type = 'requirement'
+            LEFT JOIN tasks task_s       ON r.source_id = task_s.id AND r.source_type = 'task'
+            LEFT JOIN architecture adr_s ON r.source_id = adr_s.id AND r.source_type = 'architecture'
+            LEFT JOIN requirements req_t ON r.target_id = req_t.id AND r.target_type = 'requirement'
+            LEFT JOIN tasks task_t       ON r.target_id = task_t.id AND r.target_type = 'task'
+            LEFT JOIN architecture adr_t ON r.target_id = adr_t.id AND r.target_type = 'architecture'
+        """
+
+        conditions: list[str] = []
+        params: list[Any] = []
+
         if project_id:
-            relationship_rows = await self.db.get_records(
-                "relationships", "*", "project_id = ?", [project_id]
-            )
-        else:
-            relationship_rows = await self.db.get_records("relationships", "*")
+            conditions.append("r.project_id = ?")
+            params.append(project_id)
 
-        for row in relationship_rows:
-            source_id = row["source_id"]
-            target_id = row["target_id"]
-            source_type = row["source_type"]
-            target_type = row["target_type"]
+        if entity_id:
+            conditions.append("(r.source_id = ? OR r.target_id = ?)")
+            params.extend([entity_id, entity_id])
 
-            # Get source entity title
-            source_title = source_id  # Default fallback
-            if source_type == "requirement":
-                source_rows = await self.db.get_records("requirements", "title", "id = ?", [source_id])
-                if source_rows:
-                    source_title = source_rows[0]["title"]
-            elif source_type == "task":
-                source_rows = await self.db.get_records("tasks", "title", "id = ?", [source_id])
-                if source_rows:
-                    source_title = source_rows[0]["title"]
-            elif source_type == "architecture":
-                source_rows = await self.db.get_records("architecture", "title", "id = ?", [source_id])
-                if source_rows:
-                    source_title = source_rows[0]["title"]
+        if relationship_type:
+            conditions.append("r.relationship_type = ?")
+            params.append(relationship_type)
 
-            # Get target entity title
-            target_title = target_id  # Default fallback
-            if target_type == "requirement":
-                target_rows = await self.db.get_records("requirements", "title", "id = ?", [target_id])
-                if target_rows:
-                    target_title = target_rows[0]["title"]
-            elif target_type == "task":
-                target_rows = await self.db.get_records("tasks", "title", "id = ?", [target_id])
-                if target_rows:
-                    target_title = target_rows[0]["title"]
-            elif target_type == "architecture":
-                target_rows = await self.db.get_records("architecture", "title", "id = ?", [target_id])
-                if target_rows:
-                    target_title = target_rows[0]["title"]
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
 
+        query += " ORDER BY r.rowid"
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        rows = await self.db.execute_query(query, params, fetch_all=True, row_factory=True)
+
+        relationships: list[dict[str, Any]] = []
+        for row in rows:
             relationships.append({
-                "source_id": source_id,
-                "target_id": target_id,
+                "source_id": row["source_id"],
+                "target_id": row["target_id"],
                 "type": row["relationship_type"],
-                "source_title": source_title,
-                "target_title": target_title
+                "source_title": row["source_title"] or row["source_id"],
+                "target_title": row["target_title"] or row["target_id"],
             })
 
         return relationships
 
-    def _format_relationships_details(self, relationships: list[dict[str, Any]]) -> str:
-        """Format relationships for display"""
+    def _format_relationships_summary(self, relationships: list[dict[str, Any]]) -> str:
+        """Format relationships as one-line-per-relationship summary."""
         if not relationships:
             return "No relationships found."
 
@@ -443,53 +386,20 @@ class RelationshipHandler(BaseHandler):
             target_title = rel.get("target_title", rel["target_id"])
             rel_type = rel["type"]
 
-            lines.append(f"- **{source_title}** ({rel['source_id']}) → **{target_title}** ({rel['target_id']}) [{rel_type}]")
+            lines.append(f"- **{source_title}** ({rel['source_id']}) -> **{target_title}** ({rel['target_id']}) [{rel_type}]")
 
         return "\n".join(lines)
 
-    def _format_entity_relationships_details(self, entity_id: str, relationships: list[dict[str, Any]]) -> str:
-        """Format entity relationships for detailed display"""
-        if not relationships:
-            return f"Entity {entity_id} has no relationships."
-
-        lines = [f"# Relationships for {entity_id}\n"]
-
-        # Group by relationship type
-        by_type = {}
-        for rel in relationships:
-            rel_type = rel["type"]
-            if rel_type not in by_type:
-                by_type[rel_type] = []
-            by_type[rel_type].append(rel)
-
-        for rel_type, rels in by_type.items():
-            lines.append(f"## {rel_type.title()} ({len(rels)})")
-            for rel in rels:
-                if rel["source_id"] == entity_id:
-                    # Outgoing relationship
-                    target_title = rel.get("target_title", rel["target_id"])
-                    lines.append(f"- → **{target_title}** ({rel['target_id']})")
-                else:
-                    # Incoming relationship
-                    source_title = rel.get("source_title", rel["source_id"])
-                    lines.append(f"- ← **{source_title}** ({rel['source_id']})")
-            lines.append("")
-
-        return "\n".join(lines)
-
-    def _format_all_relationships_json(self, relationships: list[dict[str, Any]]) -> str:
-        """Format all relationships as JSON for graph visualization"""
-        import json
-
-        # Simplify relationships for JSON output
+    def _format_relationships_json(self, relationships: list[dict[str, Any]]) -> str:
+        """Format relationships as a JSON array."""
         simplified = []
         for rel in relationships:
             simplified.append({
-                "source": rel["source_id"],
-                "target": rel["target_id"],
-                "type": rel["type"],
+                "source_id": rel["source_id"],
+                "target_id": rel["target_id"],
+                "relationship_type": rel["type"],
                 "source_title": rel.get("source_title", ""),
-                "target_title": rel.get("target_title", "")
+                "target_title": rel.get("target_title", ""),
             })
 
         return f"```json\n{json.dumps(simplified, indent=2)}\n```"

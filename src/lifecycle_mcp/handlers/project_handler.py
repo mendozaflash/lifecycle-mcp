@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Project Handler for MCP Lifecycle Management Server
-Handles project CRUD and archiving operations
+Handles project CRUD, archiving, listing, and detail operations
 """
 
+import json
 from typing import Any
 
 from mcp.types import TextContent
@@ -79,8 +80,8 @@ class ProjectHandler(BaseHandler):
                 },
             },
             {
-                "name": "query_projects",
-                "description": "Search and filter projects",
+                "name": "list_projects",
+                "description": "List projects with id, name, and status",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -98,11 +99,16 @@ class ProjectHandler(BaseHandler):
             },
             {
                 "name": "get_project_details",
-                "description": "Get full project details with entity counts",
+                "description": "Get project details at varying depth: summary (metadata + totals), status (+ per-status breakdowns, completion %, blocked items), or metrics (+ priority/assignee/effort breakdowns as JSON)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string", "description": "Project ID (PROJ-XXXX)"},
+                        "detail_level": {
+                            "type": "string",
+                            "enum": ["summary", "status", "metrics"],
+                            "description": "Level of detail (default: summary)",
+                        },
                     },
                     "required": ["project_id"],
                 },
@@ -115,7 +121,7 @@ class ProjectHandler(BaseHandler):
             "create_project": self._create_project,
             "update_project": self._update_project,
             "archive_project": self._archive_project,
-            "query_projects": self._query_projects,
+            "list_projects": self._list_projects,
             "get_project_details": self._get_project_details,
         }
         handler = handlers.get(tool_name)
@@ -235,8 +241,8 @@ class ProjectHandler(BaseHandler):
             "All requirements, tasks, and architecture decisions in this project have been archived.",
         )
 
-    async def _query_projects(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query projects with optional filters."""
+    async def _list_projects(self, params: dict[str, Any]) -> list[TextContent]:
+        """List projects returning only id, name, status per project."""
         include_archived = params.get("include_archived", False)
         status_filter = params.get("status")
 
@@ -270,9 +276,7 @@ class ProjectHandler(BaseHandler):
 
         lines = []
         for row in rows:
-            status = row["status"]
-            archived = " [ARCHIVED]" if row["is_archived"] else ""
-            lines.append(f"  {row['id']}: {row['name']} [{status}]{archived}")
+            lines.append(f"  {row['id']}: {row['name']} [{row['status']}]")
 
         details = "\n".join(lines)
 
@@ -283,56 +287,47 @@ class ProjectHandler(BaseHandler):
         )
 
     async def _get_project_details(self, params: dict[str, Any]) -> list[TextContent]:
-        """Get full project details with entity counts."""
+        """Get project details at varying depth via detail_level parameter.
+
+        detail_level values:
+          - summary (default): metadata + total counts
+          - status: summary + per-status breakdowns, completion %, blocked items
+          - metrics: status + priority/assignee/effort breakdowns as JSON
+        """
         error = self._validate_required_params(params, ["project_id"])
         if error:
             return self._create_error_response(error)
 
         project_id = params["project_id"]
+        detail_level = params.get("detail_level", "summary")
 
         # Validate exists
         error = await self._validate_entity_exists("project", project_id)
         if error:
             return self._create_error_response(error)
 
-        # Get project record
+        if detail_level == "metrics":
+            return await self._get_project_details_metrics(project_id)
+        elif detail_level == "status":
+            return await self._get_project_details_status(project_id)
+        else:
+            return await self._get_project_details_summary(project_id)
+
+    # ------------------------------------------------------------------
+    # Detail level implementations
+    # ------------------------------------------------------------------
+
+    async def _get_project_details_summary(self, project_id: str) -> list[TextContent]:
+        """Summary level: metadata + total counts."""
         rows = await self.db.get_records(
-            "projects",
-            where_clause="id = ?",
-            where_params=[project_id],
+            "projects", where_clause="id = ?", where_params=[project_id]
         )
         project = rows[0]
 
-        # Get entity counts
-        req_count_row = await self.db.execute_query(
-            "SELECT COUNT(*) as cnt FROM requirements WHERE project_id = ? AND is_archived = 0",
-            [project_id],
-            fetch_one=True,
-            row_factory=True,
-        )
-        task_count_row = await self.db.execute_query(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE project_id = ? AND is_archived = 0",
-            [project_id],
-            fetch_one=True,
-            row_factory=True,
-        )
-        task_complete_row = await self.db.execute_query(
-            "SELECT COUNT(*) as cnt FROM tasks WHERE project_id = ? AND status = 'Complete' AND is_archived = 0",
-            [project_id],
-            fetch_one=True,
-            row_factory=True,
-        )
-        adr_count_row = await self.db.execute_query(
-            "SELECT COUNT(*) as cnt FROM architecture WHERE project_id = ? AND is_archived = 0",
-            [project_id],
-            fetch_one=True,
-            row_factory=True,
-        )
-
-        req_count = req_count_row["cnt"]
-        task_count = task_count_row["cnt"]
-        tasks_complete = task_complete_row["cnt"]
-        adr_count = adr_count_row["cnt"]
+        req_count = await self._count_entities("requirements", project_id)
+        task_count = await self._count_entities("tasks", project_id)
+        tasks_complete = await self._count_entities("tasks", project_id, status="Complete")
+        adr_count = await self._count_entities("architecture", project_id)
 
         status = project["status"]
         name = project["name"]
@@ -354,8 +349,159 @@ class ProjectHandler(BaseHandler):
         detail_lines.append(f"Updated: {project['updated_at']}")
 
         return self._create_above_fold_response(
-            "SUCCESS",
-            key_info,
-            action_info,
-            details="\n".join(detail_lines),
+            "SUCCESS", key_info, action_info, details="\n".join(detail_lines)
         )
+
+    async def _get_project_details_status(self, project_id: str) -> list[TextContent]:
+        """Status level: summary + per-status breakdowns, completion %, blocked items."""
+        # Fetch project name
+        summary = await self.db.execute_query(
+            "SELECT name, status FROM project_summary WHERE id = ?",
+            [project_id],
+            fetch_one=True,
+            row_factory=True,
+        )
+        project_name = summary["name"] if summary else project_id
+        project_status = summary["status"] if summary else "unknown"
+
+        # Requirement breakdown
+        req_stats = await self.db.execute_query(
+            "SELECT status, COUNT(*) as count FROM requirements "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY status",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        total_reqs = sum(r["count"] for r in req_stats) if req_stats else 0
+        req_parts = ", ".join(f"{r['count']} {r['status']}" for r in req_stats) if req_stats else ""
+
+        # Task breakdown
+        task_stats = await self.db.execute_query(
+            "SELECT status, COUNT(*) as count FROM tasks "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY status",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        total_tasks = sum(t["count"] for t in task_stats) if task_stats else 0
+        completed_tasks = next((t["count"] for t in task_stats if t["status"] == "Complete"), 0) if task_stats else 0
+        completion_pct = round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+        task_parts = ", ".join(f"{t['count']} {t['status']}" for t in task_stats) if task_stats else ""
+
+        # ADR breakdown
+        adr_stats = await self.db.execute_query(
+            "SELECT status, COUNT(*) as count FROM architecture "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY status",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        total_adrs = sum(a["count"] for a in adr_stats) if adr_stats else 0
+        adr_parts = ", ".join(f"{a['count']} {a['status']}" for a in adr_stats) if adr_stats else ""
+
+        # Build report
+        lines = [
+            f"[SUCCESS] Project {project_id}: {project_name} [{project_status}]",
+            "",
+            f"Requirements: {total_reqs} total" + (f" ({req_parts})" if req_parts else ""),
+            f"Tasks: {total_tasks} total" + (f" ({task_parts})" if task_parts else "") + (f" -- {completion_pct}% complete" if total_tasks > 0 else ""),
+            f"Architecture: {total_adrs} total" + (f" ({adr_parts})" if adr_parts else ""),
+        ]
+
+        # Blocked tasks (always shown for status level)
+        blocked = await self.db.execute_query(
+            "SELECT id, title, blocked_by_id FROM blocked_tasks WHERE project_id = ?",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        if blocked:
+            lines.append("")
+            lines.append("Blocked Tasks:")
+            for b in blocked:
+                lines.append(f"- {b['id']}: {b['title']} (blocked by {b['blocked_by_id']})")
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _get_project_details_metrics(self, project_id: str) -> list[TextContent]:
+        """Metrics level: structured JSON with all breakdowns."""
+        # Requirements
+        req_by_status = await self.db.execute_query(
+            "SELECT status, COUNT(*) as count FROM requirements "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY status",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        req_by_priority = await self.db.execute_query(
+            "SELECT priority, COUNT(*) as count FROM requirements "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY priority",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+
+        # Tasks
+        task_by_status = await self.db.execute_query(
+            "SELECT status, COUNT(*) as count FROM tasks "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY status",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        task_by_priority = await self.db.execute_query(
+            "SELECT priority, COUNT(*) as count FROM tasks "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY priority",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+        task_by_assignee = await self.db.execute_query(
+            "SELECT COALESCE(assignee, 'Unassigned') as assignee, COUNT(*) as count FROM tasks "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY assignee",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+
+        # Architecture
+        adr_by_status = await self.db.execute_query(
+            "SELECT status, COUNT(*) as count FROM architecture "
+            "WHERE project_id = ? AND is_archived = 0 GROUP BY status",
+            [project_id], fetch_all=True, row_factory=True,
+        )
+
+        # Blocked count
+        blocked_row = await self.db.execute_query(
+            "SELECT COUNT(*) as cnt FROM blocked_tasks WHERE project_id = ?",
+            [project_id], fetch_one=True, row_factory=True,
+        )
+        blocked_count = blocked_row["cnt"] if blocked_row else 0
+
+        # Assemble metrics
+        total_tasks = sum(t["count"] for t in task_by_status) if task_by_status else 0
+        completed_tasks = next((t["count"] for t in task_by_status if t["status"] == "Complete"), 0) if task_by_status else 0
+        completion_pct = round(completed_tasks / total_tasks * 100, 1) if total_tasks > 0 else 0
+
+        metrics = {
+            "project_id": project_id,
+            "requirements": {
+                "total": sum(r["count"] for r in req_by_status) if req_by_status else 0,
+                "by_status": {r["status"]: r["count"] for r in req_by_status} if req_by_status else {},
+                "by_priority": {r["priority"]: r["count"] for r in req_by_priority} if req_by_priority else {},
+            },
+            "tasks": {
+                "total": total_tasks,
+                "by_status": {t["status"]: t["count"] for t in task_by_status} if task_by_status else {},
+                "by_priority": {t["priority"]: t["count"] for t in task_by_priority} if task_by_priority else {},
+                "by_assignee": {t["assignee"]: t["count"] for t in task_by_assignee} if task_by_assignee else {},
+                "completion_pct": completion_pct,
+            },
+            "architecture": {
+                "total": sum(a["count"] for a in adr_by_status) if adr_by_status else 0,
+                "by_status": {a["status"]: a["count"] for a in adr_by_status} if adr_by_status else {},
+            },
+            "blocked_count": blocked_count,
+        }
+
+        return [TextContent(type="text", text=json.dumps(metrics))]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _count_entities(self, table: str, project_id: str, status: str | None = None) -> int:
+        """Count non-archived entities in a table, optionally filtered by status."""
+        if status:
+            row = await self.db.execute_query(
+                f"SELECT COUNT(*) as cnt FROM {table} WHERE project_id = ? AND status = ? AND is_archived = 0",
+                [project_id, status], fetch_one=True, row_factory=True,
+            )
+        else:
+            row = await self.db.execute_query(
+                f"SELECT COUNT(*) as cnt FROM {table} WHERE project_id = ? AND is_archived = 0",
+                [project_id], fetch_one=True, row_factory=True,
+            )
+        return row["cnt"]
