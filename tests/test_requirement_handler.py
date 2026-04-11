@@ -1,10 +1,10 @@
-"""Tests for RequirementHandler v2 (DB-04).
+"""Tests for RequirementHandler v2 (DB-04, BF-03).
 
-Validates all 10 MCP tools:
+Validates all 8 MCP tools:
   create_requirement, update_requirement, update_requirement_status,
-  archive_requirement, query_requirements, query_requirements_json,
-  get_requirement_details, trace_requirement,
-  batch_create_requirements, clone_requirement
+  archive_requirement, query_requirements (with output_format/limit/offset),
+  get_requirement_details (with trace), batch_create_requirements,
+  clone_requirement
 """
 
 import json
@@ -95,15 +95,16 @@ async def test_tool_definitions_list(setup):
         "update_requirement_status",
         "archive_requirement",
         "query_requirements",
-        "query_requirements_json",
         "get_requirement_details",
-        "trace_requirement",
         "batch_create_requirements",
         "clone_requirement",
     ]
     for name in expected:
         assert name in names, f"Missing tool definition: {name}"
-    assert len(tools) == 10
+    # Removed tools should NOT be present
+    assert "query_requirements_json" not in names
+    assert "trace_requirement" not in names
+    assert len(tools) == 8
 
 
 # =============================================================================
@@ -506,32 +507,144 @@ async def test_query_requirements_no_results(setup):
 
 
 # =============================================================================
-#  query_requirements_json
+#  query_requirements — output_format, limit, offset
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_query_requirements_json_format(setup):
+async def test_query_requirements_summary_format(setup):
+    """Default output_format='summary' returns one-line-per-requirement format."""
     handler, db, pid = setup
-    await _create_req(handler, pid, title="JSON Req", acceptance_criteria=["AC1"])
+    await _create_req(handler, pid, title="Alpha Req", priority="P0")
+    await _create_req(handler, pid, title="Beta Req", priority="P1")
 
-    result = await handler.handle_tool_call("query_requirements_json", {"project_id": pid})
+    result = await handler.handle_tool_call("query_requirements", {"project_id": pid})
+    text = result[0].text
+    # Summary format: "REQ-XXXX | title | status | priority"
+    assert "REQ-0001 | Alpha Req | Draft | P0" in text
+    assert "REQ-0002 | Beta Req | Draft | P1" in text
+
+
+@pytest.mark.asyncio
+async def test_query_requirements_summary_format_explicit(setup):
+    """Explicitly passing output_format='summary' works the same as default."""
+    handler, db, pid = setup
+    await _create_req(handler, pid, title="Explicit Summary", priority="P2")
+
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid, "output_format": "summary"}
+    )
+    text = result[0].text
+    assert "REQ-0001 | Explicit Summary | Draft | P2" in text
+
+
+@pytest.mark.asyncio
+async def test_query_requirements_json_output_format(setup):
+    """output_format='json' returns a JSON array of {id, title, status, priority}."""
+    handler, db, pid = setup
+    await _create_req(handler, pid, title="JSON Req", priority="P0")
+    await _create_req(handler, pid, title="Another Req", priority="P1")
+
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid, "output_format": "json"}
+    )
     data = json.loads(result[0].text)
     assert isinstance(data, list)
-    assert len(data) == 1
+    assert len(data) == 2
+    # Each item has only the 4 specified keys
+    for item in data:
+        assert set(item.keys()) == {"id", "title", "status", "priority"}
     assert data[0]["title"] == "JSON Req"
-    # acceptance_criteria should be parsed from JSON string
-    assert data[0]["acceptance_criteria"] == ["AC1"]
+    assert data[0]["priority"] == "P0"
+
+
+@pytest.mark.asyncio
+async def test_query_requirements_markdown_format(setup):
+    """output_format='markdown' returns verbose markdown (backward-compat)."""
+    handler, db, pid = setup
+    await _create_req(handler, pid, title="Markdown Req", priority="P1")
+
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid, "output_format": "markdown"}
+    )
+    text = result[0].text
+    # Markdown format has the detailed listing with dashes
+    assert "REQ-0001" in text
+    assert "Markdown Req" in text
+    assert "Draft" in text
+    assert "P1" in text
+
+
+@pytest.mark.asyncio
+async def test_query_requirements_limit(setup):
+    """limit parameter restricts number of results."""
+    handler, db, pid = setup
+    # Use different priorities to get deterministic ordering (P0 < P1 < P2 in sort)
+    await _create_req(handler, pid, title="Prio0 Req", priority="P0")
+    await _create_req(handler, pid, title="Prio1 Req", priority="P1")
+    await _create_req(handler, pid, title="Prio2 Req", priority="P2")
+    await _create_req(handler, pid, title="Prio3a Req", priority="P3")
+    await _create_req(handler, pid, title="Prio3b Req", priority="P3")
+
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid, "limit": 2}
+    )
+    text = result[0].text
+    # ORDER BY priority, created_at DESC — first two are P0 and P1
+    assert "Prio0 Req" in text
+    assert "Prio1 Req" in text
+    assert "Prio2 Req" not in text
+    assert "Found 2 requirement(s)" in text
+
+
+@pytest.mark.asyncio
+async def test_query_requirements_offset(setup):
+    """offset parameter skips first N results."""
+    handler, db, pid = setup
+    # Use different priorities for deterministic ordering
+    await _create_req(handler, pid, title="Prio0 Req", priority="P0")
+    await _create_req(handler, pid, title="Prio1 Req", priority="P1")
+    await _create_req(handler, pid, title="Prio2 Req", priority="P2")
+    await _create_req(handler, pid, title="Prio3a Req", priority="P3")
+
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid, "limit": 2, "offset": 2}
+    )
+    text = result[0].text
+    # Skip P0 and P1 (offset=2), return P2 and P3a (limit=2)
+    assert "Prio0 Req" not in text
+    assert "Prio1 Req" not in text
+    assert "Prio2 Req" in text
+    assert "Prio3a Req" in text
+
+
+@pytest.mark.asyncio
+async def test_query_requirements_default_limit(setup):
+    """Default limit is 25 — creating fewer than 25 returns all."""
+    handler, db, pid = setup
+    for i in range(3):
+        await _create_req(handler, pid, title=f"Req {i}", priority="P1")
+
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "REQ-0002" in text
+    assert "REQ-0003" in text
 
 
 @pytest.mark.asyncio
 async def test_query_requirements_json_excludes_archived(setup):
+    """JSON output_format also excludes archived requirements by default."""
     handler, db, pid = setup
     await _create_req(handler, pid, title="Visible")
     await _create_req(handler, pid, title="Hidden")
     await handler.handle_tool_call("archive_requirement", {"requirement_id": "REQ-0002"})
 
-    result = await handler.handle_tool_call("query_requirements_json", {"project_id": pid})
+    result = await handler.handle_tool_call(
+        "query_requirements", {"project_id": pid, "output_format": "json"}
+    )
     data = json.loads(result[0].text)
     assert len(data) == 1
     assert data[0]["title"] == "Visible"
@@ -595,33 +708,71 @@ async def test_get_requirement_details_not_found(setup):
 
 
 # =============================================================================
-#  trace_requirement
+#  get_requirement_details — trace parameter
 # =============================================================================
 
 
 @pytest.mark.asyncio
-async def test_trace_requirement_linked_entities(setup):
+async def test_get_requirement_details_with_trace(setup):
+    """trace=true includes parent/child requirements in addition to tasks/ADRs."""
     handler, db, pid = setup
-    await _create_req(handler, pid, title="Traced Req")
+    # Create parent, child, and main requirement
+    await _create_req(handler, pid, title="Parent Req")
+    await _create_req(handler, pid, title="Main Req")
+    await _create_req(handler, pid, title="Child Req")
+
+    # Create task and ADR
     await _create_task(db, pid, "TASK-0001", title="Impl Task")
     await _create_adr(db, pid, "ADR-0001", title="Design Decision")
-    await _link(db, "requirement", "REQ-0001", "task", "TASK-0001", "implements", pid)
-    await _link(db, "requirement", "REQ-0001", "architecture", "ADR-0001", "addresses", pid)
+
+    # Link: REQ-0002 -> TASK-0001 (implements)
+    await _link(db, "requirement", "REQ-0002", "task", "TASK-0001", "implements", pid)
+    # Link: REQ-0002 -> ADR-0001 (addresses)
+    await _link(db, "requirement", "REQ-0002", "architecture", "ADR-0001", "addresses", pid)
+    # Link: REQ-0002 has parent REQ-0001 (REQ-0002 is source, REQ-0001 is target, rel=parent)
+    await _link(db, "requirement", "REQ-0002", "requirement", "REQ-0001", "parent", pid)
+    # Link: REQ-0003 has parent REQ-0002 (REQ-0003 is source, REQ-0002 is target, rel=parent)
+    await _link(db, "requirement", "REQ-0003", "requirement", "REQ-0002", "parent", pid)
 
     result = await handler.handle_tool_call(
-        "trace_requirement", {"requirement_id": "REQ-0001"}
+        "get_requirement_details", {"requirement_id": "REQ-0002", "trace": True}
     )
     text = result[0].text
-    assert "Traced Req" in text
+    assert "Main Req" in text
     assert "TASK-0001" in text
     assert "ADR-0001" in text
+    assert "Parent Req" in text or "REQ-0001" in text
+    assert "Child Req" in text or "REQ-0003" in text
 
 
 @pytest.mark.asyncio
-async def test_trace_requirement_not_found(setup):
+async def test_get_requirement_details_without_trace(setup):
+    """trace=false (default) does NOT include parent/child requirements."""
+    handler, db, pid = setup
+    await _create_req(handler, pid, title="Parent Req")
+    await _create_req(handler, pid, title="Main Req")
+    await _create_req(handler, pid, title="Child Req")
+
+    # Link parent/child
+    await _link(db, "requirement", "REQ-0002", "requirement", "REQ-0001", "parent", pid)
+    await _link(db, "requirement", "REQ-0003", "requirement", "REQ-0002", "parent", pid)
+
+    result = await handler.handle_tool_call(
+        "get_requirement_details", {"requirement_id": "REQ-0002"}
+    )
+    text = result[0].text
+    assert "Main Req" in text
+    # Parent/child sections should NOT appear when trace=false
+    assert "Parent Requirements" not in text
+    assert "Child Requirements" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_requirement_details_trace_not_found(setup):
+    """trace=true on a nonexistent requirement returns error."""
     handler, db, pid = setup
     result = await handler.handle_tool_call(
-        "trace_requirement", {"requirement_id": "REQ-9999"}
+        "get_requirement_details", {"requirement_id": "REQ-9999", "trace": True}
     )
     assert "ERROR" in result[0].text
     assert "not found" in result[0].text.lower()

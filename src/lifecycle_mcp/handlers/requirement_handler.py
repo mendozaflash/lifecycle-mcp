@@ -136,42 +136,34 @@ class RequirementHandler(BaseHandler):
                             "type": "boolean",
                             "description": "Include archived requirements (default: false)",
                         },
-                    },
-                },
-            },
-            {
-                "name": "query_requirements_json",
-                "description": "Query requirements and return structured JSON data for UI",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string"},
-                        "status": {"type": "string"},
-                        "priority": {"type": "string"},
-                        "type": {"type": "string"},
-                        "search_text": {"type": "string"},
-                        "include_archived": {
-                            "type": "boolean",
-                            "description": "Include archived requirements (default: false)",
+                        "output_format": {
+                            "type": "string",
+                            "enum": ["summary", "json", "markdown"],
+                            "description": "Output format: summary (one-line per req), json (structured array), markdown (verbose table). Default: summary",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 25)",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Number of results to skip (default: 0)",
                         },
                     },
                 },
             },
             {
                 "name": "get_requirement_details",
-                "description": "Get full requirement with all relationships",
+                "description": "Get full requirement with all relationships. Use trace=true to include parent/child requirements.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"requirement_id": {"type": "string"}},
-                    "required": ["requirement_id"],
-                },
-            },
-            {
-                "name": "trace_requirement",
-                "description": "Trace requirement through implementation (tasks, ADRs, child reqs)",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"requirement_id": {"type": "string"}},
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "trace": {
+                            "type": "boolean",
+                            "description": "Include parent/child requirement hierarchy (default: false)",
+                        },
+                    },
                     "required": ["requirement_id"],
                 },
             },
@@ -239,9 +231,7 @@ class RequirementHandler(BaseHandler):
             "update_requirement_status": self._update_requirement_status,
             "archive_requirement": self._archive_requirement,
             "query_requirements": self._query_requirements,
-            "query_requirements_json": self._query_requirements_json,
             "get_requirement_details": self._get_requirement_details,
-            "trace_requirement": self._trace_requirement,
             "batch_create_requirements": self._batch_create_requirements,
             "clone_requirement": self._clone_requirement,
         }
@@ -377,73 +367,67 @@ class RequirementHandler(BaseHandler):
     # ------------------------------------------------------------------
 
     async def _query_requirements(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query requirements with filters."""
+        """Query requirements with filters, output format, and pagination."""
         conditions, query_params = self._build_query_filters(params)
         where_clause = " AND ".join(conditions) if conditions else ""
 
-        requirements = await self.db.get_records(
-            "requirements", "*",
-            where_clause=where_clause,
-            where_params=query_params,
-            order_by="priority, created_at DESC",
+        output_format = params.get("output_format", "summary")
+        limit = params.get("limit", 25)
+        offset = params.get("offset", 0)
+
+        # Build query with LIMIT/OFFSET
+        columns = "*"
+        query = f"SELECT {columns} FROM requirements"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+        query += " ORDER BY priority, created_at DESC"
+        query += " LIMIT ? OFFSET ?"
+        query_params.extend([limit, offset])
+
+        requirements = await self.db.execute_query(
+            query, query_params, fetch_all=True, row_factory=True,
         )
 
         if not requirements:
             return self._create_above_fold_response("INFO", "No requirements found", "Try adjusting search criteria")
 
+        filter_desc = self._build_filter_description(params)
+
+        if output_format == "json":
+            result_list = [
+                {"id": req["id"], "title": req["title"], "status": req["status"], "priority": req["priority"]}
+                for req in requirements
+            ]
+            return [TextContent(type="text", text=json.dumps(result_list))]
+
+        if output_format == "markdown":
+            lines = []
+            for req in requirements:
+                info = f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}"
+                lines.append(info)
+            key_info = self._format_count_summary("requirement", len(requirements), filter_desc)
+            return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
+
+        # Default: summary — one-line pipe-delimited format
         lines = []
         for req in requirements:
-            info = f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}"
-            lines.append(info)
-
-        filter_desc = self._build_filter_description(params)
+            lines.append(f"{req['id']} | {req['title']} | {req['status']} | {req['priority']}")
         key_info = self._format_count_summary("requirement", len(requirements), filter_desc)
         return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
-
-    # ------------------------------------------------------------------
-    # query_requirements_json
-    # ------------------------------------------------------------------
-
-    async def _query_requirements_json(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query requirements and return structured JSON."""
-        conditions, query_params = self._build_query_filters(params)
-        where_clause = " AND ".join(conditions) if conditions else ""
-
-        requirements = await self.db.get_records(
-            "requirements", "*",
-            where_clause=where_clause,
-            where_params=query_params,
-            order_by="priority, created_at DESC",
-        )
-
-        json_fields = [
-            "functional_requirements", "nonfunctional_requirements", "out_of_scope",
-            "acceptance_criteria",
-        ]
-        result_list = []
-        for req in requirements:
-            req_dict = dict(req) if hasattr(req, "keys") else req
-            for field in json_fields:
-                if field in req_dict and isinstance(req_dict[field], str):
-                    try:
-                        req_dict[field] = json.loads(req_dict[field]) if req_dict[field] else []
-                    except (json.JSONDecodeError, TypeError):
-                        req_dict[field] = []
-            result_list.append(req_dict)
-
-        return [TextContent(type="text", text=json.dumps(result_list))]
 
     # ------------------------------------------------------------------
     # get_requirement_details
     # ------------------------------------------------------------------
 
     async def _get_requirement_details(self, params: dict[str, Any]) -> list[TextContent]:
-        """Get full requirement details with relationships."""
+        """Get full requirement details with relationships. Optionally trace parent/child reqs."""
         error = self._validate_required_params(params, ["requirement_id"])
         if error:
             return self._create_error_response(error)
 
         req_id = params["requirement_id"]
+        trace = params.get("trace", False)
+
         rows = await self.db.get_records("requirements", "*", where_clause="id = ?", where_params=[req_id])
         if not rows:
             return self._create_error_response(f"Requirement not found: {req_id}")
@@ -500,6 +484,41 @@ class RequirementHandler(BaseHandler):
                 for ac in acc_criteria:
                     report += f"- {ac}\n"
 
+        # Parent/child requirements (only when trace=true)
+        if trace:
+            parent_requirements = await self.db.execute_query(
+                """
+                SELECT r.* FROM requirements r
+                JOIN relationships rel ON r.id = rel.target_id
+                WHERE rel.source_id = ? AND rel.source_type = 'requirement'
+                  AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
+                """,
+                [req_id],
+                fetch_all=True,
+                row_factory=True,
+            )
+            if parent_requirements:
+                report += f"\n## Parent Requirements ({len(parent_requirements)})\n"
+                for parent in parent_requirements:
+                    report += f"- {parent['id']}: {parent['title']} [{parent['status']}]\n"
+
+            child_requirements = await self.db.execute_query(
+                """
+                SELECT r.* FROM requirements r
+                JOIN relationships rel ON r.id = rel.source_id
+                WHERE rel.target_id = ? AND rel.source_type = 'requirement'
+                  AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
+                ORDER BY r.created_at
+                """,
+                [req_id],
+                fetch_all=True,
+                row_factory=True,
+            )
+            if child_requirements:
+                report += f"\n## Child Requirements ({len(child_requirements)})\n"
+                for i, child in enumerate(child_requirements, 1):
+                    report += f"{i}. {child['id']}: {child['title']} [{child['status']}]\n"
+
         # Linked tasks via relationships (both directions)
         tasks = await self._get_linked_tasks(req_id)
         if tasks:
@@ -516,97 +535,6 @@ class RequirementHandler(BaseHandler):
 
         key_info = self._format_status_summary("Requirement", req["id"], req["status"])
         action_info = f"{req['title']} | {req['priority']}"
-        return self._create_above_fold_response("INFO", key_info, action_info, report)
-
-    # ------------------------------------------------------------------
-    # trace_requirement
-    # ------------------------------------------------------------------
-
-    async def _trace_requirement(self, params: dict[str, Any]) -> list[TextContent]:
-        """Trace requirement through full lifecycle."""
-        error = self._validate_required_params(params, ["requirement_id"])
-        if error:
-            return self._create_error_response(error)
-
-        req_id = params["requirement_id"]
-        rows = await self.db.get_records("requirements", "*", where_clause="id = ?", where_params=[req_id])
-        if not rows:
-            return self._create_error_response(f"Requirement not found: {req_id}")
-
-        req = dict(rows[0])
-
-        # Build trace report
-        report = f"""# Requirement Trace: {req["id"]}
-
-## Requirement Details
-- **Title**: {req["title"]}
-- **Status**: {req["status"]}
-- **Priority**: {req["priority"]}
-- **Created**: {req["created_at"]}
-
-## Current State
-{req.get("current_state") or "Not specified"}
-
-## Desired State
-{req.get("desired_state") or "Not specified"}
-"""
-
-        # Get parent requirements
-        parent_requirements = await self.db.execute_query(
-            """
-            SELECT r.* FROM requirements r
-            JOIN relationships rel ON r.id = rel.target_id
-            WHERE rel.source_id = ? AND rel.source_type = 'requirement'
-              AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
-            """,
-            [req_id],
-            fetch_all=True,
-            row_factory=True,
-        )
-        if parent_requirements:
-            report += f"\n## Parent Requirements ({len(parent_requirements)})\n"
-            for parent in parent_requirements:
-                report += f"- {parent['id']}: {parent['title']} [{parent['status']}]\n"
-
-        # Get child requirements
-        child_requirements = await self.db.execute_query(
-            """
-            SELECT r.* FROM requirements r
-            JOIN relationships rel ON r.id = rel.source_id
-            WHERE rel.target_id = ? AND rel.source_type = 'requirement'
-              AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
-            ORDER BY r.created_at
-            """,
-            [req_id],
-            fetch_all=True,
-            row_factory=True,
-        )
-        if child_requirements:
-            report += f"\n## Child Requirements ({len(child_requirements)})\n"
-            for i, child in enumerate(child_requirements, 1):
-                report += f"{i}. {child['id']}: {child['title']} [{child['status']}]\n"
-
-        # Get linked tasks
-        tasks = await self._get_linked_tasks(req_id)
-        report += f"\n## Implementation Tasks ({len(tasks)})\n"
-        if tasks:
-            for task in tasks:
-                info = f"- {task['id']}: {task['title']} [{task['status']}]"
-                if task["assignee"]:
-                    info += f" (Assigned: {task['assignee']})"
-                report += info + "\n"
-        else:
-            report += "No tasks linked\n"
-
-        # Get linked ADRs
-        adrs = await self._get_linked_adrs(req_id)
-        if adrs:
-            report += f"\n## Architecture Decisions ({len(adrs)})\n"
-            for adr in adrs:
-                report += f"- {adr['id']}: {adr['title']} [{adr['status']}]\n"
-
-        key_info = f"Requirement {req['id']} trace"
-        action_info = f"{req['title']} | {len(tasks)} tasks | {len(adrs)} architecture"
         return self._create_above_fold_response("INFO", key_info, action_info, report)
 
     # ------------------------------------------------------------------
@@ -764,7 +692,7 @@ class RequirementHandler(BaseHandler):
         return data
 
     def _build_query_filters(self, params: dict[str, Any]) -> tuple[list[str], list[Any]]:
-        """Build WHERE conditions for query_requirements / query_requirements_json."""
+        """Build WHERE conditions for query_requirements."""
         conditions: list[str] = []
         query_params: list[Any] = []
 
