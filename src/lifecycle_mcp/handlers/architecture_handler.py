@@ -28,11 +28,9 @@ class ArchitectureHandler(BaseHandler):
     _UPDATABLE_FIELDS = ["title", "context", "decision"]
     _UPDATABLE_JSON_FIELDS = ["decision_drivers", "considered_options", "consequences", "authors"]
 
-    def __init__(self, db_manager, mcp_client=None):
-        """Initialize handler with database manager and optional MCP client"""
+    def __init__(self, db_manager):
+        """Initialize handler with database manager"""
         super().__init__(db_manager)
-        self.mcp_client = mcp_client
-        self._testing_mode = False
 
     # ------------------------------------------------------------------
     # Tool definitions
@@ -79,7 +77,8 @@ class ArchitectureHandler(BaseHandler):
             },
             {
                 "name": "update_architecture_status",
-                "description": "Update architecture decision status with transition validation",
+                "description": "Update architecture decision status with transition validation. "
+                "Supports shortcut transitions: Draft->Accepted, Under Review->Accepted.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -124,21 +123,18 @@ class ArchitectureHandler(BaseHandler):
                             "type": "boolean",
                             "description": "Include archived decisions (default: false)",
                         },
-                    },
-                },
-            },
-            {
-                "name": "query_architecture_decisions_json",
-                "description": "Query architecture decisions and return structured JSON data for UI",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string"},
-                        "status": {"type": "string"},
-                        "search_text": {"type": "string"},
-                        "include_archived": {
-                            "type": "boolean",
-                            "description": "Include archived decisions (default: false)",
+                        "output_format": {
+                            "type": "string",
+                            "enum": ["summary", "json", "markdown"],
+                            "description": "Output format: summary (one-line per ADR), json (structured array), markdown (verbose). Default: summary",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 25)",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Number of results to skip for pagination (default: 0)",
                         },
                     },
                 },
@@ -179,7 +175,6 @@ class ArchitectureHandler(BaseHandler):
             "update_architecture_status": self._update_architecture_status,
             "archive_architecture_decision": self._archive_architecture_decision,
             "query_architecture_decisions": self._query_architecture_decisions,
-            "query_architecture_decisions_json": self._query_architecture_decisions_json,
             "get_architecture_details": self._get_architecture_details,
             "add_architecture_review": self._add_architecture_review,
         }
@@ -224,16 +219,6 @@ class ArchitectureHandler(BaseHandler):
 
         await self.db.insert_record("architecture", data)
         await self._log_operation("architecture", adr_id, "created", project_id=project_id)
-
-        # Analyze ADR for diagram suggestions (if not in testing mode)
-        if not self._testing_mode:
-            diagram_suggestions = await self._analyze_adr_for_diagrams(data)
-            if diagram_suggestions and diagram_suggestions.get("suggested_diagrams"):
-                suggestions_text = self._format_diagram_suggestions(diagram_suggestions, adr_id)
-                key_info = f"Architecture decision {adr_id} created with diagram suggestions"
-                suggestions_count = len(diagram_suggestions["suggested_diagrams"])
-                action_info = f"{params['title']} | {suggestions_count} diagram suggestions"
-                return self._create_above_fold_response("SUCCESS", key_info, action_info, suggestions_text)
 
         key_info = f"Architecture decision {adr_id} created"
         action_info = f"{params['title']} | Draft"
@@ -347,15 +332,23 @@ class ArchitectureHandler(BaseHandler):
     # ------------------------------------------------------------------
 
     async def _query_architecture_decisions(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query architecture decisions with filters."""
+        """Query architecture decisions with filters and configurable output format."""
         conditions, query_params = self._build_query_filters(params)
         where_clause = " AND ".join(conditions) if conditions else ""
 
-        decisions = await self.db.get_records(
-            "architecture", "*",
-            where_clause=where_clause,
-            where_params=query_params,
-            order_by="created_at DESC",
+        limit = params.get("limit", 25)
+        offset = params.get("offset", 0)
+        output_format = params.get("output_format", "summary")
+
+        # Build SQL with LIMIT/OFFSET
+        query = "SELECT * FROM architecture"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+        query += " ORDER BY created_at DESC"
+        query += f" LIMIT {int(limit)} OFFSET {int(offset)}"
+
+        decisions = await self.db.execute_query(
+            query, query_params, fetch_all=True, row_factory=True,
         )
 
         if not decisions:
@@ -363,44 +356,12 @@ class ArchitectureHandler(BaseHandler):
                 "INFO", "No architecture decisions found", "Try adjusting search criteria"
             )
 
-        lines = []
-        for decision in decisions:
-            info = f"- {decision['id']}: {decision['title']} [{decision['status']}]"
-            lines.append(info)
-
-        filter_desc = self._build_filter_description(params)
-        key_info = self._format_count_summary("architecture decision", len(decisions), filter_desc)
-        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
-
-    # ------------------------------------------------------------------
-    # query_architecture_decisions_json
-    # ------------------------------------------------------------------
-
-    async def _query_architecture_decisions_json(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query architecture decisions and return structured JSON."""
-        conditions, query_params = self._build_query_filters(params)
-        where_clause = " AND ".join(conditions) if conditions else ""
-
-        decisions = await self.db.get_records(
-            "architecture", "*",
-            where_clause=where_clause,
-            where_params=query_params,
-            order_by="created_at DESC",
-        )
-
-        json_fields = ["decision_drivers", "considered_options", "consequences", "authors"]
-        result_list = []
-        for decision in decisions:
-            decision_dict = dict(decision) if hasattr(decision, "keys") else decision
-            for field in json_fields:
-                if field in decision_dict and isinstance(decision_dict[field], str):
-                    try:
-                        decision_dict[field] = json.loads(decision_dict[field]) if decision_dict[field] else []
-                    except (json.JSONDecodeError, TypeError):
-                        decision_dict[field] = []
-            result_list.append(decision_dict)
-
-        return [TextContent(type="text", text=json.dumps(result_list))]
+        if output_format == "json":
+            return self._format_json_output(decisions)
+        elif output_format == "markdown":
+            return self._format_markdown_output(decisions, params)
+        else:  # summary (default)
+            return self._format_summary_output(decisions, params)
 
     # ------------------------------------------------------------------
     # get_architecture_details
@@ -576,121 +537,41 @@ class ArchitectureHandler(BaseHandler):
         return " | ".join(filters) if filters else "all decisions"
 
     # ------------------------------------------------------------------
-    # LLM diagram suggestion (kept from v1, gated by _testing_mode)
+    # Output format helpers
     # ------------------------------------------------------------------
 
-    async def _analyze_adr_for_diagrams(self, adr_data: dict[str, Any]) -> dict[str, Any] | None:
-        """Analyze ADR context using LLM sampling to suggest relevant diagrams."""
-        if not self.mcp_client:
-            self.logger.info("No MCP client available for sampling - skipping diagram suggestions")
-            return None
+    def _format_summary_output(self, decisions: list, params: dict[str, Any]) -> list[TextContent]:
+        """Format decisions as one-line-per-ADR summary."""
+        lines = []
+        for d in decisions:
+            lines.append(f"{d['id']} | {d['title']} | {d['status']}")
 
-        try:
-            adr_context = self._build_adr_context(adr_data)
+        filter_desc = self._build_filter_description(params)
+        key_info = self._format_count_summary("architecture decision", len(decisions), filter_desc)
+        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
 
-            sampling_request = {
-                "messages": [{"role": "user", "content": {"type": "text", "text": adr_context}}],
-                "modelPreferences": {"intelligencePriority": 0.8, "speedPriority": 0.2, "costPriority": 0.1},
-                "systemPrompt": self._get_diagram_analysis_system_prompt(),
-                "includeContext": "thisServer",
-                "temperature": 0.1,
-                "maxTokens": 800,
-                "stopSequences": ["```"],
-            }
+    def _format_json_output(self, decisions: list) -> list[TextContent]:
+        """Format decisions as a JSON array with parsed JSON fields."""
+        json_fields = ["decision_drivers", "considered_options", "consequences", "authors"]
+        result_list = []
+        for decision in decisions:
+            decision_dict = dict(decision) if hasattr(decision, "keys") else decision
+            for field in json_fields:
+                if field in decision_dict and isinstance(decision_dict[field], str):
+                    try:
+                        decision_dict[field] = json.loads(decision_dict[field]) if decision_dict[field] else []
+                    except (json.JSONDecodeError, TypeError):
+                        decision_dict[field] = []
+            result_list.append(decision_dict)
 
-            if hasattr(self.mcp_client, "sample") and callable(self.mcp_client.sample):
-                try:
-                    response = await self.mcp_client.sample(sampling_request)
-                    if response and hasattr(response, "content") and hasattr(response.content, "text"):
-                        return json.loads(response.content.text)
-                    else:
-                        self.logger.warning("MCP sampling returned invalid response format")
-                        return None
-                except Exception as sampling_error:
-                    self.logger.warning(f"MCP sampling failed: {sampling_error}")
-                    return None
-            else:
-                self.logger.info("MCP client does not support sampling - skipping diagram suggestions")
-                return None
+        return [TextContent(type="text", text=json.dumps(result_list))]
 
-        except Exception as e:
-            self.logger.warning(f"LLM diagram analysis failed: {e}")
-            return None
+    def _format_markdown_output(self, decisions: list, params: dict[str, Any]) -> list[TextContent]:
+        """Format decisions as verbose markdown."""
+        lines = []
+        for d in decisions:
+            lines.append(f"- **{d['id']}**: {d['title']} [{d['status']}]")
 
-    def _build_adr_context(self, adr_data: dict[str, Any]) -> str:
-        """Build context string for ADR diagram analysis."""
-        decision_drivers = self._safe_json_loads(adr_data.get("decision_drivers", "[]"))
-        considered_options = self._safe_json_loads(adr_data.get("considered_options", "[]"))
-        consequences = self._safe_json_loads(adr_data.get("consequences", "{}"))
-
-        context = (
-            f"Analyze this Architecture Decision Record (ADR) to suggest helpful "
-            f"diagrams for implementation and understanding:\n\n"
-            f"**ADR Title**: {adr_data['title']}\n\n"
-            f"**Context**: {adr_data.get('context', '')}\n\n"
-            f"**Decision**: {adr_data.get('decision', '')}\n\n"
-            f"**Decision Drivers**:\n"
-            f"{self._format_list_items(decision_drivers)}\n\n"
-            f"**Considered Options**:\n"
-            f"{self._format_list_items(considered_options)}\n\n"
-            f"**Consequences**:\n"
-            f"{self._format_consequences(consequences)}\n\n"
-            f"Please analyze this ADR and suggest 2-4 diagrams."
-        )
-        return context
-
-    def _format_list_items(self, items: list[str]) -> str:
-        """Format list items for context."""
-        if not items:
-            return "- None specified"
-        return "\n".join(f"- {item}" for item in items)
-
-    def _format_consequences(self, consequences: dict[str, Any]) -> str:
-        """Format consequences object for context."""
-        if not consequences:
-            return "- None specified"
-
-        formatted = []
-        if isinstance(consequences, dict):
-            for key, value in consequences.items():
-                if isinstance(value, list):
-                    formatted.append(f"**{key.title()}**:")
-                    formatted.extend(f"  - {item}" for item in value)
-                else:
-                    formatted.append(f"**{key.title()}**: {value}")
-        else:
-            formatted.append(str(consequences))
-
-        return "\n".join(formatted) if formatted else "- None specified"
-
-    def _get_diagram_analysis_system_prompt(self) -> str:
-        """Get system prompt for ADR diagram analysis."""
-        return (
-            "You are an expert software architect analyzing Architecture Decision Records "
-            "(ADRs) to suggest helpful diagrams.\n\n"
-            "Your goal is to recommend diagrams that provide practical value for:\n"
-            "- Implementation teams who need to understand how to build the solution\n"
-            "- Stakeholders who need to understand the architectural impact\n"
-            "- Future maintainers who need to understand the system structure\n\n"
-            "Always respond with valid JSON matching the specified format."
-        )
-
-    def _format_diagram_suggestions(self, suggestions: dict[str, Any], adr_id: str) -> str:
-        """Format diagram suggestions for user response."""
-        suggested_diagrams = suggestions.get("suggested_diagrams", [])
-        implementation_notes = suggestions.get("implementation_notes", "")
-
-        response = f"# Diagram Suggestions for {adr_id}\n\n"
-
-        for i, diagram in enumerate(suggested_diagrams, 1):
-            response += (
-                f"{i}. **{diagram.get('title', 'Untitled')}**\n"
-                f"   - **Type**: {diagram.get('type', 'unknown')}\n"
-                f"   - **Purpose**: {diagram.get('purpose', 'unknown')}\n"
-                f"   - **Rationale**: {diagram.get('rationale', '')}\n\n"
-            )
-
-        if implementation_notes:
-            response += f"## Implementation Notes\n{implementation_notes}\n"
-
-        return response
+        filter_desc = self._build_filter_description(params)
+        key_info = self._format_count_summary("architecture decision", len(decisions), filter_desc)
+        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
