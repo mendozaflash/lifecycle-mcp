@@ -3,7 +3,7 @@ Integration tests for the full server with all v2 handlers.
 
 Verifies:
   - 8 handlers instantiated (no InterviewHandler)
-  - 47 tools registered with correct routing
+  - Tools registered with correct routing
   - No legacy/removed tools in registry
   - Full end-to-end workflow through all handlers
   - All tool names unique
@@ -64,15 +64,27 @@ class TestServerStructure:
 
     @pytest.mark.asyncio
     async def test_tool_count(self, server):
-        """Exactly 47 tools should be registered in the handler registry."""
-        assert len(server.handlers) == 47, (
-            f"Expected 47 tools, got {len(server.handlers)}: {sorted(server.handlers.keys())}"
+        """Handler registry size should match total tool definitions from all handlers."""
+        expected_count = sum(
+            len(h.get_tool_definitions())
+            for h in [
+                server.project_handler,
+                server.requirement_handler,
+                server.task_handler,
+                server.architecture_handler,
+                server.relationship_handler,
+                server.validation_handler,
+                server.export_handler,
+                server.status_handler,
+            ]
+        )
+        assert len(server.handlers) == expected_count, (
+            f"Expected {expected_count} tools, got {len(server.handlers)}: {sorted(server.handlers.keys())}"
         )
 
     @pytest.mark.asyncio
     async def test_all_tool_names_unique(self, server):
-        """All tool names in handler registry must be unique (dict guarantees this, but verify definitions)."""
-        # Collect tool names from all handler get_tool_definitions()
+        """All tool names in handler registry must be unique."""
         seen = set()
         handlers = [
             server.project_handler,
@@ -84,12 +96,14 @@ class TestServerStructure:
             server.export_handler,
             server.status_handler,
         ]
+        expected_count = 0
         for handler in handlers:
             for tool_def in handler.get_tool_definitions():
                 name = tool_def["name"]
                 assert name not in seen, f"Duplicate tool name: {name}"
                 seen.add(name)
-        assert len(seen) == 47
+                expected_count += 1
+        assert len(seen) == expected_count
 
     @pytest.mark.asyncio
     async def test_interview_tools_not_in_registry(self, server):
@@ -117,11 +131,8 @@ class TestServerStructure:
     async def test_tool_routing_project(self, server):
         """Project tools should route to ProjectHandler."""
         project_tools = [
-            "create_project",
-            "update_project",
-            "archive_project",
-            "query_projects",
-            "get_project_details",
+            tool_def["name"]
+            for tool_def in server.project_handler.get_tool_definitions()
         ]
         for tool_name in project_tools:
             assert tool_name in server.handlers
@@ -131,16 +142,8 @@ class TestServerStructure:
     async def test_tool_routing_requirement(self, server):
         """Requirement tools should route to RequirementHandler."""
         req_tools = [
-            "create_requirement",
-            "update_requirement",
-            "update_requirement_status",
-            "archive_requirement",
-            "query_requirements",
-            "query_requirements_json",
-            "get_requirement_details",
-            "trace_requirement",
-            "batch_create_requirements",
-            "clone_requirement",
+            tool_def["name"]
+            for tool_def in server.requirement_handler.get_tool_definitions()
         ]
         for tool_name in req_tools:
             assert tool_name in server.handlers
@@ -150,18 +153,8 @@ class TestServerStructure:
     async def test_tool_routing_task(self, server):
         """Task tools should route to TaskHandler."""
         task_tools = [
-            "create_task",
-            "update_task",
-            "update_task_status",
-            "archive_task",
-            "query_tasks",
-            "query_tasks_json",
-            "get_task_details",
-            "batch_create_tasks",
-            "clone_task",
-            "get_task_requirement_context",
-            "get_task_adr_context",
-            "get_task_full_context",
+            tool_def["name"]
+            for tool_def in server.task_handler.get_tool_definitions()
         ]
         for tool_name in task_tools:
             assert tool_name in server.handlers
@@ -171,14 +164,8 @@ class TestServerStructure:
     async def test_tool_routing_architecture(self, server):
         """Architecture tools should route to ArchitectureHandler."""
         arch_tools = [
-            "create_architecture_decision",
-            "update_architecture_decision",
-            "update_architecture_status",
-            "archive_architecture_decision",
-            "query_architecture_decisions",
-            "query_architecture_decisions_json",
-            "get_architecture_details",
-            "add_architecture_review",
+            tool_def["name"]
+            for tool_def in server.architecture_handler.get_tool_definitions()
         ]
         for tool_name in arch_tools:
             assert tool_name in server.handlers
@@ -188,22 +175,31 @@ class TestServerStructure:
     async def test_tool_routing_relationship(self, server):
         """Relationship tools should route to RelationshipHandler."""
         rel_tools = [
-            "create_relationship",
-            "delete_relationship",
-            "query_relationships",
-            "get_entity_relationships",
-            "query_all_relationships",
+            tool_def["name"]
+            for tool_def in server.relationship_handler.get_tool_definitions()
         ]
+        # BF-02: only 3 tools remain (create, delete, query_relationships)
+        assert len(rel_tools) == 3
         for tool_name in rel_tools:
             assert tool_name in server.handlers
             assert server.handlers[tool_name] is server.relationship_handler
 
     @pytest.mark.asyncio
+    async def test_removed_relationship_tools_not_in_registry(self, server):
+        """get_entity_relationships and query_all_relationships must NOT be registered."""
+        removed_tools = [
+            "get_entity_relationships",
+            "query_all_relationships",
+        ]
+        for tool_name in removed_tools:
+            assert tool_name not in server.handlers, f"Removed tool still registered: {tool_name}"
+
+    @pytest.mark.asyncio
     async def test_tool_routing_validation(self, server):
         """Validation tools should route to ValidationHandler."""
         val_tools = [
-            "validate_project_plan",
-            "get_valid_status_transitions",
+            tool_def["name"]
+            for tool_def in server.validation_handler.get_tool_definitions()
         ]
         for tool_name in val_tools:
             assert tool_name in server.handlers
@@ -213,8 +209,8 @@ class TestServerStructure:
     async def test_tool_routing_export(self, server):
         """Export tools should route to ExportHandler."""
         exp_tools = [
-            "export_project_documentation",
-            "create_architectural_diagrams",
+            tool_def["name"]
+            for tool_def in server.export_handler.get_tool_definitions()
         ]
         for tool_name in exp_tools:
             assert tool_name in server.handlers
@@ -224,9 +220,8 @@ class TestServerStructure:
     async def test_tool_routing_status(self, server):
         """Status tools should route to StatusHandler."""
         status_tools = [
-            "get_project_status",
-            "get_project_metrics",
-            "diff_project",
+            tool_def["name"]
+            for tool_def in server.status_handler.get_tool_definitions()
         ]
         for tool_name in status_tools:
             assert tool_name in server.handlers
@@ -337,22 +332,21 @@ class TestFullWorkflow:
             {"project_id": "PROJ-0001"},
         )
         assert len(val_result) == 1
-        # Validation should complete (may have warnings but not crash)
         assert "ERROR" not in val_result[0].text or "validation" in val_result[0].text.lower()
 
-        # 6. Get project status
-        status_result = await server.status_handler.handle_tool_call(
-            "get_project_status",
-            {"project_id": "PROJ-0001"},
+        # 6. Get project details with status level
+        status_result = await server.project_handler.handle_tool_call(
+            "get_project_details",
+            {"project_id": "PROJ-0001", "detail_level": "status"},
         )
         assert len(status_result) == 1
         status_text = status_result[0].text
         assert "PROJ-0001" in status_text or "Integration Test Project" in status_text
 
-        # 7. Get project metrics
-        metrics_result = await server.status_handler.handle_tool_call(
-            "get_project_metrics",
-            {"project_id": "PROJ-0001"},
+        # 7. Get project details with metrics level
+        metrics_result = await server.project_handler.handle_tool_call(
+            "get_project_details",
+            {"project_id": "PROJ-0001", "detail_level": "metrics"},
         )
         assert len(metrics_result) == 1
 
@@ -368,19 +362,16 @@ class TestFullWorkflow:
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_error(self, server):
         """Calling a tool not in the registry should return an error message."""
-        # The call_tool is registered on server.server, but we can test handler routing
         handler = server.handlers.get("nonexistent_tool")
         assert handler is None
 
     @pytest.mark.asyncio
     async def test_architecture_decision_workflow(self, server):
         """Create project -> create ADR -> add review -> query."""
-        # Create project
         await server.project_handler.handle_tool_call(
             "create_project", {"name": "ADR Test"}
         )
 
-        # Create ADR
         adr_result = await server.architecture_handler.handle_tool_call(
             "create_architecture_decision",
             {
@@ -393,7 +384,6 @@ class TestFullWorkflow:
         assert "SUCCESS" in adr_result[0].text
         assert "ADR-0001" in adr_result[0].text
 
-        # Add review
         review_result = await server.architecture_handler.handle_tool_call(
             "add_architecture_review",
             {
@@ -404,7 +394,6 @@ class TestFullWorkflow:
         )
         assert "SUCCESS" in review_result[0].text
 
-        # Query ADRs
         query_result = await server.architecture_handler.handle_tool_call(
             "query_architecture_decisions",
             {"project_id": "PROJ-0001"},

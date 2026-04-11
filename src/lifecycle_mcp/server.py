@@ -3,7 +3,7 @@
 MCP Server for Software Lifecycle Management (v2)
 
 Provides structured access to projects, requirements, tasks, and
-architecture decisions through 8 handler modules and 47 tools.
+architecture decisions through 8 handler modules and 36 tools.
 """
 
 import argparse
@@ -49,62 +49,51 @@ class LifecycleMCPServer:
         self.export_handler = ExportHandler(self.db_manager)
         self.status_handler = StatusHandler(self.db_manager)
 
-        # Create handler registry for tool routing (47 tools)
+        # Create handler registry for tool routing (36 tools)
         self.handlers = {
             # Project tools (5)
             "create_project": self.project_handler,
             "update_project": self.project_handler,
             "archive_project": self.project_handler,
-            "query_projects": self.project_handler,
+            "list_projects": self.project_handler,
             "get_project_details": self.project_handler,
-            # Requirement tools (10)
+            # Requirement tools (8)
             "create_requirement": self.requirement_handler,
             "update_requirement": self.requirement_handler,
             "update_requirement_status": self.requirement_handler,
             "archive_requirement": self.requirement_handler,
             "query_requirements": self.requirement_handler,
-            "query_requirements_json": self.requirement_handler,
             "get_requirement_details": self.requirement_handler,
-            "trace_requirement": self.requirement_handler,
             "batch_create_requirements": self.requirement_handler,
             "clone_requirement": self.requirement_handler,
-            # Task tools (12)
+            # Task tools (8)
             "create_task": self.task_handler,
             "update_task": self.task_handler,
             "update_task_status": self.task_handler,
             "archive_task": self.task_handler,
             "query_tasks": self.task_handler,
-            "query_tasks_json": self.task_handler,
             "get_task_details": self.task_handler,
             "batch_create_tasks": self.task_handler,
             "clone_task": self.task_handler,
-            "get_task_requirement_context": self.task_handler,
-            "get_task_adr_context": self.task_handler,
-            "get_task_full_context": self.task_handler,
-            # Architecture tools (8)
+            # Architecture tools (7)
             "create_architecture_decision": self.architecture_handler,
             "update_architecture_decision": self.architecture_handler,
             "update_architecture_status": self.architecture_handler,
             "archive_architecture_decision": self.architecture_handler,
             "query_architecture_decisions": self.architecture_handler,
-            "query_architecture_decisions_json": self.architecture_handler,
             "get_architecture_details": self.architecture_handler,
             "add_architecture_review": self.architecture_handler,
-            # Relationship tools (5)
+            # Relationship tools (3)
             "create_relationship": self.relationship_handler,
             "delete_relationship": self.relationship_handler,
             "query_relationships": self.relationship_handler,
-            "get_entity_relationships": self.relationship_handler,
-            "query_all_relationships": self.relationship_handler,
             # Validation tools (2)
             "validate_project_plan": self.validation_handler,
             "get_valid_status_transitions": self.validation_handler,
             # Export tools (2)
             "export_project_documentation": self.export_handler,
             "create_architectural_diagrams": self.export_handler,
-            # Status tools (3)
-            "get_project_status": self.status_handler,
-            "get_project_metrics": self.status_handler,
+            # Status tools (1)
             "diff_project": self.status_handler,
         }
 
