@@ -45,13 +45,13 @@ The server exposes **36 tools** across **8 handler modules**, accessible via std
 |------|---------|
 | `project_summary` | Aggregated counts per project (requirements, tasks, ADRs, completion) |
 | `task_hierarchy` | Recursive CTE for parent-child task trees |
-| `blocked_tasks` | Tasks in Blocked status with their blocker IDs |
 
 ### Triggers
 
 - **Timestamp triggers**: Auto-update `updated_at` on projects, requirements, tasks, architecture
-- **Status change logging**: Auto-insert into `lifecycle_events` when requirement or task status changes
-- **Task completion**: Auto-set `completed_at` when task status becomes Complete
+- **Auto-progression triggers**: Two consolidated triggers on `tasks` table auto-progress requirement status when tasks reach `Implemented` or `Validated`
+- **Status change logging**: Auto-insert into `lifecycle_events` with auto-progression detection (actor = `system:auto-progression` for auto transitions, `MCP User` for manual)
+- **Task completion**: Auto-set `completed_at` when task status becomes `Validated`
 
 ### Indexes
 
@@ -165,41 +165,61 @@ Both tools require `output_directory` / `output_path` to be specified — they w
 
 ### Requirement Lifecycle
 
+#### State Diagram
+
 ```
-Draft -> Under Review -> Approved -> Architecture -> Ready -> Implemented -> Validated
-                  |           |                                      |
-                  v           v                                      v
-              Deprecated  Deprecated                            Deprecated
+Under Review -> Approved  (manual)
+Approved -> Partially Implemented  (auto: first task reaches Implemented)
+Partially Implemented -> Implemented  (auto: all non-deprecated tasks Implemented or Validated)
+Partially Implemented -> Partially Implemented Validated  (auto: task reaches Validated while others not yet Implemented)
+Implemented -> Partially Validated  (auto: first task reaches Validated)
+Partially Validated -> Validated  (auto: all non-deprecated tasks Validated)
+Partially Implemented Validated -> Validated  (auto: all non-deprecated tasks Validated)
+Any state -> Deprecated  (manual)
 ```
 
-Valid transitions:
-- **Draft**: Under Review, Deprecated
-- **Under Review**: Draft, Approved, Deprecated
-- **Approved**: Architecture, Ready, Deprecated
-- **Architecture**: Ready, Approved
-- **Ready**: Implemented, Deprecated
-- **Implemented**: Validated, Ready
-- **Validated**: Deprecated
-- **Deprecated**: (terminal)
+#### Manual Transitions (via update_requirement_status)
+
+| From | To |
+|------|-----|
+| Under Review | Approved, Deprecated |
+| Approved | Deprecated |
+| Partially Implemented | Deprecated |
+| Partially Implemented Validated | Deprecated |
+| Implemented | Deprecated |
+| Partially Validated | Deprecated |
+| Validated | Deprecated |
+| Deprecated | (terminal) |
+
+#### Automatic Transitions (via SQLite triggers on task status changes)
+
+| Trigger Condition | From | To |
+|-------------------|------|-----|
+| Task reaches Implemented (first linked task) | Approved | Partially Implemented |
+| Task reaches Implemented (all non-deprecated linked tasks) | Partially Implemented | Implemented |
+| Task reaches Validated (while other tasks not yet Implemented) | Partially Implemented | Partially Implemented Validated |
+| Task reaches Validated (first linked task, all tasks at least Implemented) | Implemented | Partially Validated |
+| Task reaches Validated (all non-deprecated linked tasks) | Partially Validated | Validated |
+| Task reaches Validated (all non-deprecated linked tasks) | Partially Implemented Validated | Validated |
+
+Auto-progression transitions are logged in `lifecycle_events` with `actor = 'system:auto-progression'`.
+Deprecated tasks are excluded from "all tasks" calculations.
 
 ### Task Lifecycle
 
 ```
-Not Started -> In Progress -> Complete
-                    |
-                    v
-                 Blocked -> In Progress
-                    |
-                    v
-                Abandoned
+Under Review -> Approved -> Implemented -> Validated
+Any state -> Deprecated
 ```
 
 Valid transitions:
-- **Not Started**: In Progress, Abandoned
-- **In Progress**: Complete, Blocked, Abandoned
-- **Blocked**: In Progress, Abandoned
-- **Complete**: (terminal)
-- **Abandoned**: (terminal)
+- **Under Review**: Approved, Deprecated
+- **Approved**: Implemented, Deprecated
+- **Implemented**: Validated, Deprecated
+- **Validated**: Deprecated
+- **Deprecated**: (terminal)
+
+**Task Approval Gating:** Tasks can only transition from `Under Review` to `Approved` when ALL linked requirements are in exactly `Approved` status. Tasks with no linked requirements are ungated.
 
 ### Architecture Decision Lifecycle
 
