@@ -168,6 +168,8 @@ async def test_validate_not_archived_nonexistent(handler, seeded_db):
     """Nonexistent entity returns error string (not found)."""
     result = await handler._validate_not_archived("task", "TASK-9999")
     assert result is not None
+    assert "not found" in result.lower()
+    assert "TASK-9999" in result
 
 
 @pytest.mark.asyncio
@@ -175,9 +177,77 @@ async def test_validate_not_archived_unknown_type(handler, seeded_db):
     """Unknown entity type returns error string."""
     result = await handler._validate_not_archived("widget", "W-0001")
     assert result is not None
+    assert "unknown" in result.lower() or "widget" in result.lower()
 
 
 # ── _log_operation with project_id ───────────────────────────────────
+
+
+# ── _create_error_response ──────────────────────────────────────────
+
+
+def test_create_error_response_with_exception(handler):
+    """Error response with exception logs the exception string."""
+    result = handler._create_error_response("Something failed", ValueError("boom"))
+    assert len(result) == 1
+    assert "ERROR" in result[0].text
+    assert "Something failed" in result[0].text
+
+
+# ── _safe_json_loads / _safe_json_dumps ─────────────────────────────
+
+
+def test_safe_json_loads_invalid_json(handler):
+    """Invalid JSON returns default value."""
+    result = handler._safe_json_loads("{not valid json")
+    assert result == []
+
+
+def test_safe_json_loads_non_string(handler):
+    """Non-string input (TypeError path) returns default value."""
+    result = handler._safe_json_loads(12345)
+    assert result == []
+
+
+def test_safe_json_dumps_unserializable(handler):
+    """Un-serializable data returns '[]' fallback."""
+    result = handler._safe_json_dumps(object())
+    assert result == "[]"
+
+
+# ── _log_operation exception swallowing ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_log_operation_swallows_insert_error(handler, seeded_db, monkeypatch):
+    """_log_operation swallows exceptions from insert_record."""
+    async def bad_insert(*args, **kwargs):
+        raise RuntimeError("DB write failed")
+
+    monkeypatch.setattr(handler.db, "insert_record", bad_insert)
+
+    # Should not raise
+    await handler._log_operation(
+        entity_type="task", entity_id="TASK-0001", event_type="created"
+    )
+
+
+# ── _add_review_comment exception swallowing ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_add_review_comment_swallows_insert_error(handler, seeded_db, monkeypatch):
+    """_add_review_comment swallows exceptions from insert_record."""
+    async def bad_insert(*args, **kwargs):
+        raise RuntimeError("DB write failed")
+
+    monkeypatch.setattr(handler.db, "insert_record", bad_insert)
+
+    # Should not raise
+    await handler._add_review_comment("requirement", "REQ-0001", "Nice work")
+
+
+# ── _log_operation with project_id ──────────────────────────────────
 
 
 @pytest.mark.asyncio

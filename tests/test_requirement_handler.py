@@ -48,6 +48,15 @@ async def _create_req(handler, project_id, title="Test Requirement", priority="P
     return await handler.handle_tool_call("create_requirement", params)
 
 
+def _extract_id(result):
+    """Extract REQ-XXXX ID from handler response text."""
+    import re
+    text = result[0].text
+    match = re.search(r"REQ-\d{4}", text)
+    assert match, f"Could not extract REQ ID from: {text}"
+    return match.group()
+
+
 async def _create_task(db, project_id, task_id, title="Test Task"):
     """Insert a task directly into the DB for relationship testing."""
     await db.execute_query(
@@ -1405,3 +1414,207 @@ class TestAutoProgression:
         assert ("Partially Implemented", "Implemented") in auto_transitions
         assert ("Implemented", "Partially Validated") in auto_transitions
         assert ("Partially Validated", "Validated") in auto_transitions
+
+
+# =============================================================================
+#  Coverage improvement tests
+# =============================================================================
+
+
+class TestCoverageGaps:
+    """Tests targeting specific uncovered lines in requirement_handler.py"""
+
+    @pytest.mark.asyncio
+    async def test_handle_tool_call_general_exception(self, setup):
+        """handle_tool_call wraps unexpected exceptions in error response."""
+        handler, db, project_id = setup
+
+        async def raise_error(params):
+            raise RuntimeError("boom")
+
+        handler._create_requirement = raise_error
+        result = await handler.handle_tool_call("create_requirement", {"project_id": "X"})
+        assert "ERROR" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_update_requirement_missing_id(self, setup):
+        """update_requirement without requirement_id returns error."""
+        handler, db, project_id = setup
+        result = await handler.handle_tool_call("update_requirement", {})
+        assert "ERROR" in result[0].text
+        assert "Missing required" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_update_requirement_status_missing_params(self, setup):
+        """update_requirement_status without new_status returns error."""
+        handler, db, project_id = setup
+        result = await handler.handle_tool_call(
+            "update_requirement_status", {"requirement_id": "REQ-0001"}
+        )
+        assert "ERROR" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_archive_requirement_missing_id(self, setup):
+        """archive_requirement without requirement_id returns error."""
+        handler, db, project_id = setup
+        result = await handler.handle_tool_call("archive_requirement", {})
+        assert "ERROR" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_batch_create_missing_params(self, setup):
+        """batch_create_requirements without required params returns error."""
+        handler, db, project_id = setup
+        result = await handler.handle_tool_call("batch_create_requirements", {})
+        assert "ERROR" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_batch_create_missing_type(self, setup):
+        """batch_create_requirements with missing type field returns error."""
+        handler, db, project_id = setup
+        result = await handler.handle_tool_call(
+            "batch_create_requirements",
+            {"project_id": project_id, "requirements": [{"title": "X", "priority": "P0"}]},
+        )
+        assert "ERROR" in result[0].text
+        assert "type" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_batch_create_missing_priority(self, setup):
+        """batch_create_requirements with missing priority returns error."""
+        handler, db, project_id = setup
+        result = await handler.handle_tool_call(
+            "batch_create_requirements",
+            {"project_id": project_id, "requirements": [{"title": "X", "type": "FUNC"}]},
+        )
+        assert "ERROR" in result[0].text
+        assert "priority" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_clone_requirement_invalid_target_project(self, setup):
+        """clone_requirement to nonexistent target project returns error."""
+        handler, db, project_id = setup
+        result = await _create_req(handler, project_id)
+        req_id = _extract_id(result)
+
+        result = await handler.handle_tool_call(
+            "clone_requirement",
+            {"requirement_id": req_id, "target_project_id": "PROJ-9999"},
+        )
+        assert "ERROR" in result[0].text
+
+    @pytest.mark.asyncio
+    async def test_clone_requirement_copies_optional_fields(self, setup):
+        """clone copies all optional fields from original."""
+        handler, db, project_id = setup
+        result = await _create_req(
+            handler, project_id,
+            title="With Extras",
+            current_state="Old state",
+            desired_state="New state",
+            business_value="High",
+            author="Alice",
+            functional_requirements=["FR-1"],
+            acceptance_criteria=["AC-1"],
+        )
+        req_id = _extract_id(result)
+
+        clone_result = await handler.handle_tool_call(
+            "clone_requirement", {"requirement_id": req_id}
+        )
+        assert "SUCCESS" in clone_result[0].text
+        clone_id = _extract_id(clone_result)
+
+        # Verify clone has the same optional fields
+        rows = await db.get_records("requirements", "*", where_clause="id = ?", where_params=[clone_id])
+        clone = dict(rows[0])
+        assert clone["current_state"] == "Old state"
+        assert clone["desired_state"] == "New state"
+        assert clone["business_value"] == "High"
+        assert clone["author"] == "Alice"
+
+    @pytest.mark.asyncio
+    async def test_get_requirement_details_with_json_arrays(self, setup):
+        """get_requirement_details renders functional_requirements, nonfunctional, out_of_scope, acceptance_criteria."""
+        handler, db, project_id = setup
+        result = await _create_req(
+            handler, project_id,
+            title="Rich Details Req",
+            functional_requirements=["FR-1: Must do X", "FR-2: Must do Y"],
+            nonfunctional_requirements=["NFR-1: Performance"],
+            out_of_scope=["OOS-1: Legacy system"],
+            acceptance_criteria=["AC-1: System responds in 200ms"],
+        )
+        req_id = _extract_id(result)
+
+        details = await handler.handle_tool_call(
+            "get_requirement_details", {"requirement_id": req_id}
+        )
+        text = details[0].text
+        assert "Functional Requirements" in text
+        assert "FR-1" in text
+        assert "Non-Functional Requirements" in text
+        assert "NFR-1" in text
+        assert "Out of Scope" in text
+        assert "OOS-1" in text
+        assert "Acceptance Criteria" in text
+        assert "AC-1" in text
+
+    @pytest.mark.asyncio
+    async def test_get_requirement_details_trace_parent_child(self, setup):
+        """get_requirement_details with trace=true renders parent and child sections."""
+        handler, db, project_id = setup
+        # Create parent and child requirements
+        parent_result = await _create_req(handler, project_id, title="Parent Req")
+        parent_id = _extract_id(parent_result)
+
+        child_result = await _create_req(handler, project_id, title="Child Req")
+        child_id = _extract_id(child_result)
+
+        # Create parent relationship: child -> parent (child has parent)
+        await db.execute_query(
+            "INSERT INTO relationships (id, source_type, source_id, target_type, target_id, "
+            "relationship_type, project_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [f"rel-parent-{child_id}", "requirement", child_id, "requirement", parent_id, "parent", project_id],
+        )
+
+        # Get details of parent (should show child)
+        details = await handler.handle_tool_call(
+            "get_requirement_details", {"requirement_id": parent_id, "trace": True}
+        )
+        text = details[0].text
+        assert "Child Requirements" in text
+        assert child_id in text
+
+        # Get details of child (should show parent)
+        details = await handler.handle_tool_call(
+            "get_requirement_details", {"requirement_id": child_id, "trace": True}
+        )
+        text = details[0].text
+        assert "Parent Requirements" in text
+        assert parent_id in text
+
+    @pytest.mark.asyncio
+    async def test_query_requirements_by_type(self, setup):
+        """query_requirements filters by type correctly."""
+        handler, db, project_id = setup
+        await _create_req(handler, project_id, title="Func Req", req_type="FUNC")
+        await _create_req(handler, project_id, title="Tech Req", req_type="TECH")
+
+        result = await handler.handle_tool_call(
+            "query_requirements", {"project_id": project_id, "type": "TECH"}
+        )
+        text = result[0].text
+        assert "Tech Req" in text
+        assert "Func Req" not in text
+
+    @pytest.mark.asyncio
+    async def test_query_requirements_filter_description_includes_type(self, setup):
+        """query_requirements filter description includes type."""
+        handler, db, project_id = setup
+        await _create_req(handler, project_id, title="Req X", req_type="TECH")
+
+        result = await handler.handle_tool_call(
+            "query_requirements", {"project_id": project_id, "type": "TECH"}
+        )
+        text = result[0].text
+        assert "type: TECH" in text

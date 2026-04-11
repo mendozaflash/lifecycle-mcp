@@ -109,7 +109,7 @@ class TestMixedReadWriteWorkload:
         update_coros = [
             handler._update_requirement_status({
                 "requirement_id": seed_ids[i],
-                "new_status": "Under Review",
+                "new_status": "Approved",
                 "comment": f"Concurrent update {i}",
             })
             for i in range(3)
@@ -126,6 +126,12 @@ class TestMixedReadWriteWorkload:
             assert not isinstance(r, Exception), (
                 f"Operation {idx} raised {type(r).__name__}: {r}"
             )
+        # Verify creates succeeded
+        for r in results[:5]:
+            assert "SUCCESS" in r[0].text, f"Expected SUCCESS in create result: {r[0].text}"
+        # Verify status updates succeeded
+        for r in results[10:]:
+            assert "SUCCESS" in r[0].text, f"Expected SUCCESS in update result: {r[0].text}"
 
 
 class TestLatencyUnderLoad:

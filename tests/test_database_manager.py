@@ -376,3 +376,125 @@ async def test_constructor_does_not_create_db(tmp_path):
     db_path = str(tmp_path / "lazy.db")
     _db = DatabaseManager(db_path)  # noqa: F841
     assert not os.path.exists(db_path), "Constructor should not create DB file"
+
+
+# ── initialize() idempotent ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_initialize_idempotent_same_instance(tmp_path):
+    """Calling initialize() twice on the same instance is a no-op."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        pool_before = db._available.qsize()
+        await db.initialize()  # second call
+        pool_after = db._available.qsize()
+        assert pool_before == pool_after
+    finally:
+        await db.close()
+
+
+# ── execute_many ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_many(tmp_path):
+    """execute_many inserts multiple records in one call."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        await db.execute_many(
+            "INSERT INTO projects (id, name) VALUES (?, ?)",
+            [["PROJ-0001", "Alpha"], ["PROJ-0002", "Beta"], ["PROJ-0003", "Charlie"]],
+        )
+        records = await db.get_records("projects")
+        assert len(records) == 3
+    finally:
+        await db.close()
+
+
+# ── get_records with LIMIT ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_records_with_limit(tmp_path):
+    """get_records respects LIMIT parameter."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        for i in range(5):
+            await db.insert_record("projects", {"id": f"PROJ-{i:04d}", "name": f"Proj {i}"})
+        records = await db.get_records("projects", limit=2)
+        assert len(records) == 2
+    finally:
+        await db.close()
+
+
+# ── configure_pool ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_configure_pool_changes_pool_size(tmp_path):
+    """configure_pool drains and rebuilds pool with new size."""
+    db = DatabaseManager(str(tmp_path / "test.db"), pool_size=3)
+    await db.initialize()
+    try:
+        result = await db.configure_pool(pool_size=7)
+        assert result["old_config"]["pool_size"] == 3
+        assert result["new_config"]["pool_size"] == 7
+        assert db.pool_size == 7
+        # Verify pool is still operational
+        test_result = await db.test_connection()
+        assert test_result["status"] == "success"
+    finally:
+        await db.close()
+
+
+# ── close() ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_close_drains_pool(tmp_path):
+    """close() drains pool and marks as not initialized."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    assert db._initialized is True
+    await db.close()
+    assert db._initialized is False
+    assert len(db._connections) == 0
+
+
+# ── async context manager ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_protocol(tmp_path):
+    """DatabaseManager works as async context manager."""
+    db_path = str(tmp_path / "test.db")
+    async with DatabaseManager(db_path) as db:
+        assert db._initialized is True
+        result = await db.test_connection()
+        assert result["status"] == "success"
+    assert db._initialized is False
+
+
+# ── test_connection failure ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_test_connection_failure(tmp_path):
+    """test_connection returns failure status when DB errors."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        # Close all connections to force a failure
+        await db.close()
+        db._initialized = True  # pretend still initialized
+        db._semaphore = asyncio.Semaphore(5)
+        db._available = asyncio.Queue()
+        # No connections available, should timeout or fail
+        result = await db.test_connection(timeout=0.1)
+        assert result["status"] == "failed"
+    finally:
+        db._initialized = False
