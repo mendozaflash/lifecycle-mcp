@@ -47,7 +47,7 @@ async def _create_requirement(db, project_id, req_id, title="Test Requirement"):
     """Insert a requirement directly into the DB for relationship testing."""
     await db.execute_query(
         "INSERT INTO requirements (id, project_id, type, title, priority, status) "
-        "VALUES (?, ?, 'FUNC', ?, 'P1', 'Draft')",
+        "VALUES (?, ?, 'FUNC', ?, 'P1', 'Under Review')",
         [req_id, project_id, title],
     )
 
@@ -187,7 +187,7 @@ async def test_create_task_stores_planning_fields(task_env):
     assert json.loads(row["verification_commands"]) == ["pytest tests/"]
     assert json.loads(row["public_symbols"]) == ["MyClass", "my_func"]
     assert row["risk_notes"] == "Might break Z"
-    assert row["status"] == "Not Started"
+    assert row["status"] == "Under Review"
     assert row["project_id"] == pid
 
 
@@ -310,15 +310,15 @@ async def test_update_task_status_valid_transitions(task_env):
     handler, db, pid = task_env
     await _create_task(handler, pid)
 
-    # Not Started -> In Progress
+    # Under Review -> Approved
     result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
     )
     assert "SUCCESS" in result[0].text
 
-    # In Progress -> Complete
+    # Approved -> Implemented
     result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Implemented"}
     )
     assert "SUCCESS" in result[0].text
 
@@ -326,62 +326,57 @@ async def test_update_task_status_valid_transitions(task_env):
 @pytest.mark.asyncio
 async def test_update_task_status_invalid_transition(task_env):
     handler, db, pid = task_env
-    await _create_task(handler, pid)  # status = "Not Started"
+    await _create_task(handler, pid)  # status = "Under Review"
 
-    # Not Started -> Complete (not allowed)
+    # Under Review -> Implemented (not allowed, must go through Approved)
     result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Implemented"}
     )
     assert "ERROR" in result[0].text
     assert "Invalid transition" in result[0].text or "transition" in result[0].text.lower()
 
 
 @pytest.mark.asyncio
-async def test_update_task_status_complete_is_terminal(task_env):
+async def test_update_task_status_no_backward_transitions(task_env):
     handler, db, pid = task_env
     await _create_task(handler, pid)
     await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
     )
     await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Implemented"}
     )
-    # Complete -> In Progress (not allowed)
+    # Implemented -> Approved (not allowed, no backward transitions)
     result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
     )
     assert "ERROR" in result[0].text
 
 
 @pytest.mark.asyncio
-async def test_update_task_status_abandoned_is_terminal(task_env):
+async def test_update_task_status_deprecated_is_terminal(task_env):
     handler, db, pid = task_env
     await _create_task(handler, pid)
     await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Abandoned"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Deprecated"}
     )
     result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
     )
     assert "ERROR" in result[0].text
 
 
 @pytest.mark.asyncio
-async def test_update_task_status_blocked_transitions(task_env):
+async def test_update_task_status_full_lifecycle(task_env):
+    """Test the full task lifecycle: Under Review -> Approved -> Implemented -> Validated -> Deprecated."""
     handler, db, pid = task_env
     await _create_task(handler, pid)
 
-    # Not Started -> In Progress -> Blocked -> In Progress
-    await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
-    )
-    await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Blocked"}
-    )
-    result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
-    )
-    assert "SUCCESS" in result[0].text
+    for status in ["Approved", "Implemented", "Validated", "Deprecated"]:
+        result = await handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": status}
+        )
+        assert "SUCCESS" in result[0].text, f"Failed transition to {status}"
 
 
 @pytest.mark.asyncio
@@ -401,7 +396,7 @@ async def test_update_task_status_narrow_write(task_env):
         "update_task_status",
         {
             "task_id": "TASK-0001",
-            "new_status": "In Progress",
+            "new_status": "Approved",
             "execution_notes": "Started work",
             "deviation_from_plan": "None so far",
         },
@@ -413,7 +408,7 @@ async def test_update_task_status_narrow_write(task_env):
         row_factory=True,
     )
     # Status and execution fields updated
-    assert row["status"] == "In Progress"
+    assert row["status"] == "Approved"
     assert row["execution_notes"] == "Started work"
     assert row["deviation_from_plan"] == "None so far"
     # Other fields unchanged
@@ -427,7 +422,7 @@ async def test_update_task_status_narrow_write(task_env):
 async def test_update_task_status_not_found(task_env):
     handler, db, pid = task_env
     result = await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-9999", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
     )
     assert "ERROR" in result[0].text
     assert "not found" in result[0].text.lower()
@@ -523,11 +518,11 @@ async def test_query_tasks_by_status(task_env):
     await _create_task(handler, pid, title="Todo")
     await _create_task(handler, pid, title="Active")
     await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0002", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0002", "new_status": "Approved"}
     )
 
     result = await handler.handle_tool_call(
-        "query_tasks", {"status": "In Progress"}
+        "query_tasks", {"status": "Approved"}
     )
     text = result[0].text
     assert "Active" in text
@@ -551,7 +546,7 @@ async def test_query_tasks_by_assignee(task_env):
 @pytest.mark.asyncio
 async def test_query_tasks_no_results(task_env):
     handler, db, pid = task_env
-    result = await handler.handle_tool_call("query_tasks", {"status": "Complete"})
+    result = await handler.handle_tool_call("query_tasks", {"status": "Implemented"})
     assert "No tasks found" in result[0].text or "0" in result[0].text
 
 
@@ -587,7 +582,7 @@ async def test_query_tasks_json_output_format(task_env):
     assert len(data) == 1
     assert data[0]["title"] == "JSON Task"
     assert data[0]["id"] == "TASK-0001"
-    assert data[0]["status"] == "Not Started"
+    assert data[0]["status"] == "Under Review"
     assert data[0]["priority"] == "P1"
 
 
@@ -784,7 +779,7 @@ async def test_get_task_details_all_sections(task_env):
         "update_task_status",
         {
             "task_id": "TASK-0001",
-            "new_status": "In Progress",
+            "new_status": "Approved",
             "execution_notes": "Work started",
             "deviation_from_plan": "Minor deviation",
         },
@@ -834,7 +829,7 @@ async def test_get_task_details_execution_section_only(task_env):
         "update_task_status",
         {
             "task_id": "TASK-0001",
-            "new_status": "In Progress",
+            "new_status": "Approved",
             "execution_notes": "Doing work",
         },
     )
@@ -1021,7 +1016,7 @@ async def test_clone_task_basic(task_env):
     assert "SUCCESS" in text
     assert "TASK-0002" in text
 
-    # Cloned task should have same fields but new ID, Not Started
+    # Cloned task should have same fields but new ID, Under Review
     row = await db.execute_query(
         "SELECT title, priority, effort, status FROM tasks WHERE id = 'TASK-0002'",
         fetch_one=True,
@@ -1030,7 +1025,7 @@ async def test_clone_task_basic(task_env):
     assert row["title"] == "Original"
     assert row["priority"] == "P1"
     assert row["effort"] == "M"
-    assert row["status"] == "Not Started"
+    assert row["status"] == "Under Review"
 
 
 @pytest.mark.asyncio
@@ -1058,10 +1053,10 @@ async def test_clone_task_resets_status(task_env):
     handler, db, pid = task_env
     await _create_task(handler, pid, title="Done Task")
     await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
     )
     await handler.handle_tool_call(
-        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Implemented"}
     )
 
     await handler.handle_tool_call("clone_task", {"task_id": "TASK-0001"})
@@ -1072,7 +1067,7 @@ async def test_clone_task_resets_status(task_env):
         fetch_one=True,
         row_factory=True,
     )
-    assert row["status"] == "Not Started"
+    assert row["status"] == "Under Review"
     assert row["completed_at"] is None
     assert row["execution_notes"] is None
     assert row["deviation_from_plan"] is None
@@ -1167,6 +1162,79 @@ async def test_clone_task_not_found(task_env):
     handler, db, pid = task_env
     result = await handler.handle_tool_call("clone_task", {"task_id": "TASK-9999"})
     assert "ERROR" in result[0].text
+
+
+# =============================================================================
+#  Task approval gating
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_task_approval_blocked_by_unapproved_req(task_env):
+    """Task approval is rejected when linked requirement is in 'Under Review'."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Gated Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Pending Req")
+    # Requirement is in 'Draft' status by default from helper; update to 'Under Review'
+    await db.execute_query(
+        "UPDATE requirements SET status = 'Under Review' WHERE id = 'REQ-0001'", []
+    )
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+    )
+    assert "ERROR" in result[0].text
+    assert "REQ-0001" in result[0].text
+    assert "Approved" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_task_approval_allowed_with_approved_req(task_env):
+    """Task approval succeeds when linked requirement is exactly 'Approved'."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Gated Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Approved Req")
+    await db.execute_query(
+        "UPDATE requirements SET status = 'Approved' WHERE id = 'REQ-0001'", []
+    )
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+    )
+    assert "SUCCESS" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_task_approval_no_requirements(task_env):
+    """Task approval succeeds when task has no linked requirements (ungated)."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Ungated Task")
+
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+    )
+    assert "SUCCESS" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_task_approval_blocked_by_partially_impl_req(task_env):
+    """Task approval is rejected when linked requirement is 'Partially Implemented' (not exactly 'Approved')."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Gated Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Partial Req")
+    await db.execute_query(
+        "UPDATE requirements SET status = 'Partially Implemented' WHERE id = 'REQ-0001'", []
+    )
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+    )
+    assert "ERROR" in result[0].text
+    assert "REQ-0001" in result[0].text
+    assert "Partially Implemented" in result[0].text
 
 
 # =============================================================================

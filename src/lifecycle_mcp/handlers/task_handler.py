@@ -103,7 +103,7 @@ class TaskHandler(BaseHandler):
                         "task_id": {"type": "string"},
                         "new_status": {
                             "type": "string",
-                            "enum": ["Not Started", "In Progress", "Blocked", "Complete", "Abandoned"],
+                            "enum": ["Under Review", "Approved", "Implemented", "Validated", "Deprecated"],
                         },
                         "execution_notes": {"type": "string"},
                         "deviation_from_plan": {"type": "string"},
@@ -208,7 +208,7 @@ class TaskHandler(BaseHandler):
             {
                 "name": "clone_task",
                 "description": (
-                    "Clone a task with a new ID. Copies relationships. Resets status to Not Started. "
+                    "Clone a task with a new ID. Copies relationships. Resets status to Under Review. "
                     "Optionally clones child tasks recursively."
                 ),
                 "inputSchema": {
@@ -342,6 +342,12 @@ class TaskHandler(BaseHandler):
                 f"Invalid transition from '{current_status}' to '{new_status}'. "
                 f"Allowed transitions: {allowed or 'none (terminal state)'}"
             )
+
+        # Task approval gating: require all linked requirements to be Approved
+        if new_status == "Approved":
+            gating_error = await self._check_requirement_approval_gating(task_id)
+            if gating_error:
+                return self._create_error_response(gating_error)
 
         # NARROW WRITE: only status + execution fields
         data: dict[str, Any] = {"status": new_status}
@@ -682,7 +688,7 @@ class TaskHandler(BaseHandler):
             "id": new_id,
             "project_id": project_id,
             "title": original["title"],
-            "status": "Not Started",
+            "status": "Under Review",
             "priority": original["priority"],
         }
 
@@ -742,6 +748,24 @@ class TaskHandler(BaseHandler):
     # Private helpers
     # ------------------------------------------------------------------
 
+    async def _check_requirement_approval_gating(self, task_id: str) -> str | None:
+        """Check if all linked requirements are in 'Approved' status.
+        Returns error message if gating fails, None if OK."""
+        linked_reqs = await self._get_linked_requirements(task_id)
+        if not linked_reqs:
+            return None  # No requirements = ungated
+        non_approved = [
+            f"{req['id']} ({req['status']})"
+            for req in linked_reqs
+            if req['status'] != 'Approved'
+        ]
+        if non_approved:
+            return (
+                f"Cannot approve task: linked requirement(s) not in 'Approved' status: "
+                f"{', '.join(non_approved)}. All linked requirements must be exactly 'Approved'."
+            )
+        return None
+
     def _build_task_data(self, task_id: str, project_id: str, params: dict[str, Any]) -> dict[str, Any]:
         """Build a task data dict for INSERT."""
         data: dict[str, Any] = {
@@ -749,7 +773,7 @@ class TaskHandler(BaseHandler):
             "project_id": project_id,
             "title": params["title"],
             "priority": params["priority"],
-            "status": "Not Started",
+            "status": "Under Review",
         }
         # Optional scalar fields
         for field in ["effort", "user_story", "assignee", "parent_task_id",
