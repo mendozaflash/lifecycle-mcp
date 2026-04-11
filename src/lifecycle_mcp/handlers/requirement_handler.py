@@ -16,22 +16,13 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from lifecycle_mcp.constants import REQUIREMENT_TRANSITIONS
+
 from .base_handler import BaseHandler
 
 
 class RequirementHandler(BaseHandler):
     """Handler for requirement-related MCP tools (v2 schema)"""
-
-    VALID_TRANSITIONS = {
-        "Draft": ["Under Review", "Deprecated"],
-        "Under Review": ["Draft", "Approved", "Deprecated"],
-        "Approved": ["Architecture", "Ready", "Deprecated"],
-        "Architecture": ["Ready", "Approved"],
-        "Ready": ["Implemented", "Deprecated"],
-        "Implemented": ["Validated", "Ready"],
-        "Validated": ["Deprecated"],
-        "Deprecated": [],
-    }
 
     # Fields that may be updated via update_requirement
     _UPDATABLE_FIELDS = [
@@ -340,7 +331,7 @@ class RequirementHandler(BaseHandler):
             return self._create_error_response(f"Requirement not found: {req_id}")
 
         current_status = rows[0]["status"]
-        allowed = self.VALID_TRANSITIONS.get(current_status, [])
+        allowed = REQUIREMENT_TRANSITIONS.get(current_status, [])
         if new_status not in allowed:
             return self._create_error_response(
                 f"Invalid transition from '{current_status}' to '{new_status}'. "

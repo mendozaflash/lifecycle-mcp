@@ -16,22 +16,13 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from lifecycle_mcp.constants import ARCHITECTURE_TRANSITIONS
+
 from .base_handler import BaseHandler
 
 
 class ArchitectureHandler(BaseHandler):
     """Handler for architecture decision-related MCP tools (v2 schema)"""
-
-    VALID_TRANSITIONS = {
-        "Draft": ["Under Review", "Deprecated"],
-        "Under Review": ["Proposed", "Approved", "Deprecated"],
-        "Proposed": ["Accepted", "Rejected", "Deprecated"],
-        "Accepted": ["Implemented", "Deprecated"],
-        "Rejected": ["Deprecated"],
-        "Deprecated": [],
-        "Approved": ["Implemented", "Deprecated"],
-        "Implemented": ["Deprecated"],
-    }
 
     # Fields that may be updated via update_architecture_decision
     _UPDATABLE_FIELDS = ["title", "context", "decision"]
@@ -304,7 +295,7 @@ class ArchitectureHandler(BaseHandler):
             return self._create_error_response(f"Architecture decision not found: {adr_id}")
 
         current_status = rows[0]["status"]
-        allowed = self.VALID_TRANSITIONS.get(current_status, [])
+        allowed = ARCHITECTURE_TRANSITIONS.get(current_status, [])
         if new_status not in allowed:
             return self._create_error_response(
                 f"Invalid transition from '{current_status}' to '{new_status}'. "

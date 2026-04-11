@@ -13,45 +13,13 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from lifecycle_mcp.constants import STATE_MACHINES
+
 from .base_handler import BaseHandler
 
 
 class ValidationHandler(BaseHandler):
     """Handler for validation and status-transition MCP tools."""
-
-    # ------------------------------------------------------------------
-    # State machines
-    # ------------------------------------------------------------------
-
-    STATE_MACHINES: dict[str, dict[str, list[str]]] = {
-        "requirement": {
-            "Draft": ["Under Review", "Deprecated"],
-            "Under Review": ["Draft", "Approved", "Deprecated"],
-            "Approved": ["Architecture", "Ready", "Deprecated"],
-            "Architecture": ["Ready", "Approved"],
-            "Ready": ["Implemented", "Deprecated"],
-            "Implemented": ["Validated", "Ready"],
-            "Validated": ["Deprecated"],
-            "Deprecated": [],
-        },
-        "task": {
-            "Not Started": ["In Progress", "Abandoned"],
-            "In Progress": ["Complete", "Blocked", "Abandoned"],
-            "Blocked": ["In Progress", "Abandoned"],
-            "Complete": [],
-            "Abandoned": [],
-        },
-        "architecture": {
-            "Draft": ["Under Review", "Deprecated"],
-            "Under Review": ["Proposed", "Approved", "Deprecated"],
-            "Proposed": ["Accepted", "Rejected", "Deprecated"],
-            "Accepted": ["Implemented", "Deprecated"],
-            "Rejected": ["Deprecated"],
-            "Deprecated": [],
-            "Approved": ["Implemented", "Deprecated"],
-            "Implemented": ["Deprecated"],
-        },
-    }
 
     # ------------------------------------------------------------------
     # Tool definitions
@@ -468,11 +436,11 @@ class ValidationHandler(BaseHandler):
         entity_type: str = params["entity_type"]
         current_status: str = params["current_status"]
 
-        machine = self.STATE_MACHINES.get(entity_type)
+        machine = STATE_MACHINES.get(entity_type)
         if machine is None:
             return self._create_error_response(
                 f"Unknown entity type: '{entity_type}'. "
-                f"Valid types: {', '.join(sorted(self.STATE_MACHINES))}"
+                f"Valid types: {', '.join(sorted(STATE_MACHINES))}"
             )
 
         transitions = machine.get(current_status)

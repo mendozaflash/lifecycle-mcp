@@ -8,6 +8,8 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from lifecycle_mcp.constants import VALID_RELATIONSHIP_COMBINATIONS
+
 from .base_handler import BaseHandler
 
 
@@ -286,23 +288,7 @@ class RelationshipHandler(BaseHandler):
 
     def _validate_relationship(self, source_type: str, target_type: str, rel_type: str) -> bool:
         """Validate that relationship type is valid for entity types"""
-        valid_combinations = {
-            ("requirement", "task", "implements"): True,
-            ("task", "requirement", "implements"): True,  # Reverse is also valid
-            ("requirement", "architecture", "addresses"): True,
-            ("architecture", "requirement", "addresses"): True,
-            ("task", "task", "depends"): True,
-            ("task", "task", "blocks"): True,
-            ("task", "task", "informs"): True,
-            ("task", "task", "requires"): True,
-            ("requirement", "requirement", "depends"): True,
-            ("requirement", "requirement", "parent"): True,
-            ("requirement", "requirement", "refines"): True,
-            ("requirement", "requirement", "conflicts"): True,
-            ("requirement", "requirement", "relates"): True,
-        }
-
-        return valid_combinations.get((source_type, target_type, rel_type), False)
+        return (source_type, target_type, rel_type) in VALID_RELATIONSHIP_COMBINATIONS
 
     async def _relationship_exists(self, source_id: str, target_id: str, rel_type: str) -> bool:
         """Check if relationship already exists in unified relationships table"""

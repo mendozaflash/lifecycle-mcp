@@ -11,6 +11,7 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from ..constants import ENTITY_TABLE_MAP
 from ..database_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -114,13 +115,6 @@ class BaseHandler(ABC):
     # Validation helpers (v2)
     # ------------------------------------------------------------------
 
-    _ENTITY_TABLE_MAP = {
-        "project": "projects",
-        "requirement": "requirements",
-        "task": "tasks",
-        "architecture": "architecture",
-    }
-
     async def _validate_project_exists(self, project_id: str) -> str | None:
         """Check that a project exists.  Returns error string if not found, None if OK."""
         exists = await self.db.check_exists("projects", "id = ?", [project_id])
@@ -133,7 +127,7 @@ class BaseHandler(ABC):
 
         *entity_type* must be one of: project, requirement, task, architecture.
         """
-        table = self._ENTITY_TABLE_MAP.get(entity_type)
+        table = ENTITY_TABLE_MAP.get(entity_type)
         if table is None:
             return f"Unknown entity type: {entity_type}"
         exists = await self.db.check_exists(table, "id = ?", [entity_id])
@@ -146,7 +140,7 @@ class BaseHandler(ABC):
 
         Returns error string if archived or not found, None if active.
         """
-        table = self._ENTITY_TABLE_MAP.get(entity_type)
+        table = ENTITY_TABLE_MAP.get(entity_type)
         if table is None:
             return f"Unknown entity type: {entity_type}"
         row = await self.db.execute_query(

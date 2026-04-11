@@ -16,21 +16,13 @@ from typing import Any
 
 from mcp.types import TextContent
 
+from lifecycle_mcp.constants import TASK_STATUSES, TASK_TRANSITIONS
+
 from .base_handler import BaseHandler
 
 
 class TaskHandler(BaseHandler):
     """Handler for task-related MCP tools (v2 schema)"""
-
-    VALID_STATUSES = {"Not Started", "In Progress", "Blocked", "Complete", "Abandoned"}
-
-    VALID_TRANSITIONS = {
-        "Not Started": ["In Progress", "Abandoned"],
-        "In Progress": ["Complete", "Blocked", "Abandoned"],
-        "Blocked": ["In Progress", "Abandoned"],
-        "Complete": [],
-        "Abandoned": [],
-    }
 
     # Fields that may be updated via update_task (planning tool)
     _UPDATABLE_FIELDS = [
@@ -358,9 +350,9 @@ class TaskHandler(BaseHandler):
         task_id = params["task_id"]
         new_status = params["new_status"]
 
-        if new_status not in self.VALID_STATUSES:
+        if new_status not in TASK_STATUSES:
             return self._create_error_response(
-                f"Invalid status '{new_status}'. Valid: {', '.join(sorted(self.VALID_STATUSES))}"
+                f"Invalid status '{new_status}'. Valid: {', '.join(sorted(TASK_STATUSES))}"
             )
 
         # Get current task
@@ -369,7 +361,7 @@ class TaskHandler(BaseHandler):
             return self._create_error_response(f"Task not found: {task_id}")
 
         current_status = rows[0]["status"]
-        allowed = self.VALID_TRANSITIONS.get(current_status, [])
+        allowed = TASK_TRANSITIONS.get(current_status, [])
         if new_status not in allowed:
             return self._create_error_response(
                 f"Invalid transition from '{current_status}' to '{new_status}'. "
