@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Requirement Handler for MCP Lifecycle Management Server
-Handles all requirement-related operations
+Requirement Handler for MCP Lifecycle Management Server (v2)
+
+Handles all requirement-related operations using the v2 schema:
+- Sequential IDs via generate_id("requirement")
+- Project-scoped requirements (project_id FK)
+- Polymorphic relationships table (no requirement_tasks)
+- No risk_level, no requirement_number, no version column
+- Archive (soft delete) support
+- Batch create and clone operations
 """
 
 import json
@@ -13,39 +20,89 @@ from .base_handler import BaseHandler
 
 
 class RequirementHandler(BaseHandler):
-    """Handler for requirement-related MCP tools"""
+    """Handler for requirement-related MCP tools (v2 schema)"""
+
+    VALID_TRANSITIONS = {
+        "Draft": ["Under Review", "Deprecated"],
+        "Under Review": ["Draft", "Approved", "Deprecated"],
+        "Approved": ["Architecture", "Ready", "Deprecated"],
+        "Architecture": ["Ready", "Approved"],
+        "Ready": ["Implemented", "Deprecated"],
+        "Implemented": ["Validated", "Ready"],
+        "Validated": ["Deprecated"],
+        "Deprecated": [],
+    }
+
+    # Fields that may be updated via update_requirement
+    _UPDATABLE_FIELDS = [
+        "title", "type", "priority", "current_state", "desired_state",
+        "business_value", "author",
+    ]
+    _UPDATABLE_JSON_FIELDS = [
+        "functional_requirements", "nonfunctional_requirements", "out_of_scope",
+        "acceptance_criteria",
+    ]
 
     def __init__(self, db_manager, mcp_client=None):
         """Initialize handler with database manager and optional MCP client"""
         super().__init__(db_manager)
         self.mcp_client = mcp_client
+        self._testing_mode = False
+
+    # ------------------------------------------------------------------
+    # Tool definitions
+    # ------------------------------------------------------------------
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return requirement tool definitions"""
         return [
             {
                 "name": "create_requirement",
-                "description": "Create a new requirement from interview data",
+                "description": "Create a new requirement linked to a project",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string", "description": "Project ID (PROJ-XXXX)"},
                         "type": {"type": "string", "enum": ["FUNC", "NFUNC", "TECH", "BUS", "INTF"]},
                         "title": {"type": "string"},
                         "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
                         "current_state": {"type": "string"},
                         "desired_state": {"type": "string"},
                         "functional_requirements": {"type": "array", "items": {"type": "string"}},
+                        "nonfunctional_requirements": {"type": "array", "items": {"type": "string"}},
+                        "out_of_scope": {"type": "array", "items": {"type": "string"}},
                         "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                         "business_value": {"type": "string"},
-                        "risk_level": {"type": "string", "enum": ["High", "Medium", "Low"]},
                         "author": {"type": "string"},
                     },
-                    "required": ["type", "title", "priority", "current_state", "desired_state"],
+                    "required": ["project_id", "type", "title", "priority"],
+                },
+            },
+            {
+                "name": "update_requirement",
+                "description": "Update requirement fields (title, priority, type, etc.)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "type": {"type": "string", "enum": ["FUNC", "NFUNC", "TECH", "BUS", "INTF"]},
+                        "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                        "current_state": {"type": "string"},
+                        "desired_state": {"type": "string"},
+                        "functional_requirements": {"type": "array", "items": {"type": "string"}},
+                        "nonfunctional_requirements": {"type": "array", "items": {"type": "string"}},
+                        "out_of_scope": {"type": "array", "items": {"type": "string"}},
+                        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                        "business_value": {"type": "string"},
+                        "author": {"type": "string"},
+                    },
+                    "required": ["requirement_id"],
                 },
             },
             {
                 "name": "update_requirement_status",
-                "description": "Move requirement through lifecycle states",
+                "description": "Move requirement through lifecycle states with transition validation",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -53,14 +110,8 @@ class RequirementHandler(BaseHandler):
                         "new_status": {
                             "type": "string",
                             "enum": [
-                                "Draft",
-                                "Under Review",
-                                "Approved",
-                                "Architecture",
-                                "Ready",
-                                "Implemented",
-                                "Validated",
-                                "Deprecated",
+                                "Draft", "Under Review", "Approved", "Architecture",
+                                "Ready", "Implemented", "Validated", "Deprecated",
                             ],
                         },
                         "comment": {"type": "string"},
@@ -69,15 +120,31 @@ class RequirementHandler(BaseHandler):
                 },
             },
             {
+                "name": "archive_requirement",
+                "description": "Archive a requirement (soft delete)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string", "description": "Requirement ID (REQ-XXXX)"},
+                    },
+                    "required": ["requirement_id"],
+                },
+            },
+            {
                 "name": "query_requirements",
                 "description": "Search and filter requirements",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string"},
                         "status": {"type": "string"},
                         "priority": {"type": "string"},
                         "type": {"type": "string"},
                         "search_text": {"type": "string"},
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Include archived requirements (default: false)",
+                        },
                     },
                 },
             },
@@ -87,10 +154,15 @@ class RequirementHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string"},
                         "status": {"type": "string"},
                         "priority": {"type": "string"},
                         "type": {"type": "string"},
                         "search_text": {"type": "string"},
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Include archived requirements (default: false)",
+                        },
                     },
                 },
             },
@@ -105,776 +177,670 @@ class RequirementHandler(BaseHandler):
             },
             {
                 "name": "trace_requirement",
-                "description": "Trace requirement through implementation",
+                "description": "Trace requirement through implementation (tasks, ADRs, child reqs)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"requirement_id": {"type": "string"}},
                     "required": ["requirement_id"],
                 },
             },
+            {
+                "name": "batch_create_requirements",
+                "description": "Create multiple requirements atomically (all or nothing)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Project ID (PROJ-XXXX)"},
+                        "requirements": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["FUNC", "NFUNC", "TECH", "BUS", "INTF"]},
+                                    "title": {"type": "string"},
+                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                                    "current_state": {"type": "string"},
+                                    "desired_state": {"type": "string"},
+                                    "functional_requirements": {"type": "array", "items": {"type": "string"}},
+                                    "nonfunctional_requirements": {"type": "array", "items": {"type": "string"}},
+                                    "out_of_scope": {"type": "array", "items": {"type": "string"}},
+                                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                    "business_value": {"type": "string"},
+                                    "author": {"type": "string"},
+                                },
+                                "required": ["type", "title", "priority"],
+                            },
+                            "description": "Array of requirement objects to create",
+                        },
+                    },
+                    "required": ["project_id", "requirements"],
+                },
+            },
+            {
+                "name": "clone_requirement",
+                "description": (
+                    "Clone a requirement with a new ID. Copies relationships. "
+                    "Resets status to Draft. Review copied relationships for applicability."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "requirement_id": {"type": "string"},
+                        "target_project_id": {
+                            "type": "string",
+                            "description": "Clone into a different project (default: same project)",
+                        },
+                    },
+                    "required": ["requirement_id"],
+                },
+            },
         ]
 
+    # ------------------------------------------------------------------
+    # Tool routing
+    # ------------------------------------------------------------------
+
     async def handle_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> list[TextContent]:
-        """Route tool calls to appropriate handler methods"""
+        """Route tool calls to handler methods"""
+        handlers = {
+            "create_requirement": self._create_requirement,
+            "update_requirement": self._update_requirement,
+            "update_requirement_status": self._update_requirement_status,
+            "archive_requirement": self._archive_requirement,
+            "query_requirements": self._query_requirements,
+            "query_requirements_json": self._query_requirements_json,
+            "get_requirement_details": self._get_requirement_details,
+            "trace_requirement": self._trace_requirement,
+            "batch_create_requirements": self._batch_create_requirements,
+            "clone_requirement": self._clone_requirement,
+        }
+        handler = handlers.get(tool_name)
+        if not handler:
+            return self._create_error_response(f"Unknown tool: {tool_name}")
         try:
-            if tool_name == "create_requirement":
-                return await self._create_requirement(**arguments)
-            elif tool_name == "update_requirement_status":
-                return await self._update_requirement_status(**arguments)
-            elif tool_name == "query_requirements":
-                return await self._query_requirements(**arguments)
-            elif tool_name == "query_requirements_json":
-                return await self._query_requirements_json(**arguments)
-            elif tool_name == "get_requirement_details":
-                return await self._get_requirement_details(**arguments)
-            elif tool_name == "trace_requirement":
-                return await self._trace_requirement(**arguments)
-            else:
-                return self._create_error_response(f"Unknown tool: {tool_name}")
+            return await handler(arguments)
         except Exception as e:
-            return self._create_error_response(f"Error handling {tool_name}", e)
+            return self._create_error_response(f"Error in {tool_name}", exception=e)
 
-    async def _create_requirement(self, **params) -> list[TextContent]:
-        """Create a new requirement with LLM-enhanced analysis"""
-        # Validate required parameters
-        error = self._validate_required_params(params, ["type", "title", "priority", "current_state", "desired_state"])
+    # ------------------------------------------------------------------
+    # create_requirement
+    # ------------------------------------------------------------------
+
+    async def _create_requirement(self, params: dict[str, Any]) -> list[TextContent]:
+        """Create a requirement linked to a project."""
+        error = self._validate_required_params(params, ["project_id", "type", "title", "priority"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Perform LLM analysis for requirement decomposition
-            llm_analysis = await self._analyze_requirement_with_llm(params)
-            analysis_warning = ""
-
-            # Handle LLM analysis results
-            if llm_analysis:
-                if llm_analysis.get("recommendation") == "needs_clarification":
-                    # Return clarifying questions to user
-                    return self._create_clarification_response(llm_analysis)
-                elif llm_analysis.get("recommendation") == "decompose":
-                    # Automatically create decomposed requirements
-                    return await self._create_decomposed_requirements(llm_analysis, params)
-            else:
-                analysis_warning = "\n⚠️  LLM analysis not available - proceeding with standard creation"
-
-            # Standard requirement creation (single requirement)
-            req_id = await self._create_single_requirement(params)
-
-            # Create above-the-fold response
-            key_info = f"Requirement {req_id} created"
-            action_info = f"📄 {params['title']} | {params['type']} | {params['priority']}"
-            warning_info = analysis_warning.strip() if analysis_warning else ""
-
-            return self._create_above_fold_response("SUCCESS", key_info, action_info, warning_info)
-
-        except Exception as e:
-            return self._create_error_response("Failed to create requirement", e)
-
-    async def _analyze_requirement_with_llm(self, params: dict[str, Any]) -> dict[str, Any] | None:
-        """Analyze requirement using LLM sampling for decomposition"""
-        # Skip LLM analysis in test environments
-        if hasattr(self, '_testing_mode') and self._testing_mode:
-            return None
-
-        if not self.mcp_client:
-            self.logger.info("No MCP client available for sampling - using fallback requirement creation")
-            return None
-
-        try:
-            # Build context for LLM analysis
-            requirement_context = self._build_requirement_context(params)
-
-            # Prepare LLM sampling request
-            sampling_request = {
-                "messages": [{"role": "user", "content": {"type": "text", "text": requirement_context}}],
-                "modelPreferences": {"intelligencePriority": 0.8, "speedPriority": 0.2, "costPriority": 0.1},
-                "systemPrompt": self._get_analysis_system_prompt(),
-                "includeContext": "thisServer",
-                "temperature": 0.1,
-                "maxTokens": 1000,
-                "stopSequences": ["```"],
-            }
-
-            # Check if the MCP client has sampling capability
-            if hasattr(self.mcp_client, "sample") and callable(self.mcp_client.sample):
-                try:
-                    # Make the actual MCP sampling request
-                    response = await self.mcp_client.sample(sampling_request)
-                    if response and hasattr(response, "content") and hasattr(response.content, "text"):
-                        return json.loads(response.content.text)
-                    else:
-                        self.logger.warning("MCP sampling returned invalid response format")
-                        return None
-                except Exception as sampling_error:
-                    self.logger.warning(f"MCP sampling failed: {sampling_error}")
-                    return None
-            else:
-                self.logger.info("MCP client does not support sampling - using fallback requirement creation")
-                return None
-
-        except Exception as e:
-            # Log error but don't fail requirement creation
-            self.logger.warning(f"LLM analysis failed: {e}")
-            return None
-
-    def _build_requirement_context(self, params: dict[str, Any]) -> str:
-        """Build context string for LLM analysis"""
-        context = f"""Analyze this requirement for decomposition and clarity:
-
-Title: {params["title"]}
-Type: {params["type"]}
-Priority: {params["priority"]}
-Current State: {params["current_state"]}
-Desired State: {params["desired_state"]}
-Business Value: {params.get("business_value", "Not specified")}
-
-Functional Requirements:
-{self._format_list(params.get("functional_requirements", []))}
-
-Acceptance Criteria:
-{self._format_list(params.get("acceptance_criteria", []))}
-
-Please analyze if this requirement should be:
-1. Created as a single requirement (good scope examples: "natural language search",
-   "unified navigation bar", "mobile friendly navigation")
-2. Decomposed into sub-requirements (if it covers multiple features, pages, or complex workflows)
-3. Needs clarification (missing critical details)
-
-Respond with valid JSON in this format:
-{{
-  "analysis": {{
-    "complexity_score": 1-10,
-    "needs_decomposition": boolean,
-    "scope_assessment": "single_feature|multiple_features|complex_workflow"
-  }},
-  "decomposition": {{
-    "suggested_sub_requirements": [
-      {{
-        "title": "string",
-        "type": "FUNC|NFUNC|TECH|BUS|INTF",
-        "rationale": "string"
-      }}
-    ]
-  }},
-  "clarifying_questions": [
-    {{
-      "question": "string",
-      "purpose": "scope|technical|business|acceptance"
-    }}
-  ],
-  "recommendation": "create_single|decompose|needs_clarification"
-}}"""
-        return context
-
-    def _get_analysis_system_prompt(self) -> str:
-        """Get system prompt for LLM analysis"""
-        return """You are an expert requirements analyst. Analyze requirements for proper scoping and decomposition.
-
-Guidelines:
-- Single requirements should be implementable as one cohesive feature
-- Requirements covering multiple features, pages, or workflows need decomposition
-- Ask 1-3 focused clarifying questions when requirements lack critical details
-- Provide clear rationale for decomposition suggestions
-- Always respond with valid JSON matching the specified format"""
-
-    def _format_list(self, items: list[str]) -> str:
-        """Format list items for context"""
-        if not items:
-            return "- None specified"
-        return "\n".join(f"- {item}" for item in items)
-
-    def _create_clarification_response(self, analysis: dict[str, Any]) -> list[TextContent]:
-        """Create response with clarifying questions"""
-        questions = analysis.get("clarifying_questions", [])[:3]  # Limit to 3 questions
-
-        response = "The requirement needs additional clarification. Please answer these questions:\n\n"
-        for i, q in enumerate(questions, 1):
-            response += f"{i}. {q['question']} (Purpose: {q['purpose']})\n"
-
-        response += "\nOnce you provide answers, I can create a properly scoped requirement."
-
-        # Create above-the-fold response for clarification
-        key_info = "Requirement needs clarification"
-        action_info = f"❓ {len(questions)} questions | Please provide details"
-        return self._create_above_fold_response("INFO", key_info, action_info, response)
-
-    def _create_decomposition_response(
-        self, analysis: dict[str, Any], original_params: dict[str, Any]
-    ) -> list[TextContent]:
-        """Create response with decomposition suggestions"""
-        suggestions = analysis.get("decomposition", {}).get("suggested_sub_requirements", [])
-
-        response = f"The requirement '{original_params['title']}' should be decomposed into smaller requirements:\n\n"
-
-        for i, suggestion in enumerate(suggestions, 1):
-            response += f"{i}. **{suggestion['title']}** ({suggestion['type']})\n"
-            response += f"   Rationale: {suggestion['rationale']}\n\n"
-
-        response += "Would you like me to create these individual requirements instead?"
-
-        # Create above-the-fold response for decomposition
-        key_info = "Requirement should be decomposed"
-        action_info = f"🔄 {len(suggestions)} sub-requirements suggested | Complex scope detected"
-        return self._create_above_fold_response("INFO", key_info, action_info, response)
-
-    async def _create_single_requirement(self, params: dict[str, Any]) -> str:
-        """Create a single requirement (extracted from original logic)
-
-        Uses an atomic transaction for SELECT MAX + INSERT to prevent
-        concurrent callers from receiving the same requirement_number.
-        """
-        async with self.db.transaction() as conn:
-            # Atomically get next requirement number
-            cursor = await conn.execute(
-                "SELECT COALESCE(MAX(requirement_number), 0) + 1 FROM requirements WHERE type = ?",
-                [params["type"]],
-            )
-            row = await cursor.fetchone()
-            req_number = row[0] if row else 1
-
-            req_id = f"REQ-{req_number:04d}-{params['type']}-00"
-
-            # Prepare requirement data
-            req_data = {
-                "id": req_id,
-                "requirement_number": req_number,
-                "type": params["type"],
-                "version": 0,
-                "title": params["title"],
-                "priority": params["priority"],
-                "current_state": params["current_state"],
-                "desired_state": params["desired_state"],
-                "functional_requirements": self._safe_json_dumps(params.get("functional_requirements", [])),
-                "acceptance_criteria": self._safe_json_dumps(params.get("acceptance_criteria", [])),
-                "author": params.get("author", "MCP User"),
-                "business_value": params.get("business_value", ""),
-                "risk_level": params.get("risk_level", "Medium"),
-            }
-
-            # Insert requirement inside the transaction
-            columns = ", ".join(req_data.keys())
-            placeholders = ", ".join(["?"] * len(req_data))
-            await conn.execute(
-                f"INSERT INTO requirements ({columns}) VALUES ({placeholders})",
-                list(req_data.values()),
-            )
-
-        # Log event (outside transaction — uses its own connection)
-        await self._log_operation("requirement", req_id, "created", params.get("author", "MCP User"))
-
-        return req_id
-
-    async def _create_decomposed_requirements(
-        self, analysis: dict[str, Any], original_params: dict[str, Any]
-    ) -> list[TextContent]:
-        """Create decomposed sub-requirements automatically from LLM analysis"""
-        try:
-            suggestions = analysis.get("decomposition", {}).get("suggested_sub_requirements", [])
-
-            if not suggestions:
-                # Fallback to single requirement if no suggestions
-                req_id = await self._create_single_requirement(original_params)
-                key_info = f"Requirement {req_id} created"
-                req_type = original_params["type"]
-                priority = original_params["priority"]
-                action_info = f"📄 {original_params['title']} | {req_type} | {priority}"
-                return self._create_above_fold_response("SUCCESS", key_info, action_info)
-
-            # Create parent requirement first
-            parent_req_id = await self._create_single_requirement(
-                {
-                    **original_params,
-                    "title": f"{original_params['title']} (Parent)",
-                    "current_state": f"Parent requirement for: {original_params['current_state']}",
-                    "desired_state": (
-                        f"Decomposed into {len(suggestions)} sub-requirements: {original_params['desired_state']}"
-                    ),
-                }
-            )
-
-            # Create sub-requirements
-            sub_req_ids = []
-            for i, suggestion in enumerate(suggestions, 1):
-                # Create sub-requirement with decomposed content
-                sub_req_data = {
-                    "type": suggestion.get("type", original_params["type"]),
-                    "title": suggestion["title"],
-                    "priority": original_params["priority"],  # Inherit parent priority
-                    "current_state": (
-                        f"Sub-requirement {i} of {parent_req_id}: "
-                        f"{suggestion.get('current_state', original_params['current_state'])}"
-                    ),
-                    "desired_state": suggestion.get("desired_state", suggestion["title"]),
-                    "business_value": f"Supports {parent_req_id}: {suggestion.get('rationale', '')}",
-                    "author": original_params.get("author", "MCP User"),
-                    "risk_level": original_params.get("risk_level", "Medium"),
-                    "functional_requirements": original_params.get("functional_requirements", []),
-                    "acceptance_criteria": original_params.get("acceptance_criteria", []),
-                }
-
-                sub_req_id = await self._create_single_requirement(sub_req_data)
-                sub_req_ids.append(sub_req_id)
-
-                # Create parent-child relationship
-                await self._create_requirement_dependency(sub_req_id, parent_req_id, "parent")
-
-            # Build comprehensive response
-            response = f"""# Automatic Requirement Decomposition Complete
-
-## Parent Requirement Created
-- **{parent_req_id}**: {original_params["title"]} (Parent)
-
-## Sub-Requirements Created ({len(sub_req_ids)})
-"""
-            for i, (sub_req_id, suggestion) in enumerate(zip(sub_req_ids, suggestions, strict=False), 1):
-                req_type = suggestion.get("type", original_params["type"])
-                response += f"{i}. **{sub_req_id}**: {suggestion['title']} ({req_type})\n"
-                response += f"   - Rationale: {suggestion.get('rationale', 'N/A')}\n"
-
-            response += f"""
-## Decomposition Analysis
-- **Complexity Score**: {analysis.get("analysis", {}).get("complexity_score", "N/A")}/10
-- **Scope Assessment**: {analysis.get("analysis", {}).get("scope_assessment", "N/A")}
-- **Implementation Focus**: {analysis.get("analysis", {}).get("implementation_focus", "N/A")}
-
-## Next Steps
-- Use `trace_requirement` on {parent_req_id} to see full decomposition
-- Create tasks for individual sub-requirements
-- Each sub-requirement can be implemented independently
-"""
-
-            # Create above-the-fold response
-            key_info = f"Requirement decomposed into {len(sub_req_ids)} sub-requirements"
-            action_info = f"🔄 Parent: {parent_req_id} | {len(sub_req_ids)} children created"
-            return self._create_above_fold_response("SUCCESS", key_info, action_info, response)
-
-        except Exception as e:
-            # Fallback to single requirement creation if decomposition fails
-            self.logger.warning(f"Automatic decomposition failed, creating single requirement: {e}")
-            req_id = await self._create_single_requirement(original_params)
-            key_info = f"Requirement {req_id} created"
-            action_info = f"📄 {original_params['title']} | Decomposition failed, created single requirement"
-            return self._create_above_fold_response("SUCCESS", key_info, action_info)
-
-    async def _create_requirement_dependency(self, requirement_id: str, depends_on_id: str, dependency_type: str):
-        """Create a requirement dependency relationship"""
-        try:
-            relationship_id = f"rel-{requirement_id}-{depends_on_id}-{dependency_type}"
-            await self.db.insert_record(
-                "relationships",
-                {
-                    "id": relationship_id,
-                    "source_type": "requirement",
-                    "source_id": requirement_id,
-                    "target_type": "requirement",
-                    "target_id": depends_on_id,
-                    "relationship_type": dependency_type,
-                },
-            )
-            await self._log_operation(
-                "requirement_dependency",
-                requirement_id,
-                f"created_{dependency_type}_relationship",
-                f"Linked to {depends_on_id}",
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to create requirement dependency: {e}")
-
-    async def _update_requirement_status(self, **params) -> list[TextContent]:
-        """Update requirement status with validation"""
-        # Validate required parameters
-        error = self._validate_required_params(params, ["requirement_id", "new_status"])
+        project_id = params["project_id"]
+        error = await self._validate_project_exists(project_id)
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Get current status
-            current_req = await self.db.get_records("requirements", "status", "id = ?", [params["requirement_id"]])
+        req_id, _ = await self.db.generate_id("requirement")
+        data = self._build_requirement_data(req_id, project_id, params)
+        await self.db.insert_record("requirements", data)
+        await self._log_operation("requirement", req_id, "created", project_id=project_id)
 
-            if not current_req:
-                return self._create_error_response("Requirement not found")
+        key_info = f"Requirement {req_id} created"
+        action_info = f"{params['title']} | {params['type']} | {params['priority']}"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
-            current_status = current_req[0]["status"]
-            new_status = params["new_status"]
+    # ------------------------------------------------------------------
+    # update_requirement (broad planning update)
+    # ------------------------------------------------------------------
 
-            # Validate task completion before allowing Validated status
-            if new_status == "Validated":
-                incomplete_tasks = await self.db.execute_query(
-                    """
-                    SELECT t.id, t.title, t.status FROM tasks t
-                    JOIN requirement_tasks rt ON t.id = rt.task_id
-                    WHERE rt.requirement_id = ? AND t.status != 'Complete'
-                """,
-                    [params["requirement_id"]],
-                    fetch_all=True,
-                    row_factory=True,
-                )
-
-                if incomplete_tasks:
-                    task_list = "\n".join(
-                        f"- {task['id']}: {task['title']} (status: {task['status']})" for task in incomplete_tasks
-                    )
-                    error_msg = (
-                        f"Cannot validate requirement with incomplete tasks. "
-                        f"The following tasks must be completed first:\n{task_list}\n\n"
-                        f"All tasks must have 'Complete' status before requirement validation."
-                    )
-                    return self._create_error_response(error_msg)
-
-            # Validate state transition
-            valid_transitions = {
-                "Draft": ["Under Review", "Deprecated"],
-                "Under Review": ["Draft", "Approved", "Deprecated"],
-                "Approved": ["Architecture", "Ready", "Deprecated"],
-                "Architecture": ["Ready", "Approved"],
-                "Ready": ["Implemented", "Deprecated"],
-                "Implemented": ["Validated", "Ready"],
-                "Validated": ["Deprecated"],
-                "Deprecated": [],
-            }
-
-            if new_status not in valid_transitions.get(current_status, []):
-                return self._create_error_response(f"Invalid transition from {current_status} to {new_status}")
-
-            # Update status
-            await self.db.update_record(
-                "requirements",
-                {"status": new_status, "updated_at": "CURRENT_TIMESTAMP"},
-                "id = ?",
-                [params["requirement_id"]],
-            )
-
-            # Add review comment if provided
-            if params.get("comment"):
-                await self._add_review_comment("requirement", params["requirement_id"], params["comment"])
-
-            # Create above-the-fold response
-            key_info = f"Requirement {params['requirement_id']} updated"
-            action_info = f"📈 {current_status} → {new_status}"
-
-            return self._create_above_fold_response("SUCCESS", key_info, action_info)
-
-        except Exception as e:
-            return self._create_error_response("Failed to update requirement status", e)
-
-    async def _query_requirements(self, **params) -> list[TextContent]:
-        """Query requirements with filters"""
-        try:
-            where_clauses = []
-            where_params = []
-
-            if params.get("status"):
-                where_clauses.append("status = ?")
-                where_params.append(params["status"])
-
-            if params.get("priority"):
-                where_clauses.append("priority = ?")
-                where_params.append(params["priority"])
-
-            if params.get("type"):
-                where_clauses.append("type = ?")
-                where_params.append(params["type"])
-
-            if params.get("search_text"):
-                where_clauses.append("(title LIKE ? OR desired_state LIKE ?)")
-                search = f"%{params['search_text']}%"
-                where_params.extend([search, search])
-
-            where_clause = " AND ".join(where_clauses) if where_clauses else ""
-
-            requirements = await self.db.get_records(
-                "requirements", "*", where_clause, where_params, "priority, created_at DESC"
-            )
-
-            if not requirements:
-                return self._create_above_fold_response(
-                    "INFO", "No requirements found", "Try adjusting search criteria"
-                )
-
-            # Build filter description for above-the-fold
-            filters = []
-            if params.get("status"):
-                filters.append(f"status: {params['status']}")
-            if params.get("priority"):
-                filters.append(f"priority: {params['priority']}")
-            if params.get("type"):
-                filters.append(f"type: {params['type']}")
-            if params.get("search_text"):
-                filters.append(f"search: {params['search_text']}")
-            filter_desc = " | ".join(filters) if filters else "all requirements"
-
-            # Build detailed list
-            req_list = []
-            for req in requirements:
-                req_info = f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}"
-                req_list.append(req_info)
-
-            key_info = self._format_count_summary("requirement", len(requirements), filter_desc)
-            details = "\n".join(req_list)
-
-            return self._create_above_fold_response("SUCCESS", key_info, "", details)
-
-        except Exception as e:
-            return self._create_error_response("Failed to query requirements", e)
-
-    async def _query_requirements_json(self, **params) -> list[TextContent]:
-        """Query requirements and return structured JSON data for UI"""
-        try:
-            where_clauses = []
-            where_params = []
-
-            if params.get("status"):
-                where_clauses.append("status = ?")
-                where_params.append(params["status"])
-
-            if params.get("priority"):
-                where_clauses.append("priority = ?")
-                where_params.append(params["priority"])
-
-            if params.get("type"):
-                where_clauses.append("type = ?")
-                where_params.append(params["type"])
-
-            if params.get("search_text"):
-                where_clauses.append("(title LIKE ? OR desired_state LIKE ?)")
-                search = f"%{params['search_text']}%"
-                where_params.extend([search, search])
-
-            where_clause = " AND ".join(where_clauses) if where_clauses else ""
-
-            requirements = await self.db.get_records(
-                "requirements", "*", where_clause, where_params, "priority, created_at DESC"
-            )
-
-            # Convert database rows to JSON-serializable format
-            requirements_list = []
-            for req in requirements:
-                # Convert row object to dictionary and handle any special fields
-                req_dict = dict(req) if hasattr(req, 'keys') else req
-
-                # Parse JSON fields if they exist as strings
-                json_fields = ['functional_requirements', 'acceptance_criteria', 'business_value']
-                for field in json_fields:
-                    if field in req_dict and isinstance(req_dict[field], str):
-                        try:
-                            req_dict[field] = json.loads(req_dict[field]) if req_dict[field] else []
-                        except (json.JSONDecodeError, TypeError):
-                            req_dict[field] = []
-
-                requirements_list.append(req_dict)
-
-            # Return as JSON string in text content
-            return [TextContent(type="text", text=json.dumps(requirements_list))]
-
-        except Exception as e:
-            return self._create_error_response("Failed to query requirements as JSON", e)
-
-    async def _get_requirement_details(self, **params) -> list[TextContent]:
-        """Get full requirement details"""
-        # Validate required parameters
+    async def _update_requirement(self, params: dict[str, Any]) -> list[TextContent]:
+        """Update requirement fields."""
         error = self._validate_required_params(params, ["requirement_id"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Get requirement
-            requirements = await self.db.get_records("requirements", "*", "id = ?", [params["requirement_id"]])
+        req_id = params["requirement_id"]
+        error = await self._validate_not_archived("requirement", req_id)
+        if error:
+            return self._create_error_response(error)
 
-            if not requirements:
-                return self._create_error_response("Requirement not found")
+        data: dict[str, Any] = {}
+        for field in self._UPDATABLE_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = params[field]
+        for field in self._UPDATABLE_JSON_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = self._safe_json_dumps(params[field])
 
-            req = requirements[0]
+        if not data:
+            return self._create_error_response("No fields to update")
 
-            # Build detailed report
-            report = f"""# Requirement Details: {req["id"]}
+        await self.db.update_record("requirements", data, "id = ?", [req_id])
+        await self._log_operation("requirement", req_id, "updated")
+
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Requirement {req_id} updated",
+            f"Updated fields: {', '.join(data.keys())}",
+        )
+
+    # ------------------------------------------------------------------
+    # update_requirement_status
+    # ------------------------------------------------------------------
+
+    async def _update_requirement_status(self, params: dict[str, Any]) -> list[TextContent]:
+        """Update requirement status with transition validation."""
+        error = self._validate_required_params(params, ["requirement_id", "new_status"])
+        if error:
+            return self._create_error_response(error)
+
+        req_id = params["requirement_id"]
+        new_status = params["new_status"]
+
+        # Get current status
+        rows = await self.db.get_records("requirements", "status", where_clause="id = ?", where_params=[req_id])
+        if not rows:
+            return self._create_error_response(f"Requirement not found: {req_id}")
+
+        current_status = rows[0]["status"]
+        allowed = self.VALID_TRANSITIONS.get(current_status, [])
+        if new_status not in allowed:
+            return self._create_error_response(
+                f"Invalid transition from '{current_status}' to '{new_status}'. "
+                f"Allowed transitions: {allowed or 'none (terminal state)'}"
+            )
+
+        # Update status
+        await self.db.update_record("requirements", {"status": new_status}, "id = ?", [req_id])
+
+        # Add review comment if provided
+        if params.get("comment"):
+            await self._add_review_comment("requirement", req_id, params["comment"])
+
+        key_info = f"Requirement {req_id} updated"
+        action_info = f"{current_status} -> {new_status}"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+
+    # ------------------------------------------------------------------
+    # archive_requirement
+    # ------------------------------------------------------------------
+
+    async def _archive_requirement(self, params: dict[str, Any]) -> list[TextContent]:
+        """Archive a requirement (soft delete)."""
+        error = self._validate_required_params(params, ["requirement_id"])
+        if error:
+            return self._create_error_response(error)
+
+        req_id = params["requirement_id"]
+        error = await self._validate_entity_exists("requirement", req_id)
+        if error:
+            return self._create_error_response(error)
+
+        await self.db.execute_query(
+            "UPDATE requirements SET is_archived = 1, archived_at = datetime('now') WHERE id = ?",
+            [req_id],
+        )
+        await self._log_operation("requirement", req_id, "archived")
+
+        return self._create_above_fold_response("SUCCESS", f"Requirement {req_id} archived")
+
+    # ------------------------------------------------------------------
+    # query_requirements
+    # ------------------------------------------------------------------
+
+    async def _query_requirements(self, params: dict[str, Any]) -> list[TextContent]:
+        """Query requirements with filters."""
+        conditions, query_params = self._build_query_filters(params)
+        where_clause = " AND ".join(conditions) if conditions else ""
+
+        requirements = await self.db.get_records(
+            "requirements", "*",
+            where_clause=where_clause,
+            where_params=query_params,
+            order_by="priority, created_at DESC",
+        )
+
+        if not requirements:
+            return self._create_above_fold_response("INFO", "No requirements found", "Try adjusting search criteria")
+
+        lines = []
+        for req in requirements:
+            info = f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}"
+            lines.append(info)
+
+        filter_desc = self._build_filter_description(params)
+        key_info = self._format_count_summary("requirement", len(requirements), filter_desc)
+        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # query_requirements_json
+    # ------------------------------------------------------------------
+
+    async def _query_requirements_json(self, params: dict[str, Any]) -> list[TextContent]:
+        """Query requirements and return structured JSON."""
+        conditions, query_params = self._build_query_filters(params)
+        where_clause = " AND ".join(conditions) if conditions else ""
+
+        requirements = await self.db.get_records(
+            "requirements", "*",
+            where_clause=where_clause,
+            where_params=query_params,
+            order_by="priority, created_at DESC",
+        )
+
+        json_fields = [
+            "functional_requirements", "nonfunctional_requirements", "out_of_scope",
+            "acceptance_criteria",
+        ]
+        result_list = []
+        for req in requirements:
+            req_dict = dict(req) if hasattr(req, "keys") else req
+            for field in json_fields:
+                if field in req_dict and isinstance(req_dict[field], str):
+                    try:
+                        req_dict[field] = json.loads(req_dict[field]) if req_dict[field] else []
+                    except (json.JSONDecodeError, TypeError):
+                        req_dict[field] = []
+            result_list.append(req_dict)
+
+        return [TextContent(type="text", text=json.dumps(result_list))]
+
+    # ------------------------------------------------------------------
+    # get_requirement_details
+    # ------------------------------------------------------------------
+
+    async def _get_requirement_details(self, params: dict[str, Any]) -> list[TextContent]:
+        """Get full requirement details with relationships."""
+        error = self._validate_required_params(params, ["requirement_id"])
+        if error:
+            return self._create_error_response(error)
+
+        req_id = params["requirement_id"]
+        rows = await self.db.get_records("requirements", "*", where_clause="id = ?", where_params=[req_id])
+        if not rows:
+            return self._create_error_response(f"Requirement not found: {req_id}")
+
+        req = dict(rows[0])
+
+        # Build report
+        report = f"""# Requirement Details: {req["id"]}
 
 ## Basic Information
 - **Title**: {req["title"]}
 - **Type**: {req["type"]}
 - **Status**: {req["status"]}
 - **Priority**: {req["priority"]}
-- **Risk Level**: {req["risk_level"]}
-- **Author**: {req["author"]}
+- **Author**: {req.get("author") or "Not specified"}
+- **Project**: {req["project_id"]}
 - **Created**: {req["created_at"]}
 - **Updated**: {req["updated_at"]}
 
 ## Problem Definition
-**Current State**: {req["current_state"]}
+**Current State**: {req.get("current_state") or "Not specified"}
 
-**Desired State**: {req["desired_state"]}
+**Desired State**: {req.get("desired_state") or "Not specified"}
 
-**Business Value**: {req["business_value"] or "Not specified"}
-
-## Requirements Details
+**Business Value**: {req.get("business_value") or "Not specified"}
 """
 
-            if req["functional_requirements"]:
-                func_reqs = self._safe_json_loads(req["functional_requirements"])
-                if func_reqs:
-                    report += "### Functional Requirements\n"
-                    for fr in func_reqs:
-                        report += f"- {fr}\n"
+        # JSON array fields
+        if req.get("functional_requirements"):
+            func_reqs = self._safe_json_loads(req["functional_requirements"])
+            if func_reqs:
+                report += "\n### Functional Requirements\n"
+                for fr in func_reqs:
+                    report += f"- {fr}\n"
 
-            if req["acceptance_criteria"]:
-                acc_criteria = self._safe_json_loads(req["acceptance_criteria"])
-                if acc_criteria:
-                    report += "\n### Acceptance Criteria\n"
-                    for ac in acc_criteria:
-                        report += f"- {ac}\n"
+        if req.get("nonfunctional_requirements"):
+            nfunc_reqs = self._safe_json_loads(req["nonfunctional_requirements"])
+            if nfunc_reqs:
+                report += "\n### Non-Functional Requirements\n"
+                for nfr in nfunc_reqs:
+                    report += f"- {nfr}\n"
 
-            # Get linked tasks
-            tasks = await self.db.execute_query(
-                """
-                SELECT t.* FROM tasks t
-                JOIN requirement_tasks rt ON t.id = rt.task_id
-                WHERE rt.requirement_id = ?
-            """,
-                [params["requirement_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
+        if req.get("out_of_scope"):
+            oos = self._safe_json_loads(req["out_of_scope"])
+            if oos:
+                report += "\n### Out of Scope\n"
+                for item in oos:
+                    report += f"- {item}\n"
 
-            if tasks:
-                report += f"\n## Linked Tasks ({len(tasks)})\n"
-                for task in tasks:
-                    report += f"- {task['id']}: {task['title']} [{task['status']}]\n"
+        if req.get("acceptance_criteria"):
+            acc_criteria = self._safe_json_loads(req["acceptance_criteria"])
+            if acc_criteria:
+                report += "\n### Acceptance Criteria\n"
+                for ac in acc_criteria:
+                    report += f"- {ac}\n"
 
-            # Create above-the-fold response for requirement details
-            key_info = f"Requirement {req['id']} details"
-            action_info = f"📄 {req['title']} | {req['status']} | {req['priority']}"
-            return self._create_above_fold_response("INFO", key_info, action_info, report)
+        # Linked tasks via relationships (both directions)
+        tasks = await self._get_linked_tasks(req_id)
+        if tasks:
+            report += f"\n## Linked Tasks ({len(tasks)})\n"
+            for task in tasks:
+                report += f"- {task['id']}: {task['title']} [{task['status']}]\n"
 
-        except Exception as e:
-            return self._create_error_response("Failed to get requirement details", e)
+        # Linked ADRs via relationships (both directions)
+        adrs = await self._get_linked_adrs(req_id)
+        if adrs:
+            report += f"\n## Linked Architecture Decisions ({len(adrs)})\n"
+            for adr in adrs:
+                report += f"- {adr['id']}: {adr['title']} [{adr['status']}]\n"
 
-    async def _trace_requirement(self, **params) -> list[TextContent]:
-        """Trace requirement through full lifecycle including decomposition relationships"""
-        # Validate required parameters
+        key_info = self._format_status_summary("Requirement", req["id"], req["status"])
+        action_info = f"{req['title']} | {req['priority']}"
+        return self._create_above_fold_response("INFO", key_info, action_info, report)
+
+    # ------------------------------------------------------------------
+    # trace_requirement
+    # ------------------------------------------------------------------
+
+    async def _trace_requirement(self, params: dict[str, Any]) -> list[TextContent]:
+        """Trace requirement through full lifecycle."""
         error = self._validate_required_params(params, ["requirement_id"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Get requirement
-            requirements = await self.db.get_records("requirements", "*", "id = ?", [params["requirement_id"]])
+        req_id = params["requirement_id"]
+        rows = await self.db.get_records("requirements", "*", where_clause="id = ?", where_params=[req_id])
+        if not rows:
+            return self._create_error_response(f"Requirement not found: {req_id}")
 
-            if not requirements:
-                return self._create_error_response("Requirement not found")
+        req = dict(rows[0])
 
-            req = requirements[0]
-
-            # Get parent requirements (if this is a child requirement)
-            parent_requirements = await self.db.execute_query(
-                """
-                SELECT r.* FROM requirements r
-                JOIN relationships rel ON r.id = rel.target_id
-                WHERE rel.source_id = ? AND rel.source_type = 'requirement' AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
-            """,
-                [params["requirement_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
-
-            # Get child requirements (if this is a parent requirement)
-            child_requirements = await self.db.execute_query(
-                """
-                SELECT r.* FROM requirements r
-                JOIN relationships rel ON r.id = rel.source_id
-                WHERE rel.target_id = ? AND rel.source_type = 'requirement' AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
-                ORDER BY r.created_at
-            """,
-                [params["requirement_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
-
-            # Get tasks
-            tasks = await self.db.execute_query(
-                """
-                SELECT t.* FROM tasks t
-                JOIN requirement_tasks rt ON t.id = rt.task_id
-                WHERE rt.requirement_id = ?
-                ORDER BY t.task_number, t.subtask_number
-            """,
-                [params["requirement_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
-
-            # Get architecture
-            architecture = await self.db.execute_query(
-                """
-                SELECT a.* FROM architecture a
-                JOIN relationships rel ON a.id = rel.target_id
-                WHERE rel.source_id = ? AND rel.source_type = 'requirement' AND rel.target_type = 'architecture'
-            """,
-                [params["requirement_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
-
-            # Build trace report
-            report = f"""# Requirement Trace: {req["id"]}
+        # Build trace report
+        report = f"""# Requirement Trace: {req["id"]}
 
 ## Requirement Details
 - **Title**: {req["title"]}
 - **Status**: {req["status"]}
 - **Priority**: {req["priority"]}
 - **Created**: {req["created_at"]}
-- **Progress**: {req["tasks_completed"]}/{req["task_count"]} tasks complete
 
 ## Current State
-{req["current_state"]}
+{req.get("current_state") or "Not specified"}
 
 ## Desired State
-{req["desired_state"]}
+{req.get("desired_state") or "Not specified"}
 """
 
-            # Add decomposition relationships if they exist
-            if parent_requirements:
-                report += f"\n## Parent Requirements ({len(parent_requirements)})\n"
-                for parent in parent_requirements:
-                    report += f"- {parent['id']}: {parent['title']} [{parent['status']}]\n"
-                    report += f"  Created: {parent['created_at']}\n"
+        # Get parent requirements
+        parent_requirements = await self.db.execute_query(
+            """
+            SELECT r.* FROM requirements r
+            JOIN relationships rel ON r.id = rel.target_id
+            WHERE rel.source_id = ? AND rel.source_type = 'requirement'
+              AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
+            """,
+            [req_id],
+            fetch_all=True,
+            row_factory=True,
+        )
+        if parent_requirements:
+            report += f"\n## Parent Requirements ({len(parent_requirements)})\n"
+            for parent in parent_requirements:
+                report += f"- {parent['id']}: {parent['title']} [{parent['status']}]\n"
 
-            if child_requirements:
-                report += f"\n## Child Requirements ({len(child_requirements)})\n"
-                for i, child in enumerate(child_requirements, 1):
-                    report += f"{i}. {child['id']}: {child['title']} [{child['status']}]\n"
-                    progress = f"{child['tasks_completed']}/{child['task_count']}"
-                    report += f"   Priority: {child['priority']} | Progress: {progress} tasks\n"
+        # Get child requirements
+        child_requirements = await self.db.execute_query(
+            """
+            SELECT r.* FROM requirements r
+            JOIN relationships rel ON r.id = rel.source_id
+            WHERE rel.target_id = ? AND rel.source_type = 'requirement'
+              AND rel.target_type = 'requirement' AND rel.relationship_type = 'parent'
+            ORDER BY r.created_at
+            """,
+            [req_id],
+            fetch_all=True,
+            row_factory=True,
+        )
+        if child_requirements:
+            report += f"\n## Child Requirements ({len(child_requirements)})\n"
+            for i, child in enumerate(child_requirements, 1):
+                report += f"{i}. {child['id']}: {child['title']} [{child['status']}]\n"
 
-                # Calculate overall decomposition progress
-                if child_requirements:
-                    total_child_tasks = sum(child["task_count"] for child in child_requirements)
-                    completed_child_tasks = sum(child["tasks_completed"] for child in child_requirements)
-                    decomp_progress = (completed_child_tasks / total_child_tasks * 100) if total_child_tasks > 0 else 0
-                    progress_text = f"{completed_child_tasks}/{total_child_tasks}"
-                    report += f"\n**Overall Decomposition Progress**: {progress_text} tasks ({decomp_progress:.1f}%)\n"
-
-            report += f"\n## Implementation Tasks ({len(tasks)})\n"
+        # Get linked tasks
+        tasks = await self._get_linked_tasks(req_id)
+        report += f"\n## Implementation Tasks ({len(tasks)})\n"
+        if tasks:
             for task in tasks:
-                report += f"- {task['id']}: {task['title']} [{task['status']}]"
+                info = f"- {task['id']}: {task['title']} [{task['status']}]"
                 if task["assignee"]:
-                    report += f" (Assigned: {task['assignee']})"
-                report += "\n"
+                    info += f" (Assigned: {task['assignee']})"
+                report += info + "\n"
+        else:
+            report += "No tasks linked\n"
 
-            if architecture:
-                report += f"\n## Architecture Decisions ({len(architecture)})\n"
-                for arch in architecture:
-                    report += f"- {arch['id']}: {arch['title']} [{arch['status']}]\n"
+        # Get linked ADRs
+        adrs = await self._get_linked_adrs(req_id)
+        if adrs:
+            report += f"\n## Architecture Decisions ({len(adrs)})\n"
+            for adr in adrs:
+                report += f"- {adr['id']}: {adr['title']} [{adr['status']}]\n"
 
-            # Create above-the-fold response for requirement trace
-            key_info = f"Requirement {req['id']} trace"
-            decomp_info = ""
-            if parent_requirements:
-                decomp_info = f" | Child of {len(parent_requirements)} parent(s)"
-            elif child_requirements:
-                decomp_info = f" | Parent to {len(child_requirements)} children"
+        key_info = f"Requirement {req['id']} trace"
+        action_info = f"{req['title']} | {len(tasks)} tasks | {len(adrs)} architecture"
+        return self._create_above_fold_response("INFO", key_info, action_info, report)
 
-            arch_count = len(architecture) if architecture else 0
-            action_info = f"🔍 {req['title']} | {len(tasks)} tasks | {arch_count} architecture{decomp_info}"
-            return self._create_above_fold_response("INFO", key_info, action_info, report)
+    # ------------------------------------------------------------------
+    # batch_create_requirements
+    # ------------------------------------------------------------------
 
-        except Exception as e:
-            return self._create_error_response("Failed to trace requirement", e)
+    async def _batch_create_requirements(self, params: dict[str, Any]) -> list[TextContent]:
+        """Create multiple requirements atomically."""
+        error = self._validate_required_params(params, ["project_id", "requirements"])
+        if error:
+            return self._create_error_response(error)
+
+        project_id = params["project_id"]
+        req_defs = params["requirements"]
+
+        if not req_defs:
+            return self._create_error_response("No requirements provided in batch")
+
+        error = await self._validate_project_exists(project_id)
+        if error:
+            return self._create_error_response(error)
+
+        # Validate all requirements before creating any
+        for i, req_def in enumerate(req_defs):
+            if "title" not in req_def or not req_def["title"]:
+                return self._create_error_response(
+                    f"Requirement at index {i} is missing required field: title"
+                )
+            if "type" not in req_def or not req_def["type"]:
+                return self._create_error_response(
+                    f"Requirement at index {i} is missing required field: type"
+                )
+            if "priority" not in req_def or not req_def["priority"]:
+                return self._create_error_response(
+                    f"Requirement at index {i} is missing required field: priority"
+                )
+
+        # Create all requirements
+        created_ids = []
+        for req_def in req_defs:
+            req_id, _ = await self.db.generate_id("requirement")
+            data = self._build_requirement_data(req_id, project_id, req_def)
+            await self.db.insert_record("requirements", data)
+            created_ids.append(req_id)
+
+        await self._log_operation(
+            "requirement", f"batch:{len(created_ids)}", "batch_created", project_id=project_id
+        )
+
+        ids_str = ", ".join(created_ids)
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Created {len(created_ids)} requirements",
+            ids_str,
+        )
+
+    # ------------------------------------------------------------------
+    # clone_requirement
+    # ------------------------------------------------------------------
+
+    async def _clone_requirement(self, params: dict[str, Any]) -> list[TextContent]:
+        """Clone a requirement with a new ID."""
+        error = self._validate_required_params(params, ["requirement_id"])
+        if error:
+            return self._create_error_response(error)
+
+        req_id = params["requirement_id"]
+        target_project_id = params.get("target_project_id")
+
+        # Get original requirement
+        rows = await self.db.get_records("requirements", "*", where_clause="id = ?", where_params=[req_id])
+        if not rows:
+            return self._create_error_response(f"Requirement not found: {req_id}")
+
+        original = dict(rows[0])
+
+        # Validate target project if specified
+        project_id = target_project_id or original["project_id"]
+        if target_project_id:
+            error = await self._validate_project_exists(target_project_id)
+            if error:
+                return self._create_error_response(error)
+
+        # Generate new ID
+        new_id, _ = await self.db.generate_id("requirement")
+
+        # Build clone data - copy all content fields, reset status
+        clone_data: dict[str, Any] = {
+            "id": new_id,
+            "project_id": project_id,
+            "type": original["type"],
+            "title": original["title"],
+            "status": "Draft",
+            "priority": original["priority"],
+        }
+
+        # Copy optional fields
+        for field in ["current_state", "desired_state", "business_value", "author",
+                       "functional_requirements", "nonfunctional_requirements",
+                       "out_of_scope", "acceptance_criteria"]:
+            if original.get(field) is not None:
+                clone_data[field] = original[field]
+
+        await self.db.insert_record("requirements", clone_data)
+
+        # Copy relationships (where original requirement is the source)
+        rels = await self.db.get_records(
+            "relationships",
+            where_clause="source_id = ? AND source_type = 'requirement'",
+            where_params=[req_id],
+        )
+        for rel in rels:
+            clone_rel_id = f"rel-{new_id}-{rel['target_id']}-{rel['relationship_type']}"
+            await self.db.insert_record("relationships", {
+                "id": clone_rel_id,
+                "source_type": "requirement",
+                "source_id": new_id,
+                "target_type": rel["target_type"],
+                "target_id": rel["target_id"],
+                "relationship_type": rel["relationship_type"],
+                "project_id": project_id,
+            })
+
+        await self._log_operation("requirement", new_id, "cloned", project_id=project_id)
+
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Requirement {new_id} cloned from {req_id}",
+            f"{original['title']} | {original['type']} | {original['priority']}",
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _build_requirement_data(self, req_id: str, project_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Build a requirement data dict for INSERT."""
+        data: dict[str, Any] = {
+            "id": req_id,
+            "project_id": project_id,
+            "type": params["type"],
+            "title": params["title"],
+            "priority": params["priority"],
+            "status": "Draft",
+        }
+        # Optional scalar fields
+        for field in ["current_state", "desired_state", "business_value", "author"]:
+            if field in params and params[field] is not None:
+                data[field] = params[field]
+        # Optional JSON array fields
+        for field in ["functional_requirements", "nonfunctional_requirements",
+                       "out_of_scope", "acceptance_criteria"]:
+            if field in params and params[field] is not None:
+                data[field] = self._safe_json_dumps(params[field])
+        return data
+
+    def _build_query_filters(self, params: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """Build WHERE conditions for query_requirements / query_requirements_json."""
+        conditions: list[str] = []
+        query_params: list[Any] = []
+
+        include_archived = params.get("include_archived", False)
+        if not include_archived:
+            conditions.append("is_archived = 0")
+
+        if params.get("project_id"):
+            conditions.append("project_id = ?")
+            query_params.append(params["project_id"])
+        if params.get("status"):
+            conditions.append("status = ?")
+            query_params.append(params["status"])
+        if params.get("priority"):
+            conditions.append("priority = ?")
+            query_params.append(params["priority"])
+        if params.get("type"):
+            conditions.append("type = ?")
+            query_params.append(params["type"])
+        if params.get("search_text"):
+            conditions.append("(title LIKE ? OR desired_state LIKE ?)")
+            search = f"%{params['search_text']}%"
+            query_params.extend([search, search])
+
+        return conditions, query_params
+
+    def _build_filter_description(self, params: dict[str, Any]) -> str:
+        """Build a human-readable filter description."""
+        filters = []
+        if params.get("project_id"):
+            filters.append(f"project: {params['project_id']}")
+        if params.get("status"):
+            filters.append(f"status: {params['status']}")
+        if params.get("priority"):
+            filters.append(f"priority: {params['priority']}")
+        if params.get("type"):
+            filters.append(f"type: {params['type']}")
+        if params.get("search_text"):
+            filters.append(f"search: {params['search_text']}")
+        return " | ".join(filters) if filters else "all requirements"
+
+    async def _get_linked_tasks(self, req_id: str) -> list:
+        """Get tasks linked to a requirement via relationships (both directions)."""
+        return await self.db.execute_query(
+            """
+            SELECT DISTINCT t.* FROM tasks t
+            JOIN relationships rel ON
+                (rel.source_id = ? AND rel.target_id = t.id AND rel.target_type = 'task')
+                OR (rel.target_id = ? AND rel.source_id = t.id AND rel.source_type = 'task')
+            WHERE t.is_archived = 0
+            """,
+            [req_id, req_id],
+            fetch_all=True,
+            row_factory=True,
+        )
+
+    async def _get_linked_adrs(self, req_id: str) -> list:
+        """Get architecture decisions linked to a requirement via relationships (both directions)."""
+        return await self.db.execute_query(
+            """
+            SELECT DISTINCT a.* FROM architecture a
+            JOIN relationships rel ON
+                (rel.source_id = ? AND rel.target_id = a.id AND rel.target_type = 'architecture')
+                OR (rel.target_id = ? AND rel.source_id = a.id AND rel.source_type = 'architecture')
+            WHERE a.is_archived = 0
+            """,
+            [req_id, req_id],
+            fetch_all=True,
+            row_factory=True,
+        )

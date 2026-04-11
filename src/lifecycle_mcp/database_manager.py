@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Database Manager for Lifecycle MCP Server
-Provides centralized async database connection and operation management using aiosqlite.
+Database Manager for Lifecycle MCP Server (v2)
+
+Async-only database manager using aiosqlite with connection pooling.
+No legacy migrations -- fresh v2 schema applied on first init.
 """
 
 import asyncio
 import logging
 import os
-import sqlite3
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
-
-from .migrations import apply_all_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +25,12 @@ class DatabaseManager:
     Uses an internal pool of aiosqlite connections managed via an asyncio.Queue
     and a Semaphore to bound concurrency.
 
-    The constructor is synchronous (stores config, runs sync schema/migrations).
-    Call ``await db.initialize()`` once before any async operations.
+    The constructor is synchronous and stores config only -- it does NOT touch
+    disk.  Call ``await db.initialize()`` once before any async operations.
     """
 
     # ------------------------------------------------------------------
-    # Construction (synchronous)
+    # Construction (synchronous -- stores config only)
     # ------------------------------------------------------------------
 
     def __init__(
@@ -42,7 +41,7 @@ class DatabaseManager:
         retry_attempts: int = 3,
         retry_delay: float = 0.1,
     ):
-        """Initialize database manager — sync only, stores config."""
+        """Initialize database manager -- sync only, stores config."""
         self.db_path: str = db_path or os.environ.get("LIFECYCLE_DB", "lifecycle.db")
         self.pool_size: int = pool_size
         self.timeout: float = timeout
@@ -55,75 +54,29 @@ class DatabaseManager:
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(pool_size)
         self._initialized: bool = False
 
-        # Sync bootstrap: create schema + run migrations via plain sqlite3
-        self._ensure_database_exists()
-
-    # ------------------------------------------------------------------
-    # Sync bootstrap
-    # ------------------------------------------------------------------
-
-    def _ensure_database_exists(self) -> None:
-        """Create DB directory, apply schema if needed, run migrations (all sync)."""
-        db_dir = Path(self.db_path).parent
-        if str(db_dir) not in ("", "."):
-            db_dir.mkdir(parents=True, exist_ok=True)
-
-        needs_schema = not Path(self.db_path).exists()
-
-        if not needs_schema:
-            # File exists — verify the schema was actually applied
-            try:
-                conn = sqlite3.connect(self.db_path)
-                conn.execute("PRAGMA journal_mode=WAL")
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
-                needs_schema = cursor.fetchone() is None
-                conn.close()
-                if needs_schema:
-                    logger.warning(
-                        "Database file exists at %s but is missing schema tables — re-initializing",
-                        self.db_path,
-                    )
-            except sqlite3.Error as exc:
-                logger.warning("Could not check database schema: %s — re-initializing", exc)
-                needs_schema = True
-
-        if needs_schema:
-            logger.info("Initializing database schema at %s", self.db_path)
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                schema_path = Path(__file__).parent / "lifecycle-schema.sql"
-                if schema_path.exists():
-                    with open(schema_path, encoding="utf-8") as fh:
-                        conn.executescript(fh.read())
-                    logger.info("Database schema initialized")
-                else:
-                    logger.error("Schema file not found at %s", schema_path)
-                    raise FileNotFoundError(f"Schema file not found at {schema_path}")
-            finally:
-                conn.close()
-
-        # Apply any pending migrations (sync — migrations.py is sync-only)
-        apply_all_migrations(self.db_path)
-
     # ------------------------------------------------------------------
     # Async initialization (call once after construction)
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Create the async connection pool.  Must be awaited before first use."""
+        """Create the async connection pool and apply schema if needed.
+
+        Must be awaited before first use.  Safe to call multiple times --
+        subsequent calls are no-ops.
+        """
         if self._initialized:
             return
 
+        # Ensure parent directory exists
+        db_dir = Path(self.db_path).parent
+        if str(db_dir) not in ("", "."):
+            db_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create pool connections with proper PRAGMAs
         for _ in range(self.pool_size):
             conn = await aiosqlite.connect(self.db_path, timeout=self.timeout)
-            # Optimized PRAGMAs
             await conn.execute("PRAGMA journal_mode=WAL")
-            # Note: foreign_keys=ON is intentionally omitted. Migration 7
-            # rebuilds the tasks table via ALTER TABLE RENAME which breaks
-            # SQLite FK metadata for requirement_tasks. The old sync
-            # ConnectionPool also never enforced FK constraints.
+            await conn.execute("PRAGMA foreign_keys=ON")
             await conn.execute("PRAGMA synchronous=NORMAL")
             await conn.execute("PRAGMA cache_size=10000")
             await conn.execute("PRAGMA temp_store=MEMORY")
@@ -131,11 +84,41 @@ class DatabaseManager:
             await self._available.put(conn)
 
         self._initialized = True
+
+        # Check if schema is already applied
+        needs_schema = not await self._schema_exists()
+
+        if needs_schema:
+            logger.info("Initializing v2 database schema at %s", self.db_path)
+            await self._apply_schema()
+            logger.info("Database schema initialized")
+        else:
+            logger.info("Database schema already present at %s", self.db_path)
+
         logger.info(
             "Async connection pool initialized: %d connections, %.1fs timeout",
             self.pool_size,
             self.timeout,
         )
+
+    async def _schema_exists(self) -> bool:
+        """Check if the v2 schema is already applied by looking for the projects table."""
+        result = await self.execute_query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='projects'",
+            fetch_one=True,
+        )
+        return result is not None
+
+    async def _apply_schema(self) -> None:
+        """Read and execute the v2 schema SQL file."""
+        schema_path = Path(__file__).parent / "lifecycle-schema-v2.sql"
+        if not schema_path.exists():
+            raise FileNotFoundError(f"Schema file not found at {schema_path}")
+
+        schema_sql = schema_path.read_text(encoding="utf-8")
+
+        async with self.get_connection() as conn:
+            await conn.executescript(schema_sql)
 
     # ------------------------------------------------------------------
     # Connection acquisition
@@ -144,6 +127,9 @@ class DatabaseManager:
     @asynccontextmanager
     async def get_connection(self, row_factory: bool = False):
         """Async context manager that borrows a connection from the pool.
+
+        Every connection has ``PRAGMA foreign_keys = ON`` re-applied on
+        checkout to guarantee FK enforcement even for recycled connections.
 
         Usage::
 
@@ -158,6 +144,8 @@ class DatabaseManager:
         conn: aiosqlite.Connection | None = None
         try:
             conn = await asyncio.wait_for(self._available.get(), timeout=self.timeout)
+            # Re-enforce FK on every checkout (survives pool recycling)
+            await conn.execute("PRAGMA foreign_keys=ON")
             if row_factory:
                 conn.row_factory = aiosqlite.Row
             yield conn
@@ -205,16 +193,18 @@ class DatabaseManager:
             except Exception as exc:
                 last_error = exc
                 err_msg = str(exc).lower()
-                if "database is locked" in err_msg or "disk i/o error" in err_msg:
-                    if attempt < self.retry_attempts - 1:
-                        logger.warning(
-                            "execute_query failed (attempt %d/%d): %s",
-                            attempt + 1,
-                            self.retry_attempts,
-                            exc,
-                        )
-                        await asyncio.sleep(self.retry_delay * (2 ** attempt))
-                        continue
+                if (
+                    ("database is locked" in err_msg or "disk i/o error" in err_msg)
+                    and attempt < self.retry_attempts - 1
+                ):
+                    logger.warning(
+                        "execute_query failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        self.retry_attempts,
+                        exc,
+                    )
+                    await asyncio.sleep(self.retry_delay * (2**attempt))
+                    continue
                 raise
 
         # Should not reach here, but just in case
@@ -260,16 +250,15 @@ class DatabaseManager:
             except Exception as exc:
                 last_error = exc
                 err_msg = str(exc).lower()
-                if "database is locked" in err_msg:
-                    if attempt < self.retry_attempts - 1:
-                        logger.warning(
-                            "Transaction failed (attempt %d/%d): %s",
-                            attempt + 1,
-                            self.retry_attempts,
-                            exc,
-                        )
-                        await asyncio.sleep(self.retry_delay * (2 ** attempt))
-                        continue
+                if "database is locked" in err_msg and attempt < self.retry_attempts - 1:
+                    logger.warning(
+                        "Transaction failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        self.retry_attempts,
+                        exc,
+                    )
+                    await asyncio.sleep(self.retry_delay * (2**attempt))
+                    continue
                 raise
 
         raise last_error  # type: ignore[misc]
@@ -328,44 +317,39 @@ class DatabaseManager:
         return result is not None
 
     # ------------------------------------------------------------------
-    # Atomic ID generation + insert (Issue 4 fix)
+    # Atomic ID generation (v2)
     # ------------------------------------------------------------------
 
-    async def insert_with_next_id(
-        self,
-        table: str,
-        id_column: str,
-        data: dict[str, Any],
-        where_clause: str = "",
-        where_params: list[Any] | None = None,
-    ) -> int:
-        """Atomically compute the next sequential ID and insert a record.
+    async def generate_id(self, entity_type: str) -> tuple[str, int]:
+        """Atomically generate next sequential ID for entity type.
 
-        The SELECT MAX + INSERT happens inside a single ``BEGIN IMMEDIATE``
-        transaction so no two concurrent callers can receive the same ID.
+        Returns (formatted_id, number).  E.g. ('REQ-0042', 42).
 
-        Returns the newly assigned ID value.
+        Raises KeyError if *entity_type* is not one of the known types.
         """
-        where_params = where_params or []
+        prefixes = {
+            "requirement": "REQ",
+            "task": "TASK",
+            "architecture": "ADR",
+            "project": "PROJ",
+        }
+        if entity_type not in prefixes:
+            raise KeyError(f"Unknown entity type: {entity_type!r}")
+        prefix = prefixes[entity_type]
 
         async with self.transaction() as conn:
-            if where_clause:
-                id_query = f"SELECT COALESCE(MAX({id_column}), 0) + 1 FROM {table} WHERE {where_clause}"
-            else:
-                id_query = f"SELECT COALESCE(MAX({id_column}), 0) + 1 FROM {table}"
-
-            cursor = await conn.execute(id_query, where_params)
-            row = await cursor.fetchone()
-            next_id: int = row[0] if row else 1
-
-            data[id_column] = next_id
-            columns = ", ".join(data.keys())
-            placeholders = ", ".join(["?"] * len(data))
             await conn.execute(
-                f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
-                list(data.values()),
+                "UPDATE sequences SET next_val = next_val + 1 WHERE entity_type = ?",
+                [entity_type],
             )
-            return next_id
+            cursor = await conn.execute(
+                "SELECT next_val - 1 FROM sequences WHERE entity_type = ?",
+                [entity_type],
+            )
+            row = await cursor.fetchone()
+            number = row[0]
+
+        return (f"{prefix}-{number:04d}", number)
 
     # ------------------------------------------------------------------
     # Pool management

@@ -1,319 +1,378 @@
-"""
-Unit tests for DatabaseManager
+"""Tests for DatabaseManager v2.
+
+Validates async initialization, schema application, ID generation,
+FK enforcement, pool management, and CRUD helpers against the v2 schema.
 """
 
-import os
-import tempfile
-from pathlib import Path
+import asyncio
 
 import pytest
 
 from lifecycle_mcp.database_manager import DatabaseManager
 
 
-@pytest.mark.unit
-class TestDatabaseManager:
-    """Test cases for DatabaseManager"""
+# ── Initialization ──────────────────────────────────────────────────
 
-    def test_init_creates_database(self):
-        """Test that DatabaseManager creates database if it doesn't exist"""
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=True) as tmp_file:
-            db_path = tmp_file.name
 
-        # Database file should not exist after deletion
-        assert not Path(db_path).exists()
-
-        # Creating DatabaseManager should create the database
-        DatabaseManager(db_path)  # Creating DatabaseManager should create the database
-        assert Path(db_path).exists()
-
-        # Clean up
-        os.unlink(db_path)
-
-    async def test_get_connection_context_manager(self, db_manager):
-        """Test that get_connection works as async context manager"""
-        async with db_manager.get_connection() as conn:
-            cursor = await conn.execute("SELECT 1")
-            result = await cursor.fetchone()
-            assert result[0] == 1
-
-    async def test_get_connection_with_row_factory(self, db_manager):
-        """Test get_connection with row factory enabled"""
-        import aiosqlite
-
-        async with db_manager.get_connection(row_factory=True) as conn:
-            assert conn.row_factory == aiosqlite.Row
-
-    async def test_execute_query_insert(self, db_manager):
-        """Test execute_query for INSERT operations"""
-        # Insert a test record with all required fields
-        result = await db_manager.execute_query(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
+@pytest.mark.asyncio
+async def test_initialize_creates_schema(tmp_path):
+    """Fresh init creates all v2 tables."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        result = await db.execute_query(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            fetch_all=True,
+            row_factory=True,
         )
-        assert result is not None  # Should return row ID
+        table_names = [r["name"] for r in result]
+        for t in [
+            "sequences",
+            "projects",
+            "requirements",
+            "tasks",
+            "architecture",
+            "relationships",
+            "reviews",
+            "lifecycle_events",
+        ]:
+            assert t in table_names, f"Table '{t}' not created by initialize()"
+    finally:
+        await db.close()
 
-    async def test_execute_query_select(self, db_manager):
-        """Test execute_query for SELECT operations"""
-        # First insert a record with all required fields
-        await db_manager.execute_query(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
+
+@pytest.mark.asyncio
+async def test_initialize_skips_existing_schema(tmp_path):
+    """Second init doesn't re-apply schema (data survives)."""
+    db_path = str(tmp_path / "test.db")
+    db = DatabaseManager(db_path)
+    await db.initialize()
+    # Insert a project
+    await db.execute_query(
+        "INSERT INTO projects (id, name) VALUES ('PROJ-0001', 'Test')"
+    )
+    await db.close()
+
+    # Re-initialize with new manager
+    db2 = DatabaseManager(db_path)
+    await db2.initialize()
+    try:
+        result = await db2.execute_query(
+            "SELECT COUNT(*) as cnt FROM projects",
+            fetch_one=True,
+            row_factory=True,
         )
+        assert result["cnt"] == 1
+    finally:
+        await db2.close()
 
-        # Then select it
-        result = await db_manager.execute_query(
-            "SELECT id, title FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
+
+@pytest.mark.asyncio
+async def test_initialize_creates_directory(tmp_path):
+    """initialize() creates the parent directory if it doesn't exist."""
+    db_path = str(tmp_path / "subdir" / "deep" / "test.db")
+    db = DatabaseManager(db_path)
+    await db.initialize()
+    try:
+        result = await db.execute_query("SELECT 1", fetch_one=True)
+        assert result[0] == 1
+    finally:
+        await db.close()
+
+
+# ── ID generation ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_generate_id_sequential(tmp_path):
+    """generate_id returns sequential IDs."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        id1, n1 = await db.generate_id("requirement")
+        id2, n2 = await db.generate_id("requirement")
+        assert id1 == "REQ-0001"
+        assert id2 == "REQ-0002"
+        assert n1 == 1
+        assert n2 == 2
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_id_different_types(tmp_path):
+    """generate_id sequences are independent per entity type."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        req_id, req_n = await db.generate_id("requirement")
+        task_id, task_n = await db.generate_id("task")
+        adr_id, adr_n = await db.generate_id("architecture")
+        proj_id, proj_n = await db.generate_id("project")
+
+        assert req_id == "REQ-0001" and req_n == 1
+        assert task_id == "TASK-0001" and task_n == 1
+        assert adr_id == "ADR-0001" and adr_n == 1
+        assert proj_id == "PROJ-0001" and proj_n == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_id_format_padding(tmp_path):
+    """generate_id pads numbers to 4 digits."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        # Generate 10 IDs to check padding
+        for i in range(9):
+            await db.generate_id("task")
+        id10, n10 = await db.generate_id("task")
+        assert id10 == "TASK-0010"
+        assert n10 == 10
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_generate_id_concurrent_no_duplicates(tmp_path):
+    """Concurrent generate_id produces no duplicates."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        results = await asyncio.gather(
+            *[db.generate_id("task") for _ in range(20)]
         )
-        assert result is not None
-        assert result[0] == "REQ-0001-FUNC-00"
-        assert result[1] == "Test Requirement"
+        ids = [r[0] for r in results]
+        assert len(set(ids)) == 20, f"Got duplicates: {ids}"
+    finally:
+        await db.close()
 
-    async def test_execute_query_select_all(self, db_manager):
-        """Test execute_query with fetch_all"""
-        # Insert multiple records with all required fields
-        for i in range(3):
-            await db_manager.execute_query(
-                "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-                "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    f"REQ-000{i + 1}-FUNC-00",
-                    i + 1,
-                    "FUNC",
-                    f"Test Requirement {i + 1}",
-                    "P1",
-                    "Current",
-                    "Desired",
-                    "Test Author",
-                ],
+
+@pytest.mark.asyncio
+async def test_generate_id_invalid_type(tmp_path):
+    """generate_id raises KeyError for unknown entity type."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        with pytest.raises(KeyError):
+            await db.generate_id("nonexistent")
+    finally:
+        await db.close()
+
+
+# ── Foreign key enforcement ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_foreign_keys_enabled(tmp_path):
+    """PRAGMA foreign_keys returns 1 on connection checkout."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        result = await db.execute_query("PRAGMA foreign_keys", fetch_one=True)
+        # result could be tuple or Row, check both forms
+        fk_val = result[0] if isinstance(result, tuple) else result["foreign_keys"]
+        assert fk_val == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fk_enforcement_via_manager(tmp_path):
+    """DatabaseManager rejects inserts that violate FK constraints."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        with pytest.raises(Exception):  # IntegrityError
+            await db.execute_query(
+                "INSERT INTO requirements (id, project_id, type, title, priority) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ["REQ-0001", "PROJ-9999", "FUNC", "Test", "P1"],
             )
+    finally:
+        await db.close()
 
-        # Select all
-        results = await db_manager.execute_query(
-            "SELECT id FROM requirements WHERE type = ?", ["FUNC"], fetch_all=True
+
+# ── Pool management ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pool_checkout_return(tmp_path):
+    """Connection can be checked out and returned."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        async with db.get_connection() as conn:
+            result = await conn.execute("SELECT 1")
+            row = await result.fetchone()
+            assert row[0] == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_pool_stats(tmp_path):
+    """get_pool_stats returns correct info."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        stats = await db.get_pool_stats()
+        assert stats["pooling_enabled"] is True
+        assert stats["pool_size"] == 5
+        assert stats["initialized"] is True
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_test_connection(tmp_path):
+    """test_connection returns success status."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        result = await db.test_connection()
+        assert result["status"] == "success"
+        assert "response_time_ms" in result
+    finally:
+        await db.close()
+
+
+# ── CRUD helpers ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_insert_record(tmp_path):
+    """insert_record inserts and returns lastrowid."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        await db.insert_record("projects", {"id": "PROJ-0001", "name": "Test Project"})
+        result = await db.execute_query(
+            "SELECT name FROM projects WHERE id = 'PROJ-0001'",
+            fetch_one=True,
+            row_factory=True,
         )
-        assert len(results) == 3
+        assert result["name"] == "Test Project"
+    finally:
+        await db.close()
 
-    async def test_execute_many(self, db_manager):
-        """Test execute_many for batch operations"""
-        params_list = [
-            ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement 1", "P1", "Current", "Desired", "Test Author"],
-            ["REQ-0002-FUNC-00", 2, "FUNC", "Test Requirement 2", "P2", "Current", "Desired", "Test Author"],
-            ["REQ-0003-FUNC-00", 3, "FUNC", "Test Requirement 3", "P3", "Current", "Desired", "Test Author"],
-        ]
 
-        await db_manager.execute_many(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params_list,
+@pytest.mark.asyncio
+async def test_update_record(tmp_path):
+    """update_record modifies existing data."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        await db.insert_record("projects", {"id": "PROJ-0001", "name": "Original"})
+        await db.update_record("projects", {"name": "Updated"}, "id = ?", ["PROJ-0001"])
+        result = await db.execute_query(
+            "SELECT name FROM projects WHERE id = 'PROJ-0001'",
+            fetch_one=True,
+            row_factory=True,
         )
+        assert result["name"] == "Updated"
+    finally:
+        await db.close()
 
-        # Verify all records were inserted
-        count = await db_manager.execute_query("SELECT COUNT(*) FROM requirements", fetch_one=True)
-        assert count[0] == 3
 
-    async def test_transaction_success(self, db_manager):
-        """Test successful transaction"""
-        async with db_manager.transaction() as conn:
-            await conn.execute(
-                "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-                "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
-            )
-
-        # Verify record was committed
-        result = await db_manager.execute_query(
-            "SELECT id FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
-        )
-        assert result is not None
-
-    async def test_transaction_rollback(self, db_manager):
-        """Test transaction rollback on exception"""
-        try:
-            async with db_manager.transaction() as conn:
-                await conn.execute(
-                    "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-                    "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
-                )
-                # Force an error
-                raise ValueError("Test error")
-        except ValueError:
-            pass
-
-        # Verify record was not committed
-        result = await db_manager.execute_query(
-            "SELECT id FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
-        )
-        assert result is None
-
-    async def test_insert_with_next_id(self, db_manager):
-        """Test insert_with_next_id functionality (replaces get_next_id)"""
-        # First insert should get ID 1
-        next_id = await db_manager.insert_with_next_id(
-            "requirements",
-            "requirement_number",
-            {
-                "id": "REQ-0001-FUNC-00",
-                "type": "FUNC",
-                "title": "Test Requirement",
-                "priority": "P1",
-                "current_state": "Current",
-                "desired_state": "Desired",
-                "author": "Test Author",
-            },
-        )
-        assert next_id == 1
-
-        # Second insert should get ID 2
-        next_id = await db_manager.insert_with_next_id(
-            "requirements",
-            "requirement_number",
-            {
-                "id": "REQ-0002-FUNC-00",
-                "type": "FUNC",
-                "title": "Test Requirement 2",
-                "priority": "P1",
-                "current_state": "Current",
-                "desired_state": "Desired",
-                "author": "Test Author",
-            },
-        )
-        assert next_id == 2
-
-    async def test_insert_with_next_id_with_filter(self, db_manager):
-        """Test insert_with_next_id with WHERE clause"""
-        # Insert FUNC requirement
-        next_id = await db_manager.insert_with_next_id(
-            "requirements",
-            "requirement_number",
-            {
-                "id": "REQ-0001-FUNC-00",
-                "type": "FUNC",
-                "title": "Test FUNC Requirement",
-                "priority": "P1",
-                "current_state": "Current",
-                "desired_state": "Desired",
-                "author": "Test Author",
-            },
-            "type = ?",
-            ["FUNC"],
-        )
-        assert next_id == 1
-
-        # Insert TECH requirement - should also get ID 1 (different type filter)
-        next_id = await db_manager.insert_with_next_id(
-            "requirements",
-            "requirement_number",
-            {
-                "id": "REQ-0001-TECH-00",
-                "type": "TECH",
-                "title": "Test TECH Requirement",
-                "priority": "P1",
-                "current_state": "Current",
-                "desired_state": "Desired",
-                "author": "Test Author",
-            },
-            "type = ?",
-            ["TECH"],
-        )
-        assert next_id == 1
-
-    async def test_check_exists(self, db_manager):
-        """Test check_exists functionality"""
-        # Should not exist initially
-        exists = await db_manager.check_exists("requirements", "id = ?", ["REQ-0001-FUNC-00"])
+@pytest.mark.asyncio
+async def test_delete_record(tmp_path):
+    """delete_record removes data."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        await db.insert_record("projects", {"id": "PROJ-0001", "name": "Test"})
+        await db.delete_record("projects", "id = ?", ["PROJ-0001"])
+        exists = await db.check_exists("projects", "id = ?", ["PROJ-0001"])
         assert not exists
+    finally:
+        await db.close()
 
-        # Insert record with all required fields
-        await db_manager.execute_query(
-            "INSERT INTO requirements (id, requirement_number, type, title, priority, "
-            "current_state, desired_state, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ["REQ-0001-FUNC-00", 1, "FUNC", "Test Requirement", "P1", "Current", "Desired", "Test Author"],
+
+@pytest.mark.asyncio
+async def test_get_records(tmp_path):
+    """get_records returns filtered, ordered results."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        await db.insert_record("projects", {"id": "PROJ-0001", "name": "Alpha"})
+        await db.insert_record("projects", {"id": "PROJ-0002", "name": "Beta"})
+        await db.insert_record("projects", {"id": "PROJ-0003", "name": "Charlie"})
+
+        records = await db.get_records(
+            "projects", "id, name", "status = ?", ["active"], "name"
         )
+        assert len(records) == 3
+        assert records[0]["name"] == "Alpha"
+    finally:
+        await db.close()
 
-        # Should exist now
-        exists = await db_manager.check_exists("requirements", "id = ?", ["REQ-0001-FUNC-00"])
-        assert exists
 
-    async def test_insert_record(self, db_manager):
-        """Test insert_record helper method"""
-        data = {
-            "id": "REQ-0001-FUNC-00",
-            "requirement_number": 1,
-            "type": "FUNC",
-            "title": "Test Requirement",
-            "priority": "P1",
-            "current_state": "Current",
-            "desired_state": "Desired",
-            "author": "Test Author",
-        }
+@pytest.mark.asyncio
+async def test_check_exists(tmp_path):
+    """check_exists returns True/False correctly."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        assert not await db.check_exists("projects", "id = ?", ["PROJ-0001"])
+        await db.insert_record("projects", {"id": "PROJ-0001", "name": "Test"})
+        assert await db.check_exists("projects", "id = ?", ["PROJ-0001"])
+    finally:
+        await db.close()
 
-        row_id = await db_manager.insert_record("requirements", data)
-        assert row_id is not None
 
-        # Verify record was inserted
-        result = await db_manager.execute_query(
-            "SELECT title FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
-        )
-        assert result[0] == "Test Requirement"
+# ── Transaction ─────────────────────────────────────────────────────
 
-    async def test_update_record(self, db_manager):
-        """Test update_record helper method"""
-        # Insert initial record with all required fields
-        await db_manager.insert_record(
-            "requirements",
-            {
-                "id": "REQ-0001-FUNC-00",
-                "requirement_number": 1,
-                "type": "FUNC",
-                "title": "Test Requirement",
-                "priority": "P1",
-                "current_state": "Current",
-                "desired_state": "Desired",
-                "author": "Test Author",
-            },
-        )
 
-        # Update record
-        await db_manager.update_record(
-            "requirements", {"title": "Updated Title", "priority": "P2"}, "id = ?", ["REQ-0001-FUNC-00"]
-        )
-
-        # Verify update
-        result = await db_manager.execute_query(
-            "SELECT title, priority FROM requirements WHERE id = ?", ["REQ-0001-FUNC-00"], fetch_one=True
-        )
-        assert result[0] == "Updated Title"
-        assert result[1] == "P2"
-
-    async def test_get_records(self, db_manager):
-        """Test get_records helper method"""
-        # Insert test data with all required fields
-        for i in range(3):
-            await db_manager.insert_record(
-                "requirements",
-                {
-                    "id": f"REQ-000{i + 1}-FUNC-00",
-                    "requirement_number": i + 1,
-                    "type": "FUNC",
-                    "title": f"Test Requirement {i + 1}",
-                    "priority": f"P{i + 1}",
-                    "current_state": "Current",
-                    "desired_state": "Desired",
-                    "author": "Test Author",
-                },
+@pytest.mark.asyncio
+async def test_transaction_success(tmp_path):
+    """Successful transaction commits data."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        async with db.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO projects (id, name) VALUES (?, ?)",
+                ("PROJ-0001", "Test"),
             )
 
-        # Get all records
-        records = await db_manager.get_records("requirements", "*", "type = ?", ["FUNC"], "priority")
-        assert len(records) == 3
-        assert records[0]["title"] == "Test Requirement 1"  # Should be sorted by priority
-
-        # Get limited records
-        records = await db_manager.get_records(
-            "requirements", "id, title", "type = ?", ["FUNC"], "priority", limit=2
+        result = await db.execute_query(
+            "SELECT name FROM projects WHERE id = 'PROJ-0001'",
+            fetch_one=True,
         )
-        assert len(records) == 2
+        assert result[0] == "Test"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_transaction_rollback(tmp_path):
+    """Failed transaction rolls back data."""
+    db = DatabaseManager(str(tmp_path / "test.db"))
+    await db.initialize()
+    try:
+        with pytest.raises(ValueError):
+            async with db.transaction() as conn:
+                await conn.execute(
+                    "INSERT INTO projects (id, name) VALUES (?, ?)",
+                    ("PROJ-0001", "Test"),
+                )
+                raise ValueError("Force rollback")
+
+        exists = await db.check_exists("projects", "id = ?", ["PROJ-0001"])
+        assert not exists
+    finally:
+        await db.close()
+
+
+# ── Constructor no longer touches disk ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_constructor_does_not_create_db(tmp_path):
+    """DatabaseManager constructor should NOT create the DB file (initialize does)."""
+    import os
+    db_path = str(tmp_path / "lazy.db")
+    _db = DatabaseManager(db_path)  # noqa: F841
+    assert not os.path.exists(db_path), "Constructor should not create DB file"

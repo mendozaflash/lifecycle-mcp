@@ -1,171 +1,972 @@
+"""Tests for TaskHandler v2 (DB-05).
+
+Validates all 12 MCP tools:
+  create_task, update_task, update_task_status, archive_task,
+  query_tasks, query_tasks_json, get_task_details,
+  batch_create_tasks, clone_task,
+  get_task_requirement_context, get_task_adr_context, get_task_full_context
+
+No GitHub tools should be present.
 """
-Unit tests for TaskHandler
-"""
+
+import json
 
 import pytest
 
+from lifecycle_mcp.handlers.task_handler import TaskHandler
 
-@pytest.mark.unit
-class TestTaskHandler:
-    """Test cases for TaskHandler"""
 
-    def test_get_tool_definitions(self, task_handler):
-        """Test that handler returns correct tool definitions"""
-        tools = task_handler.get_tool_definitions()
-        assert len(tools) == 7
+# ── Fixtures ────────────────────────────────────────────────────────────
 
-        tool_names = [tool["name"] for tool in tools]
-        expected_tools = [
-            "create_task",
-            "update_task_status",
-            "query_tasks",
-            "query_tasks_json",
-            "get_task_details",
-            "sync_task_from_github",
-            "bulk_sync_github_tasks",
-        ]
-        assert all(tool in tool_names for tool in expected_tools)
 
-    @pytest.mark.asyncio
-    async def test_create_task_success(
-        self, task_handler, requirement_handler, sample_requirement_data, sample_task_data
-    ):
-        """Test successful task creation"""
-        # Create requirement and approve it first
-        await requirement_handler._create_requirement(**sample_requirement_data)
-        # Move through proper status transitions to Approved
-        await requirement_handler._update_requirement_status(
-            requirement_id="REQ-0001-FUNC-00", new_status="Under Review"
-        )
-        await requirement_handler._update_requirement_status(requirement_id="REQ-0001-FUNC-00", new_status="Approved")
+@pytest.fixture
+async def task_env(v2_db_manager):
+    """Set up a TaskHandler + a test project. Returns (handler, db, project_id)."""
+    handler = TaskHandler(v2_db_manager)
+    await v2_db_manager.execute_query(
+        "INSERT INTO projects (id, name) VALUES (?, ?)",
+        ["PROJ-0001", "Test Project"],
+    )
+    return handler, v2_db_manager, "PROJ-0001"
 
-        # Create task
-        result = await task_handler._create_task(**sample_task_data)
 
-        assert len(result) == 1
-        assert "SUCCESS" in result[0].text  # Check for above-fold format
-        assert "TASK-0001-00-00" in result[0].text
+# ── Helpers ─────────────────────────────────────────────────────────────
 
-        # Verify task was stored in database
-        records = await task_handler.db.get_records("tasks", "*", "id = ?", ["TASK-0001-00-00"])
-        assert len(records) == 1
-        assert records[0]["title"] == "Test Task"
-        assert records[0]["priority"] == "P1"
-        assert records[0]["effort"] == "M"
 
-        # Verify task-requirement link was created
-        links = await task_handler.db.get_records("requirement_tasks", "*", "task_id = ?", ["TASK-0001-00-00"])
-        assert len(links) == 1
-        assert links[0]["requirement_id"] == "REQ-0001-FUNC-00"
+async def _create_task(handler, project_id, title="Test Task", priority="P1", **extra):
+    """Shorthand to create a task via handle_tool_call."""
+    params = {"project_id": project_id, "title": title, "priority": priority}
+    params.update(extra)
+    return await handler.handle_tool_call("create_task", params)
 
-    @pytest.mark.asyncio
-    async def test_create_task_missing_params(self, task_handler):
-        """Test task creation with missing required parameters"""
-        incomplete_data = {
-            "title": "Test Task"
-            # Missing requirement_ids and priority
-        }
 
-        result = await task_handler._create_task(**incomplete_data)
+async def _create_requirement(db, project_id, req_id, title="Test Requirement"):
+    """Insert a requirement directly into the DB for relationship testing."""
+    await db.execute_query(
+        "INSERT INTO requirements (id, project_id, type, title, priority, status) "
+        "VALUES (?, ?, 'FUNC', ?, 'P1', 'Draft')",
+        [req_id, project_id, title],
+    )
 
-        assert len(result) == 1
-        assert "ERROR" in result[0].text  # Check for above-fold format
-        assert "Missing required parameters" in result[0].text
 
-    @pytest.mark.asyncio
-    async def test_update_task_status_success(
-        self, task_handler, requirement_handler, sample_requirement_data, sample_task_data
-    ):
-        """Test successful task status update"""
-        # Create requirement and approve it first
-        await requirement_handler._create_requirement(**sample_requirement_data)
-        await requirement_handler._update_requirement_status(
-            requirement_id="REQ-0001-FUNC-00", new_status="Under Review"
-        )
-        await requirement_handler._update_requirement_status(requirement_id="REQ-0001-FUNC-00", new_status="Approved")
-        # Now create task
-        await task_handler._create_task(**sample_task_data)
+async def _create_adr(db, project_id, adr_id, title="Test ADR"):
+    """Insert an architecture decision directly into the DB."""
+    await db.execute_query(
+        "INSERT INTO architecture (id, project_id, title, status) "
+        "VALUES (?, ?, ?, 'Draft')",
+        [adr_id, project_id, title],
+    )
 
-        # Update task status
-        result = await task_handler._update_task_status(
-            task_id="TASK-0001-00-00", new_status="In Progress", comment="Starting work", assignee="New Assignee"
-        )
 
-        assert len(result) == 1
-        assert "SUCCESS" in result[0].text  # Check for above-fold format
-        assert "TASK-0001-00-00" in result[0].text
+async def _link(db, source_type, source_id, target_type, target_id, rel_type, project_id=None):
+    """Insert a relationship record."""
+    rel_id = f"rel-{source_id}-{target_id}-{rel_type}"
+    await db.insert_record(
+        "relationships",
+        {
+            "id": rel_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "relationship_type": rel_type,
+            "project_id": project_id,
+        },
+    )
 
-        # Verify status and assignee were updated
-        records = await task_handler.db.get_records("tasks", "status, assignee", "id = ?", ["TASK-0001-00-00"])
-        assert records[0]["status"] == "In Progress"
-        assert records[0]["assignee"] == "New Assignee"
 
-    @pytest.mark.asyncio
-    async def test_update_task_status_not_found(self, task_handler):
-        """Test updating non-existent task"""
-        result = await task_handler._update_task_status(task_id="TASK-9999-00-00", new_status="In Progress")
+# ═════════════════════════════════════════════════════════════════════════
+#  Tool definitions
+# ═════════════════════════════════════════════════════════════════════════
 
-        assert len(result) == 1
-        assert "ERROR" in result[0].text  # Check for above-fold format
-        assert "Task not found" in result[0].text
 
-    async def test_query_tasks_no_results(self, task_handler):
-        """Test querying tasks with no matches"""
-        result = await task_handler._query_tasks(status="Nonexistent")
+@pytest.mark.asyncio
+async def test_tool_definitions_list(task_env):
+    handler, _, _ = task_env
+    tools = handler.get_tool_definitions()
+    names = [t["name"] for t in tools]
+    expected = [
+        "create_task",
+        "update_task",
+        "update_task_status",
+        "archive_task",
+        "query_tasks",
+        "query_tasks_json",
+        "get_task_details",
+        "batch_create_tasks",
+        "clone_task",
+        "get_task_requirement_context",
+        "get_task_adr_context",
+        "get_task_full_context",
+    ]
+    for name in expected:
+        assert name in names, f"Missing tool definition: {name}"
+    assert len(tools) == 12
 
-        assert len(result) == 1
-        assert "INFO" in result[0].text  # Check for above-fold format
-        assert "No tasks found" in result[0].text
-        assert "Try adjusting search criteria" in result[0].text
 
-    async def test_get_task_details_not_found(self, task_handler):
-        """Test getting details for non-existent task"""
-        result = await task_handler._get_task_details(task_id="TASK-9999-00-00")
+@pytest.mark.asyncio
+async def test_no_github_tools(task_env):
+    handler, _, _ = task_env
+    tools = handler.get_tool_definitions()
+    names = [t["name"] for t in tools]
+    assert "sync_task_from_github" not in names
+    assert "bulk_sync_github_tasks" not in names
 
-        assert len(result) == 1
-        assert "ERROR" in result[0].text  # Check for above-fold format
-        assert "Task not found" in result[0].text
 
-    @pytest.mark.asyncio
-    async def test_handle_tool_call_routing(
-        self, task_handler, requirement_handler, sample_requirement_data, sample_task_data
-    ):
-        """Test that handle_tool_call routes correctly"""
-        # Create requirement and approve it
-        await requirement_handler._create_requirement(**sample_requirement_data)
-        await requirement_handler._update_requirement_status(
-            requirement_id="REQ-0001-FUNC-00", new_status="Under Review"
-        )
-        await requirement_handler._update_requirement_status(requirement_id="REQ-0001-FUNC-00", new_status="Approved")
+# ═════════════════════════════════════════════════════════════════════════
+#  create_task
+# ═════════════════════════════════════════════════════════════════════════
 
-        # Test create_task routing
-        result = await task_handler.handle_tool_call("create_task", sample_task_data)
-        assert len(result) == 1
-        assert "SUCCESS" in result[0].text  # Check for above-fold format
-        assert "TASK-0001-00-00" in result[0].text
 
-        # Test unknown tool
-        result = await task_handler.handle_tool_call("unknown_tool", {})
-        assert len(result) == 1
-        assert "Unknown tool: unknown_tool" in result[0].text
+@pytest.mark.asyncio
+async def test_create_task_basic(task_env):
+    handler, db, pid = task_env
+    result = await _create_task(handler, pid)
+    text = result[0].text
+    assert "TASK-0001" in text
+    assert "SUCCESS" in text
 
-    @pytest.mark.asyncio
-    async def test_create_task_blocks_draft_requirement(
-        self, task_handler, requirement_handler, sample_requirement_data, sample_task_data
-    ):
-        """Test that task creation is blocked for draft requirements"""
-        # Create requirement in Draft status (default)
-        await requirement_handler._create_requirement(**sample_requirement_data)
 
-        # Attempt to create task for draft requirement
-        result = await task_handler._create_task(**sample_task_data)
+@pytest.mark.asyncio
+async def test_create_task_sequential_ids(task_env):
+    handler, db, pid = task_env
+    r1 = await _create_task(handler, pid, title="A")
+    r2 = await _create_task(handler, pid, title="B")
+    r3 = await _create_task(handler, pid, title="C")
+    assert "TASK-0001" in r1[0].text
+    assert "TASK-0002" in r2[0].text
+    assert "TASK-0003" in r3[0].text
 
-        assert len(result) == 1
-        assert "ERROR" in result[0].text  # Check for above-fold format
-        assert "Cannot create tasks for unapproved requirements" in result[0].text
-        assert "REQ-0001-FUNC-00 (status: Draft)" in result[0].text
-        assert "Approved, Architecture, Implemented, Ready, Validated" in result[0].text
 
-        # Verify no task was created
-        tasks = await task_handler.db.get_records("tasks", "*", "", [])
-        assert len(tasks) == 0
+@pytest.mark.asyncio
+async def test_create_task_stores_planning_fields(task_env):
+    handler, db, pid = task_env
+    await _create_task(
+        handler,
+        pid,
+        title="Planned Task",
+        effort="L",
+        user_story="As a dev, I want tests",
+        acceptance_criteria=["AC-1", "AC-2"],
+        assignee="Alice",
+        scope_boundaries="Within module X",
+        technical_outline="Use pattern Y",
+        files_touched=["a.py", "b.py"],
+        verification_commands=["pytest tests/"],
+        public_symbols=["MyClass", "my_func"],
+        risk_notes="Might break Z",
+    )
+    row = await db.execute_query(
+        "SELECT * FROM tasks WHERE id = 'TASK-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row is not None
+    assert row["title"] == "Planned Task"
+    assert row["effort"] == "L"
+    assert row["user_story"] == "As a dev, I want tests"
+    assert json.loads(row["acceptance_criteria"]) == ["AC-1", "AC-2"]
+    assert row["assignee"] == "Alice"
+    assert row["scope_boundaries"] == "Within module X"
+    assert row["technical_outline"] == "Use pattern Y"
+    assert json.loads(row["files_touched"]) == ["a.py", "b.py"]
+    assert json.loads(row["verification_commands"]) == ["pytest tests/"]
+    assert json.loads(row["public_symbols"]) == ["MyClass", "my_func"]
+    assert row["risk_notes"] == "Might break Z"
+    assert row["status"] == "Not Started"
+    assert row["project_id"] == pid
+
+
+@pytest.mark.asyncio
+async def test_create_task_validates_project_exists(task_env):
+    handler, db, pid = task_env
+    result = await _create_task(handler, "PROJ-9999", title="Orphan")
+    text = result[0].text
+    assert "ERROR" in text
+    assert "PROJ-9999" in text
+
+
+@pytest.mark.asyncio
+async def test_create_task_missing_required_fields(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call("create_task", {"title": "No project"})
+    assert "ERROR" in result[0].text
+    assert "Missing required" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_create_task_with_parent(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Parent")
+    result = await _create_task(handler, pid, title="Child", parent_task_id="TASK-0001")
+    text = result[0].text
+    assert "SUCCESS" in text
+    assert "TASK-0002" in text
+    # Verify parent_task_id stored
+    row = await db.execute_query(
+        "SELECT parent_task_id FROM tasks WHERE id = 'TASK-0002'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["parent_task_id"] == "TASK-0001"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  update_task (new broad-update tool)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_update_task_title_and_priority(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Old Title", priority="P2")
+    result = await handler.handle_tool_call(
+        "update_task", {"task_id": "TASK-0001", "title": "New Title", "priority": "P0"}
+    )
+    assert "SUCCESS" in result[0].text
+    row = await db.execute_query(
+        "SELECT title, priority FROM tasks WHERE id = 'TASK-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["title"] == "New Title"
+    assert row["priority"] == "P0"
+
+
+@pytest.mark.asyncio
+async def test_update_task_planning_fields(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+    result = await handler.handle_tool_call(
+        "update_task",
+        {
+            "task_id": "TASK-0001",
+            "scope_boundaries": "Module A only",
+            "technical_outline": "New approach",
+            "files_touched": ["x.py"],
+            "verification_commands": ["make test"],
+            "public_symbols": ["Foo"],
+            "risk_notes": "Low risk",
+        },
+    )
+    assert "SUCCESS" in result[0].text
+    row = await db.execute_query(
+        "SELECT scope_boundaries, technical_outline, files_touched, verification_commands, "
+        "public_symbols, risk_notes FROM tasks WHERE id = 'TASK-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["scope_boundaries"] == "Module A only"
+    assert row["technical_outline"] == "New approach"
+    assert json.loads(row["files_touched"]) == ["x.py"]
+    assert json.loads(row["verification_commands"]) == ["make test"]
+    assert json.loads(row["public_symbols"]) == ["Foo"]
+    assert row["risk_notes"] == "Low risk"
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_archived(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+    await handler.handle_tool_call("archive_task", {"task_id": "TASK-0001"})
+    result = await handler.handle_tool_call(
+        "update_task", {"task_id": "TASK-0001", "title": "Nope"}
+    )
+    assert "ERROR" in result[0].text
+    assert "archived" in result[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_nonexistent(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call(
+        "update_task", {"task_id": "TASK-9999", "title": "Nope"}
+    )
+    assert "ERROR" in result[0].text
+    assert "not found" in result[0].text.lower()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  update_task_status (narrow write)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_valid_transitions(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+
+    # Not Started -> In Progress
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    assert "SUCCESS" in result[0].text
+
+    # In Progress -> Complete
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+    )
+    assert "SUCCESS" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_invalid_transition(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)  # status = "Not Started"
+
+    # Not Started -> Complete (not allowed)
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+    )
+    assert "ERROR" in result[0].text
+    assert "Invalid transition" in result[0].text or "transition" in result[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_complete_is_terminal(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+    )
+    # Complete -> In Progress (not allowed)
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    assert "ERROR" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_abandoned_is_terminal(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Abandoned"}
+    )
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    assert "ERROR" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_blocked_transitions(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+
+    # Not Started -> In Progress -> Blocked -> In Progress
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Blocked"}
+    )
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    assert "SUCCESS" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_narrow_write(task_env):
+    """Verify update_task_status ONLY updates status, execution_notes, deviation_from_plan."""
+    handler, db, pid = task_env
+    await _create_task(
+        handler,
+        pid,
+        title="Original Title",
+        priority="P1",
+        assignee="Alice",
+        effort="M",
+    )
+    # Transition with execution_notes and deviation_from_plan
+    await handler.handle_tool_call(
+        "update_task_status",
+        {
+            "task_id": "TASK-0001",
+            "new_status": "In Progress",
+            "execution_notes": "Started work",
+            "deviation_from_plan": "None so far",
+        },
+    )
+    row = await db.execute_query(
+        "SELECT title, priority, assignee, effort, status, execution_notes, deviation_from_plan "
+        "FROM tasks WHERE id = 'TASK-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    # Status and execution fields updated
+    assert row["status"] == "In Progress"
+    assert row["execution_notes"] == "Started work"
+    assert row["deviation_from_plan"] == "None so far"
+    # Other fields unchanged
+    assert row["title"] == "Original Title"
+    assert row["priority"] == "P1"
+    assert row["assignee"] == "Alice"
+    assert row["effort"] == "M"
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_not_found(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-9999", "new_status": "In Progress"}
+    )
+    assert "ERROR" in result[0].text
+    assert "not found" in result[0].text.lower()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  archive_task
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_archive_task(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid)
+    result = await handler.handle_tool_call("archive_task", {"task_id": "TASK-0001"})
+    assert "SUCCESS" in result[0].text
+
+    row = await db.execute_query(
+        "SELECT is_archived FROM tasks WHERE id = 'TASK-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["is_archived"] == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_task_not_found(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call("archive_task", {"task_id": "TASK-9999"})
+    assert "ERROR" in result[0].text
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  query_tasks
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_by_project(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="A")
+    await _create_task(handler, pid, title="B")
+    result = await handler.handle_tool_call("query_tasks", {"project_id": pid})
+    text = result[0].text
+    assert "2" in text or "TASK-0001" in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_excludes_archived(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Visible")
+    await _create_task(handler, pid, title="Hidden")
+    await handler.handle_tool_call("archive_task", {"task_id": "TASK-0002"})
+
+    result = await handler.handle_tool_call("query_tasks", {"project_id": pid})
+    text = result[0].text
+    assert "TASK-0001" in text
+    assert "TASK-0002" not in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_include_archived(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Visible")
+    await _create_task(handler, pid, title="Hidden")
+    await handler.handle_tool_call("archive_task", {"task_id": "TASK-0002"})
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "include_archived": True}
+    )
+    text = result[0].text
+    assert "TASK-0001" in text
+    assert "TASK-0002" in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_filters(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="P0 Task", priority="P0")
+    await _create_task(handler, pid, title="P2 Task", priority="P2")
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"project_id": pid, "priority": "P0"}
+    )
+    text = result[0].text
+    assert "P0 Task" in text
+    assert "P2 Task" not in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_by_status(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Todo")
+    await _create_task(handler, pid, title="Active")
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0002", "new_status": "In Progress"}
+    )
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"status": "In Progress"}
+    )
+    text = result[0].text
+    assert "Active" in text
+    assert "Todo" not in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_by_assignee(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Alice Task", assignee="Alice")
+    await _create_task(handler, pid, title="Bob Task", assignee="Bob")
+
+    result = await handler.handle_tool_call(
+        "query_tasks", {"assignee": "Alice"}
+    )
+    text = result[0].text
+    assert "Alice Task" in text
+    assert "Bob Task" not in text
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_no_results(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call("query_tasks", {"status": "Complete"})
+    assert "No tasks found" in result[0].text or "0" in result[0].text
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  query_tasks_json
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_json_format(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="JSON Task", acceptance_criteria=["AC1"])
+
+    result = await handler.handle_tool_call("query_tasks_json", {"project_id": pid})
+    data = json.loads(result[0].text)
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["title"] == "JSON Task"
+    # acceptance_criteria should be parsed from JSON string
+    assert data[0]["acceptance_criteria"] == ["AC1"]
+
+
+@pytest.mark.asyncio
+async def test_query_tasks_json_excludes_archived(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Visible")
+    await _create_task(handler, pid, title="Hidden")
+    await handler.handle_tool_call("archive_task", {"task_id": "TASK-0002"})
+
+    result = await handler.handle_tool_call("query_tasks_json", {"project_id": pid})
+    data = json.loads(result[0].text)
+    assert len(data) == 1
+    assert data[0]["title"] == "Visible"
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  get_task_details
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_full_record(task_env):
+    handler, db, pid = task_env
+    await _create_task(
+        handler,
+        pid,
+        title="Detailed Task",
+        priority="P0",
+        effort="XL",
+        assignee="Bob",
+    )
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "Detailed Task" in text
+    assert "P0" in text
+    assert "XL" in text
+    assert "Bob" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_with_relationships(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Linked Task")
+    # Create a requirement and link it
+    await _create_requirement(db, pid, "REQ-0001")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_details_not_found(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call(
+        "get_task_details", {"task_id": "TASK-9999"}
+    )
+    assert "ERROR" in result[0].text
+    assert "not found" in result[0].text.lower()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  batch_create_tasks
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_batch_create_tasks_valid(task_env):
+    handler, db, pid = task_env
+    tasks = [
+        {"title": "Batch A", "priority": "P0"},
+        {"title": "Batch B", "priority": "P1", "effort": "S"},
+        {"title": "Batch C", "priority": "P2", "assignee": "Alice"},
+    ]
+    result = await handler.handle_tool_call(
+        "batch_create_tasks", {"project_id": pid, "tasks": tasks}
+    )
+    text = result[0].text
+    assert "SUCCESS" in text
+    assert "TASK-0001" in text
+    assert "TASK-0002" in text
+    assert "TASK-0003" in text
+
+    # Verify all 3 in DB
+    rows = await db.get_records("tasks", where_clause="project_id = ?", where_params=[pid])
+    assert len(rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_batch_create_tasks_rollback_on_invalid(task_env):
+    """If one task in the batch fails validation, all are rolled back."""
+    handler, db, pid = task_env
+    tasks = [
+        {"title": "Good", "priority": "P0"},
+        {"title": "Bad - missing priority"},  # no priority field
+        {"title": "Good too", "priority": "P1"},
+    ]
+    result = await handler.handle_tool_call(
+        "batch_create_tasks", {"project_id": pid, "tasks": tasks}
+    )
+    text = result[0].text
+    assert "ERROR" in text
+
+    # No tasks should have been created
+    rows = await db.get_records("tasks", where_clause="project_id = ?", where_params=[pid])
+    assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_create_tasks_empty(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call(
+        "batch_create_tasks", {"project_id": pid, "tasks": []}
+    )
+    assert "ERROR" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_batch_create_tasks_validates_project(task_env):
+    handler, db, pid = task_env
+    tasks = [{"title": "Good", "priority": "P0"}]
+    result = await handler.handle_tool_call(
+        "batch_create_tasks", {"project_id": "PROJ-9999", "tasks": tasks}
+    )
+    assert "ERROR" in result[0].text
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  clone_task
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_clone_task_basic(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Original", priority="P1", effort="M")
+
+    result = await handler.handle_tool_call(
+        "clone_task", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "SUCCESS" in text
+    assert "TASK-0002" in text
+
+    # Cloned task should have same fields but new ID, Not Started
+    row = await db.execute_query(
+        "SELECT title, priority, effort, status FROM tasks WHERE id = 'TASK-0002'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["title"] == "Original"
+    assert row["priority"] == "P1"
+    assert row["effort"] == "M"
+    assert row["status"] == "Not Started"
+
+
+@pytest.mark.asyncio
+async def test_clone_task_copies_relationships(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Original")
+    # Create a requirement and link it to the original
+    await _create_requirement(db, pid, "REQ-0001")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    await handler.handle_tool_call("clone_task", {"task_id": "TASK-0001"})
+
+    # The cloned task should also have the relationship
+    rels = await db.get_records(
+        "relationships",
+        where_clause="source_id = ? AND source_type = 'task'",
+        where_params=["TASK-0002"],
+    )
+    assert len(rels) >= 1
+    assert any(r["target_id"] == "REQ-0001" for r in rels)
+
+
+@pytest.mark.asyncio
+async def test_clone_task_resets_status(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Done Task")
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "In Progress"}
+    )
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Complete"}
+    )
+
+    await handler.handle_tool_call("clone_task", {"task_id": "TASK-0001"})
+
+    row = await db.execute_query(
+        "SELECT status, completed_at, execution_notes, deviation_from_plan "
+        "FROM tasks WHERE id = 'TASK-0002'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["status"] == "Not Started"
+    assert row["completed_at"] is None
+    assert row["execution_notes"] is None
+    assert row["deviation_from_plan"] is None
+
+
+@pytest.mark.asyncio
+async def test_clone_task_with_children(task_env):
+    handler, db, pid = task_env
+    # Create parent + 2 children
+    await _create_task(handler, pid, title="Parent")
+    await _create_task(handler, pid, title="Child 1", parent_task_id="TASK-0001")
+    await _create_task(handler, pid, title="Child 2", parent_task_id="TASK-0001")
+
+    result = await handler.handle_tool_call(
+        "clone_task", {"task_id": "TASK-0001", "include_children": True}
+    )
+    text = result[0].text
+    assert "SUCCESS" in text
+
+    # Should now have 6 tasks total (3 original + 3 clones)
+    rows = await db.get_records("tasks", where_clause="project_id = ?", where_params=[pid])
+    assert len(rows) == 6
+
+    # Find the cloned parent (TASK-0004 since 3 originals used 1-3)
+    cloned_parent = await db.execute_query(
+        "SELECT id, title FROM tasks WHERE id = 'TASK-0004'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert cloned_parent is not None
+    assert cloned_parent["title"] == "Parent"
+
+    # Find cloned children that reference the cloned parent
+    cloned_children = await db.get_records(
+        "tasks",
+        where_clause="parent_task_id = ?",
+        where_params=["TASK-0004"],
+    )
+    assert len(cloned_children) == 2
+
+
+@pytest.mark.asyncio
+async def test_clone_task_without_children(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Parent")
+    await _create_task(handler, pid, title="Child", parent_task_id="TASK-0001")
+
+    result = await handler.handle_tool_call(
+        "clone_task", {"task_id": "TASK-0001", "include_children": False}
+    )
+    text = result[0].text
+    assert "SUCCESS" in text
+
+    # Should have 3 tasks: original parent, original child, cloned parent
+    rows = await db.get_records("tasks", where_clause="project_id = ?", where_params=[pid])
+    assert len(rows) == 3
+
+    # Cloned parent should have no children
+    cloned_children = await db.get_records(
+        "tasks",
+        where_clause="parent_task_id = 'TASK-0003'",
+        where_params=[],
+    )
+    assert len(cloned_children) == 0
+
+
+@pytest.mark.asyncio
+async def test_clone_task_target_project(task_env):
+    handler, db, pid = task_env
+    # Create second project
+    await db.execute_query(
+        "INSERT INTO projects (id, name) VALUES (?, ?)",
+        ["PROJ-0002", "Other Project"],
+    )
+    await _create_task(handler, pid, title="Cross-project")
+
+    result = await handler.handle_tool_call(
+        "clone_task", {"task_id": "TASK-0001", "target_project_id": "PROJ-0002"}
+    )
+    assert "SUCCESS" in result[0].text
+
+    row = await db.execute_query(
+        "SELECT project_id FROM tasks WHERE id = 'TASK-0002'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["project_id"] == "PROJ-0002"
+
+
+@pytest.mark.asyncio
+async def test_clone_task_not_found(task_env):
+    handler, db, pid = task_env
+    result = await handler.handle_tool_call("clone_task", {"task_id": "TASK-9999"})
+    assert "ERROR" in result[0].text
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Context tools
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_get_task_requirement_context(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Context Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Linked Req")
+    await _create_requirement(db, pid, "REQ-0002", title="Unlinked Req")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_requirement_context", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "Linked Req" in text
+    assert "REQ-0002" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_requirement_context_reverse_link(task_env):
+    """Test that relationships where requirement is the source also work."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Context Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Reverse Linked Req")
+    # Link from requirement -> task (reverse direction)
+    await _link(db, "requirement", "REQ-0001", "task", "TASK-0001", "implements", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_requirement_context", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "Reverse Linked Req" in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_adr_context(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="ADR Task")
+    await _create_adr(db, pid, "ADR-0001", title="Design Decision")
+    await _create_adr(db, pid, "ADR-0002", title="Unlinked ADR")
+    await _link(db, "task", "TASK-0001", "architecture", "ADR-0001", "addresses", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_adr_context", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "ADR-0001" in text
+    assert "Design Decision" in text
+    assert "ADR-0002" not in text
+
+
+@pytest.mark.asyncio
+async def test_get_task_full_context(task_env):
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Full Context Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Req For Context")
+    await _create_adr(db, pid, "ADR-0001", title="ADR For Context")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+    await _link(db, "task", "TASK-0001", "architecture", "ADR-0001", "addresses", pid)
+
+    result = await handler.handle_tool_call(
+        "get_task_full_context", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "Req For Context" in text
+    assert "ADR-0001" in text
+    assert "ADR For Context" in text
+
+
+@pytest.mark.asyncio
+async def test_context_tools_task_not_found(task_env):
+    handler, db, pid = task_env
+    for tool in ["get_task_requirement_context", "get_task_adr_context", "get_task_full_context"]:
+        result = await handler.handle_tool_call(tool, {"task_id": "TASK-9999"})
+        assert "ERROR" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_context_excludes_archived_entities(task_env):
+    """Archived requirements/ADRs should not appear in context."""
+    handler, db, pid = task_env
+    await _create_task(handler, pid, title="Context Task")
+    await _create_requirement(db, pid, "REQ-0001", title="Active Req")
+    await _create_requirement(db, pid, "REQ-0002", title="Archived Req")
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0002", "implements", pid)
+    # Archive REQ-0002
+    await db.execute_query(
+        "UPDATE requirements SET is_archived = 1 WHERE id = 'REQ-0002'", []
+    )
+
+    result = await handler.handle_tool_call(
+        "get_task_requirement_context", {"task_id": "TASK-0001"}
+    )
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "REQ-0002" not in text
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Handle unknown tool
+# ═════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool(task_env):
+    handler, _, _ = task_env
+    result = await handler.handle_tool_call("nonexistent_tool", {})
+    assert "ERROR" in result[0].text or "Unknown" in result[0].text

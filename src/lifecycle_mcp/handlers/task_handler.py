@@ -1,45 +1,110 @@
 #!/usr/bin/env python3
 """
-Task Handler for MCP Lifecycle Management Server
-Handles all task-related operations
+Task Handler for MCP Lifecycle Management Server (v2)
+
+Handles all task-related operations using the v2 schema:
+- Sequential IDs via generate_id("task")
+- Project-scoped tasks (project_id FK)
+- Polymorphic relationships table (no requirement_tasks)
+- Planning fields (scope_boundaries, technical_outline, etc.)
+- Execution fields (execution_notes, deviation_from_plan)
+- No GitHub integration
 """
 
-from datetime import datetime, timezone
+import json
 from typing import Any
 
 from mcp.types import TextContent
 
-from ..github_utils import GitHubUtils
 from .base_handler import BaseHandler
 
 
 class TaskHandler(BaseHandler):
-    """Handler for task-related MCP tools"""
+    """Handler for task-related MCP tools (v2 schema)"""
+
+    VALID_STATUSES = {"Not Started", "In Progress", "Blocked", "Complete", "Abandoned"}
+
+    VALID_TRANSITIONS = {
+        "Not Started": ["In Progress", "Abandoned"],
+        "In Progress": ["Complete", "Blocked", "Abandoned"],
+        "Blocked": ["In Progress", "Abandoned"],
+        "Complete": [],
+        "Abandoned": [],
+    }
+
+    # Fields that may be updated via update_task (planning tool)
+    _UPDATABLE_FIELDS = [
+        "title", "priority", "effort", "user_story", "assignee",
+        "parent_task_id", "scope_boundaries", "technical_outline", "risk_notes",
+    ]
+    _UPDATABLE_JSON_FIELDS = [
+        "acceptance_criteria", "files_touched", "verification_commands", "public_symbols",
+    ]
+
+    def __init__(self, db_manager):
+        super().__init__(db_manager)
+
+    # ------------------------------------------------------------------
+    # Tool definitions
+    # ------------------------------------------------------------------
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return task tool definitions"""
         return [
             {
                 "name": "create_task",
-                "description": "Create implementation task from requirement",
+                "description": "Create implementation task linked to a project",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "requirement_ids": {"type": "array", "items": {"type": "string"}},
+                        "project_id": {"type": "string", "description": "Project ID (PROJ-XXXX)"},
                         "title": {"type": "string"},
                         "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
                         "effort": {"type": "string", "enum": ["XS", "S", "M", "L", "XL"]},
                         "user_story": {"type": "string"},
                         "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-                        "parent_task_id": {"type": "string"},
                         "assignee": {"type": "string"},
+                        "parent_task_id": {"type": "string"},
+                        "scope_boundaries": {"type": "string"},
+                        "technical_outline": {"type": "string"},
+                        "files_touched": {"type": "array", "items": {"type": "string"}},
+                        "verification_commands": {"type": "array", "items": {"type": "string"}},
+                        "public_symbols": {"type": "array", "items": {"type": "string"}},
+                        "risk_notes": {"type": "string"},
                     },
-                    "required": ["requirement_ids", "title", "priority"],
+                    "required": ["project_id", "title", "priority"],
+                },
+            },
+            {
+                "name": "update_task",
+                "description": "Update task planning fields (title, priority, effort, planning fields, etc.)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                        "effort": {"type": "string", "enum": ["XS", "S", "M", "L", "XL"]},
+                        "user_story": {"type": "string"},
+                        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                        "assignee": {"type": "string"},
+                        "parent_task_id": {"type": "string"},
+                        "scope_boundaries": {"type": "string"},
+                        "technical_outline": {"type": "string"},
+                        "files_touched": {"type": "array", "items": {"type": "string"}},
+                        "verification_commands": {"type": "array", "items": {"type": "string"}},
+                        "public_symbols": {"type": "array", "items": {"type": "string"}},
+                        "risk_notes": {"type": "string"},
+                    },
+                    "required": ["task_id"],
                 },
             },
             {
                 "name": "update_task_status",
-                "description": "Update task progress",
+                "description": (
+                    "Update task progress (narrow write: only status, execution_notes, "
+                    "deviation_from_plan). Validates state transitions."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -48,10 +113,21 @@ class TaskHandler(BaseHandler):
                             "type": "string",
                             "enum": ["Not Started", "In Progress", "Blocked", "Complete", "Abandoned"],
                         },
-                        "comment": {"type": "string"},
-                        "assignee": {"type": "string"},
+                        "execution_notes": {"type": "string"},
+                        "deviation_from_plan": {"type": "string"},
                     },
                     "required": ["task_id", "new_status"],
+                },
+            },
+            {
+                "name": "archive_task",
+                "description": "Archive a task (soft delete)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "Task ID (TASK-XXXX)"},
+                    },
+                    "required": ["task_id"],
                 },
             },
             {
@@ -60,10 +136,14 @@ class TaskHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string"},
                         "status": {"type": "string"},
                         "priority": {"type": "string"},
                         "assignee": {"type": "string"},
-                        "requirement_id": {"type": "string"},
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Include archived tasks (default: false)",
+                        },
                     },
                 },
             },
@@ -73,16 +153,20 @@ class TaskHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string"},
                         "status": {"type": "string"},
                         "priority": {"type": "string"},
                         "assignee": {"type": "string"},
-                        "requirement_id": {"type": "string"},
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Include archived tasks (default: false)",
+                        },
                     },
                 },
             },
             {
                 "name": "get_task_details",
-                "description": "Get full task details with dependencies",
+                "description": "Get full task details with linked requirements and ADRs",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"task_id": {"type": "string"}},
@@ -90,8 +174,64 @@ class TaskHandler(BaseHandler):
                 },
             },
             {
-                "name": "sync_task_from_github",
-                "description": "Sync individual task from GitHub issue changes",
+                "name": "batch_create_tasks",
+                "description": "Create multiple tasks atomically (all or nothing)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Project ID (PROJ-XXXX)"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "priority": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                                    "effort": {"type": "string", "enum": ["XS", "S", "M", "L", "XL"]},
+                                    "user_story": {"type": "string"},
+                                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                    "assignee": {"type": "string"},
+                                    "parent_task_id": {"type": "string"},
+                                    "scope_boundaries": {"type": "string"},
+                                    "technical_outline": {"type": "string"},
+                                    "files_touched": {"type": "array", "items": {"type": "string"}},
+                                    "verification_commands": {"type": "array", "items": {"type": "string"}},
+                                    "public_symbols": {"type": "array", "items": {"type": "string"}},
+                                    "risk_notes": {"type": "string"},
+                                },
+                                "required": ["title", "priority"],
+                            },
+                            "description": "Array of task objects to create",
+                        },
+                    },
+                    "required": ["project_id", "tasks"],
+                },
+            },
+            {
+                "name": "clone_task",
+                "description": (
+                    "Clone a task with a new ID. Copies relationships. Resets status to Not Started. "
+                    "Optionally clones child tasks recursively."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "include_children": {
+                            "type": "boolean",
+                            "description": "Recursively clone child tasks (default: false)",
+                        },
+                        "target_project_id": {
+                            "type": "string",
+                            "description": "Clone into a different project (default: same project)",
+                        },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+            {
+                "name": "get_task_requirement_context",
+                "description": "Get requirements linked to this task via relationships",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"task_id": {"type": "string"}},
@@ -99,638 +239,260 @@ class TaskHandler(BaseHandler):
                 },
             },
             {
-                "name": "bulk_sync_github_tasks",
-                "description": "Sync all tasks with their GitHub issues",
-                "inputSchema": {"type": "object", "properties": {}},
+                "name": "get_task_adr_context",
+                "description": "Get architecture decisions linked to this task via relationships",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"],
+                },
+            },
+            {
+                "name": "get_task_full_context",
+                "description": "Get both requirements AND ADRs linked to this task",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"task_id": {"type": "string"}},
+                    "required": ["task_id"],
+                },
             },
         ]
 
+    # ------------------------------------------------------------------
+    # Tool routing
+    # ------------------------------------------------------------------
+
     async def handle_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> list[TextContent]:
-        """Route tool calls to appropriate handler methods"""
+        """Route tool calls to handler methods"""
+        handlers = {
+            "create_task": self._create_task,
+            "update_task": self._update_task,
+            "update_task_status": self._update_task_status,
+            "archive_task": self._archive_task,
+            "query_tasks": self._query_tasks,
+            "query_tasks_json": self._query_tasks_json,
+            "get_task_details": self._get_task_details,
+            "batch_create_tasks": self._batch_create_tasks,
+            "clone_task": self._clone_task,
+            "get_task_requirement_context": self._get_task_requirement_context,
+            "get_task_adr_context": self._get_task_adr_context,
+            "get_task_full_context": self._get_task_full_context,
+        }
+        handler = handlers.get(tool_name)
+        if not handler:
+            return self._create_error_response(f"Unknown tool: {tool_name}")
         try:
-            if tool_name == "create_task":
-                return await self._create_task(**arguments)
-            elif tool_name == "update_task_status":
-                return await self._update_task_status(**arguments)
-            elif tool_name == "query_tasks":
-                return await self._query_tasks(**arguments)
-            elif tool_name == "query_tasks_json":
-                return await self._query_tasks_json(**arguments)
-            elif tool_name == "get_task_details":
-                return await self._get_task_details(**arguments)
-            elif tool_name == "sync_task_from_github":
-                task_id = arguments.get("task_id", "")
-                if not task_id:
-                    return self._create_error_response("task_id parameter required")
-                return await self._sync_from_github(task_id)
-            elif tool_name == "bulk_sync_github_tasks":
-                return await self._bulk_sync_with_github(**arguments)
-            else:
-                return self._create_error_response(f"Unknown tool: {tool_name}")
+            return await handler(arguments)
         except Exception as e:
             return self._create_error_response(f"Error handling {tool_name}", e)
 
-    async def _create_task(self, **params) -> list[TextContent]:
-        """Create task linked to requirements"""
-        # Validate required parameters
-        error = self._validate_required_params(params, ["requirement_ids", "title", "priority"])
+    # ------------------------------------------------------------------
+    # create_task
+    # ------------------------------------------------------------------
+
+    async def _create_task(self, params: dict[str, Any]) -> list[TextContent]:
+        """Create a task linked to a project."""
+        error = self._validate_required_params(params, ["project_id", "title", "priority"])
         if error:
             return self._create_error_response(error)
 
-        # Validate requirement approval status
-        approved_statuses = {"Approved", "Architecture", "Ready", "Implemented", "Validated"}
-        unapproved_reqs = []
-
-        for req_id in params["requirement_ids"]:
-            req_status = await self.db.get_records("requirements", "status", "id = ?", [req_id])
-
-            if not req_status:
-                return self._create_error_response(f"Requirement {req_id} not found")
-
-            status = req_status[0]["status"]
-            if status not in approved_statuses:
-                unapproved_reqs.append(f"{req_id} (status: {status})")
-
-        if unapproved_reqs:
-            error_msg = (
-                "Cannot create tasks for unapproved requirements. The following requirements must be approved first:\n"
-            )
-            error_msg += "\n".join(f"- {req}" for req in unapproved_reqs)
-            error_msg += "\n\nRequirements must be in one of these states: " + ", ".join(sorted(approved_statuses))
-            return self._create_error_response(error_msg)
-
-        try:
-            parent_task_id = params.get("parent_task_id")
-
-            # Use transaction for atomic task_number assignment + insert
-            async with self.db.transaction() as conn:
-                if parent_task_id:
-                    # Subtask: get parent's task_number and count existing subtasks
-                    cursor = await conn.execute(
-                        "SELECT task_number FROM tasks WHERE id = ?", [parent_task_id]
-                    )
-                    parent_row = await cursor.fetchone()
-                    if not parent_row:
-                        raise ValueError(f"Parent task {parent_task_id} not found")
-
-                    task_number = parent_row[0]
-
-                    # Count existing subtasks using relationships table
-                    cursor = await conn.execute(
-                        "SELECT COUNT(*) FROM relationships "
-                        "WHERE target_type = 'task' AND target_id = ? AND relationship_type = 'parent'",
-                        [parent_task_id],
-                    )
-                    count_row = await cursor.fetchone()
-                    subtask_number = (count_row[0] if count_row else 0) + 1
-                else:
-                    # Top-level task: get next task_number
-                    cursor = await conn.execute(
-                        "SELECT COALESCE(MAX(task_number), 0) + 1 FROM tasks"
-                    )
-                    row = await cursor.fetchone()
-                    task_number = row[0] if row else 1
-                    subtask_number = 0
-
-                task_id = f"TASK-{task_number:04d}-{subtask_number:02d}-00"
-
-                # Prepare task data
-                task_data = {
-                    "id": task_id,
-                    "task_number": task_number,
-                    "subtask_number": subtask_number,
-                    "version": 0,
-                    "title": params["title"],
-                    "priority": params["priority"],
-                    "effort": params.get("effort"),
-                    "user_story": params.get("user_story"),
-                    "acceptance_criteria": self._safe_json_dumps(params.get("acceptance_criteria", [])),
-                    "assignee": params.get("assignee"),
-                    "status": "Not Started",
-                }
-
-                # Insert task inside the transaction
-                columns = ", ".join(task_data.keys())
-                placeholders = ", ".join(["?"] * len(task_data))
-                await conn.execute(
-                    f"INSERT INTO tasks ({columns}) VALUES ({placeholders})",
-                    list(task_data.values()),
-                )
-
-            # Outside transaction: create relationships and links
-
-            # Create parent-child relationship if this is a subtask
-            if parent_task_id:
-                relationship_id = f"rel-{task_id}-{parent_task_id}-parent"
-                relationship_data = {
-                    "id": relationship_id,
-                    "source_type": "task",
-                    "source_id": task_id,
-                    "target_type": "task",
-                    "target_id": parent_task_id,
-                    "relationship_type": "parent",
-                }
-                await self.db.insert_record("relationships", relationship_data)
-
-            # Link to requirements
-            for req_id in params["requirement_ids"]:
-                await self.db.insert_record("requirement_tasks", {"requirement_id": req_id, "task_id": task_id})
-
-            # Create GitHub issue if available
-            github_url = None
-            github_error = None
-            if GitHubUtils.is_github_available():
-                try:
-                    github_title = f"{task_id}: {params['title']}"
-                    github_body = GitHubUtils.format_task_body(task_data)
-
-                    # Create labels based on priority and status
-                    labels = [params["priority"].lower()]
-                    if params.get("effort"):
-                        labels.append(f"effort-{params['effort'].lower()}")
-
-                    github_url = await GitHubUtils.create_github_issue(
-                        title=github_title, body=github_body, labels=labels, assignee=params.get("assignee")
-                    )
-
-                    # Store GitHub issue metadata if created successfully
-                    if github_url:
-                        issue_number = GitHubUtils.extract_issue_number_from_url(github_url)
-                        if issue_number:
-                            # Get the created issue details for ETag storage
-                            github_issue = await GitHubUtils.get_github_issue(issue_number)
-
-                            github_data = {
-                                "github_issue_number": issue_number,
-                                "github_issue_url": github_url,
-                                "github_last_sync": datetime.now(timezone.utc).isoformat(),
-                                "github_etag": github_issue.get("etag") if github_issue else None,
-                            }
-
-                            await self.db.update_record("tasks", github_data, "id = ?", [task_id])
-                    else:
-                        github_error = "GitHub issue creation returned no URL"
-
-                except Exception as e:
-                    github_error = f"GitHub issue creation failed: {str(e)}"
-                    self.logger.warning(f"GitHub integration error for task {task_id}: {github_error}")
-            else:
-                github_error = "GitHub not available or not configured"
-
-            # Create above-the-fold response
-            key_info = f"Task {task_id} created"
-            action_info = f"📋 {params['title']} | {params['priority']} | {params.get('effort', 'No effort specified')}"
-
-            github_info = ""
-            if github_url:
-                github_info = f"🔗 GitHub: {github_url}"
-            elif github_error:
-                github_info = f"⚠️ GitHub: {github_error}"
-
-            return self._create_above_fold_response("SUCCESS", key_info, action_info, github_info)
-
-        except ValueError as ve:
-            return self._create_error_response(str(ve))
-        except Exception as e:
-            return self._create_error_response("Failed to create task", e)
-
-    async def _update_task_status(self, **params) -> list[TextContent]:
-        """Update task status"""
-        # Validate required parameters
-        error = self._validate_required_params(params, ["task_id", "new_status"])
+        project_id = params["project_id"]
+        error = await self._validate_project_exists(project_id)
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Validate status value
-            valid_statuses = {"Not Started", "In Progress", "Blocked", "Complete", "Abandoned"}
-            new_status = params["new_status"]
-            if new_status not in valid_statuses:
-                return self._create_error_response(
-                    f"Invalid status '{new_status}'. Valid statuses: {', '.join(sorted(valid_statuses))}"
-                )
-
-            # Get current task with GitHub info
-            current_tasks = await self.db.get_records(
-                "tasks", "status, assignee, github_issue_number, github_issue_url", "id = ?", [params["task_id"]]
-            )
-
-            if not current_tasks:
-                return self._create_error_response("Task not found")
-
-            current_task = dict(current_tasks[0])  # Convert Row to dict for .get() method
-            current_status = current_task["status"]
-            new_status = params["new_status"]
-
-            # Prepare update data
-            update_data = {"status": new_status, "updated_at": "CURRENT_TIMESTAMP"}
-
-            if params.get("assignee"):
-                update_data["assignee"] = params["assignee"]
-
-            # Update task
-            await self.db.update_record("tasks", update_data, "id = ?", [params["task_id"]])
-
-            # Add comment if provided
-            if params.get("comment"):
-                await self._add_review_comment("task", params["task_id"], params["comment"])
-
-            # Update GitHub issue if it exists using sync-safe operations
-            github_updated = False
-            github_error = None
-
-            if current_task.get("github_issue_number") and GitHubUtils.is_github_available():
-                try:
-                    # Prepare GitHub updates
-                    github_updates = {}
-
-                    # Map task status to GitHub state
-                    if new_status == "Complete":
-                        github_updates["state"] = "closed"
-                    elif new_status in ["Not Started", "In Progress", "Blocked"]:
-                        github_updates["state"] = "open"
-
-                    # Prepare comment
-                    github_comment = f"Task status updated from '{current_status}' to '{new_status}'"
-                    if params.get("comment"):
-                        github_comment += f"\n\n{params['comment']}"
-                    github_updates["comment"] = github_comment
-
-                    # Update assignee if changed
-                    if params.get("assignee") and params["assignee"] != current_task.get("assignee"):
-                        github_updates["assignees"] = [params["assignee"]] if params["assignee"] else []
-
-                    # Use sync-safe update with current ETag
-                    current_etag = current_task.get("github_etag")
-                    success, error_msg, updated_issue = await GitHubUtils.update_github_issue_safe(
-                        str(current_task["github_issue_number"]), github_updates, expected_etag=current_etag
-                    )
-
-                    if success and updated_issue:
-                        github_updated = True
-                        # Update stored ETag and sync timestamp
-                        await self.db.update_record(
-                            "tasks",
-                            {"github_etag": updated_issue.get("etag"), "github_last_sync": datetime.now().isoformat()},
-                            "id = ?",
-                            [params["task_id"]],
-                        )
-                    else:
-                        github_error = error_msg or "GitHub update failed"
-                        self.logger.warning(f"GitHub sync failed for task {params['task_id']}: {github_error}")
-
-                except Exception as e:
-                    github_error = f"GitHub update error: {str(e)}"
-                    self.logger.error(f"GitHub integration error: {github_error}")
-            else:
-                if current_task.get("github_issue_number"):
-                    github_error = "GitHub not available"
-
-            # Create above-the-fold response
-            key_info = f"Task {params['task_id']} updated"
-            action_info = f"📈 {current_status} → {new_status}"
-
-            github_info = ""
-            if github_updated:
-                github_info = f"🔗 GitHub issue #{current_task['github_issue_number']} synced"
-            elif github_error:
-                github_info = f"⚠️ GitHub sync failed: {github_error}"
-
-            return self._create_above_fold_response("SUCCESS", key_info, action_info, github_info)
-
-        except Exception as e:
-            return self._create_error_response("Failed to update task", e)
-
-    async def _query_tasks(self, **params) -> list[TextContent]:
-        """Query tasks with filters"""
-        try:
-            where_clauses = []
-            where_params = []
-
-            # Handle requirement_id filter specially (requires join)
-            if params.get("requirement_id"):
-                tasks = await self.db.execute_query(
-                    """
-                    SELECT t.* FROM tasks t
-                    JOIN requirement_tasks rt ON t.id = rt.task_id
-                    WHERE rt.requirement_id = ?
-                    ORDER BY t.priority, t.created_at DESC
-                """,
-                    [params["requirement_id"]],
-                    fetch_all=True,
-                    row_factory=True,
-                )
-            else:
-                # Build standard filters
-                if params.get("status"):
-                    where_clauses.append("status = ?")
-                    where_params.append(params["status"])
-
-                if params.get("priority"):
-                    where_clauses.append("priority = ?")
-                    where_params.append(params["priority"])
-
-                if params.get("assignee"):
-                    where_clauses.append("assignee = ?")
-                    where_params.append(params["assignee"])
-
-                where_clause = " AND ".join(where_clauses) if where_clauses else ""
-
-                tasks = await self.db.get_records("tasks", "*", where_clause, where_params, "priority, created_at DESC")
-
-            if not tasks:
-                return self._create_above_fold_response("INFO", "No tasks found", "Try adjusting search criteria")
-
-            # Build filter description for above-the-fold
-            filters = []
-            if params.get("status"):
-                filters.append(f"status: {params['status']}")
-            if params.get("priority"):
-                filters.append(f"priority: {params['priority']}")
-            if params.get("assignee"):
-                filters.append(f"assignee: {params['assignee']}")
-            filter_desc = " | ".join(filters) if filters else "all tasks"
-
-            # Build detailed list
-            task_list = []
-            for task in tasks:
-                task_info = f"- {task['id']}: {task['title']} [{task['status']}] {task['priority']}"
-                if task["assignee"]:
-                    task_info += f" (👤 {task['assignee']})"
-                task_list.append(task_info)
-
-            key_info = self._format_count_summary("task", len(tasks), filter_desc)
-            details = "\n".join(task_list)
-
-            return self._create_above_fold_response("SUCCESS", key_info, "", details)
-
-        except Exception as e:
-            return self._create_error_response("Failed to query tasks", e)
-
-    async def _query_tasks_json(self, **params) -> list[TextContent]:
-        """Query tasks and return structured JSON data for UI"""
-        try:
-            import json
-
-            where_clauses = []
-            where_params = []
-
-            # Handle requirement_id filter specially (requires join)
-            if params.get("requirement_id"):
-                tasks = await self.db.execute_query(
-                    """
-                    SELECT t.* FROM tasks t
-                    JOIN requirement_tasks rt ON t.id = rt.task_id
-                    WHERE rt.requirement_id = ?
-                    ORDER BY t.priority, t.created_at DESC
-                """,
-                    [params["requirement_id"]],
-                    fetch_all=True,
-                    row_factory=True,
-                )
-            else:
-                # Build standard filters
-                if params.get("status"):
-                    where_clauses.append("status = ?")
-                    where_params.append(params["status"])
-
-                if params.get("priority"):
-                    where_clauses.append("priority = ?")
-                    where_params.append(params["priority"])
-
-                if params.get("assignee"):
-                    where_clauses.append("assignee = ?")
-                    where_params.append(params["assignee"])
-
-                where_clause = " AND ".join(where_clauses) if where_clauses else ""
-
-                tasks = await self.db.get_records("tasks", "*", where_clause, where_params, "priority, created_at DESC")
-
-            # Convert to list of dictionaries with JSON parsing
-            tasks_list = []
-            for task in tasks:
-                task_dict = dict(task) if hasattr(task, 'keys') else task
-
-                # Parse JSON fields if they exist as strings
-                json_fields = ['acceptance_criteria']
-                for field in json_fields:
-                    if field in task_dict and isinstance(task_dict[field], str):
-                        try:
-                            task_dict[field] = json.loads(task_dict[field]) if task_dict[field] else []
-                        except (json.JSONDecodeError, TypeError):
-                            task_dict[field] = []
-
-                tasks_list.append(task_dict)
-
-            return [TextContent(type="text", text=json.dumps(tasks_list))]
-
-        except Exception as e:
-            return self._create_error_response("Failed to query tasks for JSON", e)
-
-    async def _sync_from_github(self, task_id: str) -> list[TextContent]:
-        """Sync task from GitHub issue changes"""
-        try:
-            # Get current task with GitHub info
-            tasks = await self.db.get_records("tasks", "*", "id = ?", [task_id])
-
-            if not tasks:
-                return self._create_error_response("Task not found")
-
-            task = dict(tasks[0])  # Convert Row to dict for .get() method
-            github_issue_number = task.get("github_issue_number")
-
-            if not github_issue_number:
-                return self._create_error_response("Task has no associated GitHub issue")
-
-            # Use GitHubUtils sync method
-            success, sync_message, github_issue = await GitHubUtils.sync_task_with_github(
-                task,
-                force_sync=False,  # task is already a dict
-            )
-
-            # Handle conflicts as warnings, not errors
-            if not success and "conflicts detected" in sync_message.lower():
-                key_info = f"Sync conflicts for task {task_id}"
-                return self._create_above_fold_response("WARNING", key_info, sync_message)
-
-            # Handle other failures as errors
-            if not success:
-                return self._create_error_response(f"GitHub sync failed: {sync_message}")
-
-            # Apply GitHub changes to local task if needed
-            updates_applied = []
-
-            if github_issue:
-                # Map GitHub state to task status
-                github_state = github_issue.get("state", "")
-                current_status = task.get("status", "")
-
-                new_status = None
-                if github_state == "closed" and current_status != "Complete":
-                    new_status = "Complete"
-                elif github_state == "open" and current_status == "Complete":
-                    new_status = "In Progress"
-
-                if new_status:
-                    await self.db.update_record(
-                        "tasks",
-                        {
-                            "status": new_status,
-                            "github_last_sync": datetime.now(timezone.utc).isoformat(),
-                            "github_etag": github_issue.get("etag"),
-                        },
-                        "id = ?",
-                        [task_id],
-                    )
-                    updates_applied.append(f"Status: {current_status} → {new_status}")
-
-                # Update assignee if changed
-                github_assignees = [a.get("login", "") for a in github_issue.get("assignees", [])]
-                github_assignee = github_assignees[0] if github_assignees else None
-                current_assignee = task.get("assignee")
-
-                if github_assignee != current_assignee:
-                    await self.db.update_record("tasks", {"assignee": github_assignee}, "id = ?", [task_id])
-                    updates_applied.append(f"Assignee: {current_assignee or 'None'} → {github_assignee or 'None'}")
-
-            # Create response
-            if updates_applied:
-                key_info = f"Task {task_id} synced from GitHub"
-                action_info = " | ".join(updates_applied)
-                return self._create_above_fold_response("SUCCESS", key_info, action_info)
-            else:
-                key_info = f"Task {task_id} already in sync"
-                return self._create_above_fold_response("INFO", key_info, sync_message)
-
-        except Exception as e:
-            return self._create_error_response("Failed to sync from GitHub", e)
-
-    async def _bulk_sync_with_github(self, **params) -> list[TextContent]:
-        """Sync all tasks with GitHub issues"""
-        try:
-            # Get all tasks with GitHub issues
-            tasks_with_github = await self.db.get_records(
-                "tasks",
-                "id, title, status, github_issue_number, github_last_sync",
-                "github_issue_number IS NOT NULL AND github_issue_number != ''",
-                [],
-                "created_at DESC",
-            )
-
-            if not tasks_with_github:
-                return self._create_above_fold_response("INFO", "No tasks with GitHub issues found")
-
-            # Check sync status for each task
-            sync_results = []
-            conflicts_found = []
-            updates_applied = []
-
-            for task in tasks_with_github:
-                try:
-                    success, sync_message, github_issue = await GitHubUtils.sync_task_with_github(
-                        dict(task), force_sync=False
-                    )
-
-                    if not success:
-                        if "conflicts detected" in sync_message.lower():
-                            conflicts_found.append(f"{task['id']}: {sync_message}")
-                        else:
-                            sync_results.append(f"❌ {task['id']}: {sync_message}")
-                    elif "in sync" in sync_message.lower():
-                        sync_results.append(f"✅ {task['id']}: {sync_message}")
-                    else:
-                        # Apply updates if any changes detected
-                        task_updates = []
-
-                        if github_issue:
-                            # Update status if changed
-                            github_state = github_issue.get("state", "")
-                            current_status = task.get("status", "")
-
-                            new_status = None
-                            if github_state == "closed" and current_status != "Complete":
-                                new_status = "Complete"
-                            elif github_state == "open" and current_status == "Complete":
-                                new_status = "In Progress"
-
-                            update_data = {
-                                "github_last_sync": datetime.now(timezone.utc).isoformat(),
-                                "github_etag": github_issue.get("etag"),
-                            }
-
-                            if new_status:
-                                update_data["status"] = new_status
-                                task_updates.append(f"Status: {current_status} → {new_status}")
-
-                            # Update assignee if changed
-                            github_assignees = [a.get("login", "") for a in github_issue.get("assignees", [])]
-                            github_assignee = github_assignees[0] if github_assignees else None
-                            current_assignee = task.get("assignee")
-
-                            if github_assignee != current_assignee:
-                                update_data["assignee"] = github_assignee
-                                from_assignee = current_assignee or "None"
-                                to_assignee = github_assignee or "None"
-                                task_updates.append(f"Assignee: {from_assignee} → {to_assignee}")
-
-                            if task_updates:
-                                await self.db.update_record("tasks", update_data, "id = ?", [task["id"]])
-                                updates_applied.append(f"🔄 {task['id']}: {' | '.join(task_updates)}")
-                            else:
-                                sync_results.append(f"✅ {task['id']}: Updated sync metadata")
-
-                except Exception as e:
-                    sync_results.append(f"❌ {task['id']}: Error - {str(e)}")
-
-            # Build summary
-            total_tasks = len(tasks_with_github)
-            updates_count = len(updates_applied)
-            conflicts_count = len(conflicts_found)
-
-            key_info = f"Synced {total_tasks} GitHub task(s)"
-            action_info = f"🔄 {updates_count} updated | ⚠️ {conflicts_count} conflicts"
-
-            # Build detailed report
-            details = []
-            if updates_applied:
-                details.append("## Updated Tasks")
-                details.extend(updates_applied)
-                details.append("")
-
-            if conflicts_found:
-                details.append("## Conflicts Detected")
-                details.extend(conflicts_found)
-                details.append("")
-
-            if sync_results:
-                details.append("## All Sync Results")
-                details.extend(sync_results)
-
-            report = "\n".join(details)
-
-            return self._create_above_fold_response("SUCCESS", key_info, action_info, report)
-
-        except Exception as e:
-            return self._create_error_response("Failed to bulk sync with GitHub", e)
-
-    async def _get_task_details(self, **params) -> list[TextContent]:
-        """Get full task details"""
-        # Validate required parameters
+        task_id, _ = await self.db.generate_id("task")
+        data = self._build_task_data(task_id, project_id, params)
+        await self.db.insert_record("tasks", data)
+        await self._log_operation("task", task_id, "created", project_id=project_id)
+
+        key_info = f"Task {task_id} created"
+        action_info = f"{params['title']} | {params['priority']} | {params.get('effort', 'No effort')}"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+
+    # ------------------------------------------------------------------
+    # update_task (broad planning update)
+    # ------------------------------------------------------------------
+
+    async def _update_task(self, params: dict[str, Any]) -> list[TextContent]:
+        """Update task planning fields."""
         error = self._validate_required_params(params, ["task_id"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Get task
-            tasks = await self.db.get_records("tasks", "*", "id = ?", [params["task_id"]])
+        task_id = params["task_id"]
+        error = await self._validate_not_archived("task", task_id)
+        if error:
+            return self._create_error_response(error)
 
-            if not tasks:
-                return self._create_error_response("Task not found")
+        data: dict[str, Any] = {}
+        for field in self._UPDATABLE_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = params[field]
+        for field in self._UPDATABLE_JSON_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = self._safe_json_dumps(params[field])
 
-            task = dict(tasks[0])  # Convert Row to dict for .get() method
+        if not data:
+            return self._create_error_response("No fields to update")
 
-            # Build report
-            task_info = f"""# Task Details: {task["id"]}
+        await self.db.update_record("tasks", data, "id = ?", [task_id])
+        await self._log_operation("task", task_id, "updated")
+
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Task {task_id} updated",
+            f"Updated fields: {', '.join(data.keys())}",
+        )
+
+    # ------------------------------------------------------------------
+    # update_task_status (narrow write)
+    # ------------------------------------------------------------------
+
+    async def _update_task_status(self, params: dict[str, Any]) -> list[TextContent]:
+        """Update task status with transition validation. Narrow write."""
+        error = self._validate_required_params(params, ["task_id", "new_status"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        new_status = params["new_status"]
+
+        if new_status not in self.VALID_STATUSES:
+            return self._create_error_response(
+                f"Invalid status '{new_status}'. Valid: {', '.join(sorted(self.VALID_STATUSES))}"
+            )
+
+        # Get current task
+        rows = await self.db.get_records("tasks", "status", where_clause="id = ?", where_params=[task_id])
+        if not rows:
+            return self._create_error_response(f"Task not found: {task_id}")
+
+        current_status = rows[0]["status"]
+        allowed = self.VALID_TRANSITIONS.get(current_status, [])
+        if new_status not in allowed:
+            return self._create_error_response(
+                f"Invalid transition from '{current_status}' to '{new_status}'. "
+                f"Allowed transitions: {allowed or 'none (terminal state)'}"
+            )
+
+        # NARROW WRITE: only status + execution fields
+        data: dict[str, Any] = {"status": new_status}
+        if "execution_notes" in params and params["execution_notes"] is not None:
+            data["execution_notes"] = params["execution_notes"]
+        if "deviation_from_plan" in params and params["deviation_from_plan"] is not None:
+            data["deviation_from_plan"] = params["deviation_from_plan"]
+
+        await self.db.update_record("tasks", data, "id = ?", [task_id])
+
+        key_info = f"Task {task_id} updated"
+        action_info = f"{current_status} -> {new_status}"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+
+    # ------------------------------------------------------------------
+    # archive_task
+    # ------------------------------------------------------------------
+
+    async def _archive_task(self, params: dict[str, Any]) -> list[TextContent]:
+        """Archive a task (soft delete)."""
+        error = self._validate_required_params(params, ["task_id"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        error = await self._validate_entity_exists("task", task_id)
+        if error:
+            return self._create_error_response(error)
+
+        await self.db.execute_query(
+            "UPDATE tasks SET is_archived = 1, archived_at = datetime('now') WHERE id = ?",
+            [task_id],
+        )
+        await self._log_operation("task", task_id, "archived")
+
+        return self._create_above_fold_response("SUCCESS", f"Task {task_id} archived")
+
+    # ------------------------------------------------------------------
+    # query_tasks
+    # ------------------------------------------------------------------
+
+    async def _query_tasks(self, params: dict[str, Any]) -> list[TextContent]:
+        """Query tasks with filters."""
+        conditions, query_params = self._build_query_filters(params)
+        where_clause = " AND ".join(conditions) if conditions else ""
+
+        tasks = await self.db.get_records(
+            "tasks", "*",
+            where_clause=where_clause,
+            where_params=query_params,
+            order_by="priority, created_at DESC",
+        )
+
+        if not tasks:
+            return self._create_above_fold_response("INFO", "No tasks found", "Try adjusting search criteria")
+
+        lines = []
+        for task in tasks:
+            info = f"- {task['id']}: {task['title']} [{task['status']}] {task['priority']}"
+            if task["assignee"]:
+                info += f" ({task['assignee']})"
+            lines.append(info)
+
+        filter_desc = self._build_filter_description(params)
+        key_info = self._format_count_summary("task", len(tasks), filter_desc)
+        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # query_tasks_json
+    # ------------------------------------------------------------------
+
+    async def _query_tasks_json(self, params: dict[str, Any]) -> list[TextContent]:
+        """Query tasks and return structured JSON."""
+        conditions, query_params = self._build_query_filters(params)
+        where_clause = " AND ".join(conditions) if conditions else ""
+
+        tasks = await self.db.get_records(
+            "tasks", "*",
+            where_clause=where_clause,
+            where_params=query_params,
+            order_by="priority, created_at DESC",
+        )
+
+        json_fields = [
+            "acceptance_criteria", "files_touched", "verification_commands", "public_symbols",
+        ]
+        result_list = []
+        for task in tasks:
+            task_dict = dict(task) if hasattr(task, "keys") else task
+            for field in json_fields:
+                if field in task_dict and isinstance(task_dict[field], str):
+                    try:
+                        task_dict[field] = json.loads(task_dict[field]) if task_dict[field] else []
+                    except (json.JSONDecodeError, TypeError):
+                        task_dict[field] = []
+            result_list.append(task_dict)
+
+        return [TextContent(type="text", text=json.dumps(result_list))]
+
+    # ------------------------------------------------------------------
+    # get_task_details
+    # ------------------------------------------------------------------
+
+    async def _get_task_details(self, params: dict[str, Any]) -> list[TextContent]:
+        """Get full task details with relationships."""
+        error = self._validate_required_params(params, ["task_id"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        rows = await self.db.get_records("tasks", "*", where_clause="id = ?", where_params=[task_id])
+        if not rows:
+            return self._create_error_response(f"Task not found: {task_id}")
+
+        task = dict(rows[0])
+
+        # Build report
+        report = f"""# Task Details: {task["id"]}
 
 ## Basic Information
 - **Title**: {task["title"]}
@@ -738,92 +500,444 @@ class TaskHandler(BaseHandler):
 - **Priority**: {task["priority"]}
 - **Effort**: {task["effort"] or "Not specified"}
 - **Assignee**: {task["assignee"] or "Unassigned"}
+- **Project**: {task["project_id"]}
 - **Created**: {task["created_at"]}
-- **Updated**: {task["updated_at"]}"""
-
-            if task["github_issue_number"]:
-                task_info += f"\n- **GitHub Issue**: #{task['github_issue_number']} - {task['github_issue_url']}"
-
-            task_info += f"""
+- **Updated**: {task["updated_at"]}
 
 ## Description
 {task["user_story"] or "No user story provided"}
 
 ## Acceptance Criteria
 """
+        criteria = self._safe_json_loads(task.get("acceptance_criteria"))
+        if criteria:
+            for c in criteria:
+                report += f"- {c}\n"
+        else:
+            report += "No acceptance criteria defined\n"
 
-            if task["acceptance_criteria"]:
-                criteria = self._safe_json_loads(task["acceptance_criteria"])
-                if criteria:
-                    for criterion in criteria:
-                        task_info += f"- {criterion}\n"
-                else:
-                    task_info += "No acceptance criteria defined\n"
-            else:
-                task_info += "No acceptance criteria defined\n"
+        # Planning fields
+        planning_items = []
+        if task.get("scope_boundaries"):
+            planning_items.append(f"- **Scope Boundaries**: {task['scope_boundaries']}")
+        if task.get("technical_outline"):
+            planning_items.append(f"- **Technical Outline**: {task['technical_outline']}")
+        if task.get("files_touched"):
+            files = self._safe_json_loads(task["files_touched"])
+            if files:
+                planning_items.append(f"- **Files Touched**: {', '.join(files)}")
+        if task.get("verification_commands"):
+            cmds = self._safe_json_loads(task["verification_commands"])
+            if cmds:
+                planning_items.append(f"- **Verification Commands**: {', '.join(cmds)}")
+        if task.get("public_symbols"):
+            syms = self._safe_json_loads(task["public_symbols"])
+            if syms:
+                planning_items.append(f"- **Public Symbols**: {', '.join(syms)}")
+        if task.get("risk_notes"):
+            planning_items.append(f"- **Risk Notes**: {task['risk_notes']}")
 
-            # Get linked requirements
-            requirements = await self.db.execute_query(
-                """
-                SELECT r.id, r.title FROM requirements r
-                JOIN requirement_tasks rt ON r.id = rt.requirement_id
-                WHERE rt.task_id = ?
+        if planning_items:
+            report += "\n## Planning\n" + "\n".join(planning_items) + "\n"
+
+        # Execution fields
+        if task.get("execution_notes") or task.get("deviation_from_plan"):
+            report += "\n## Execution\n"
+            if task.get("execution_notes"):
+                report += f"- **Execution Notes**: {task['execution_notes']}\n"
+            if task.get("deviation_from_plan"):
+                report += f"- **Deviation from Plan**: {task['deviation_from_plan']}\n"
+
+        # Linked requirements via relationships
+        requirements = await self._get_linked_requirements(task_id)
+        if requirements:
+            report += f"\n## Linked Requirements ({len(requirements)})\n"
+            for req in requirements:
+                report += f"- {req['id']}: {req['title']}\n"
+
+        # Linked ADRs via relationships
+        adrs = await self._get_linked_adrs(task_id)
+        if adrs:
+            report += f"\n## Linked Architecture Decisions ({len(adrs)})\n"
+            for adr in adrs:
+                report += f"- {adr['id']}: {adr['title']}\n"
+
+        # Child tasks
+        children = await self.db.get_records(
+            "tasks", "id, title, status",
+            where_clause="parent_task_id = ? AND is_archived = 0",
+            where_params=[task_id],
+        )
+        if children:
+            report += f"\n## Subtasks ({len(children)})\n"
+            for child in children:
+                report += f"- {child['id']}: {child['title']} [{child['status']}]\n"
+
+        # Parent task
+        if task.get("parent_task_id"):
+            parent_rows = await self.db.get_records(
+                "tasks", "id, title, status",
+                where_clause="id = ?",
+                where_params=[task["parent_task_id"]],
+            )
+            if parent_rows:
+                p = parent_rows[0]
+                report += f"\n## Parent Task\n- {p['id']}: {p['title']} [{p['status']}]\n"
+
+        key_info = self._format_status_summary("Task", task["id"], task["status"])
+        action_info = f"{task['title']} | {task['priority']} | {task['effort'] or 'No effort'}"
+        if task["assignee"]:
+            action_info += f" | {task['assignee']}"
+
+        return self._create_above_fold_response("INFO", key_info, action_info, report)
+
+    # ------------------------------------------------------------------
+    # batch_create_tasks
+    # ------------------------------------------------------------------
+
+    async def _batch_create_tasks(self, params: dict[str, Any]) -> list[TextContent]:
+        """Create multiple tasks atomically."""
+        error = self._validate_required_params(params, ["project_id", "tasks"])
+        if error:
+            return self._create_error_response(error)
+
+        project_id = params["project_id"]
+        task_defs = params["tasks"]
+
+        if not task_defs:
+            return self._create_error_response("No tasks provided in batch")
+
+        error = await self._validate_project_exists(project_id)
+        if error:
+            return self._create_error_response(error)
+
+        # Validate all tasks before creating any
+        for i, task_def in enumerate(task_defs):
+            if "title" not in task_def or not task_def["title"]:
+                return self._create_error_response(
+                    f"Task at index {i} is missing required field: title"
+                )
+            if "priority" not in task_def or not task_def["priority"]:
+                return self._create_error_response(
+                    f"Task at index {i} is missing required field: priority"
+                )
+
+        # Create all tasks
+        created_ids = []
+        for task_def in task_defs:
+            task_id, _ = await self.db.generate_id("task")
+            data = self._build_task_data(task_id, project_id, task_def)
+            await self.db.insert_record("tasks", data)
+            created_ids.append(task_id)
+
+        await self._log_operation("task", f"batch:{len(created_ids)}", "batch_created", project_id=project_id)
+
+        ids_str = ", ".join(created_ids)
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Created {len(created_ids)} tasks",
+            ids_str,
+        )
+
+    # ------------------------------------------------------------------
+    # clone_task
+    # ------------------------------------------------------------------
+
+    async def _clone_task(self, params: dict[str, Any]) -> list[TextContent]:
+        """Clone a task with a new ID."""
+        error = self._validate_required_params(params, ["task_id"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        include_children = params.get("include_children", False)
+        target_project_id = params.get("target_project_id")
+
+        # Get original task
+        rows = await self.db.get_records("tasks", "*", where_clause="id = ?", where_params=[task_id])
+        if not rows:
+            return self._create_error_response(f"Task not found: {task_id}")
+
+        original = dict(rows[0])
+
+        # Validate target project if specified
+        project_id = target_project_id or original["project_id"]
+        if target_project_id:
+            error = await self._validate_project_exists(target_project_id)
+            if error:
+                return self._create_error_response(error)
+
+        # Clone the task (and optionally children)
+        cloned_ids = await self._clone_task_recursive(
+            original, project_id, include_children, parent_task_id=None
+        )
+
+        ids_str = ", ".join(cloned_ids)
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Cloned {len(cloned_ids)} task(s)",
+            ids_str,
+        )
+
+    async def _clone_task_recursive(
+        self,
+        original: dict[str, Any],
+        project_id: str,
+        include_children: bool,
+        parent_task_id: str | None,
+    ) -> list[str]:
+        """Recursively clone a task and optionally its children."""
+        new_id, _ = await self.db.generate_id("task")
+
+        # Build clone data - copy planning fields, reset execution fields
+        clone_data: dict[str, Any] = {
+            "id": new_id,
+            "project_id": project_id,
+            "title": original["title"],
+            "status": "Not Started",
+            "priority": original["priority"],
+        }
+
+        # Copy optional fields
+        for field in ["effort", "user_story", "acceptance_criteria", "assignee",
+                       "scope_boundaries", "technical_outline", "files_touched",
+                       "verification_commands", "public_symbols", "risk_notes"]:
+            if original.get(field) is not None:
+                clone_data[field] = original[field]
+
+        # Set parent if provided (for recursive cloning)
+        if parent_task_id:
+            clone_data["parent_task_id"] = parent_task_id
+
+        await self.db.insert_record("tasks", clone_data)
+
+        # Copy relationships (where original task is the source)
+        rels = await self.db.get_records(
+            "relationships",
+            where_clause="source_id = ? AND source_type = 'task'",
+            where_params=[original["id"]],
+        )
+        for rel in rels:
+            # Skip parent relationships (handled by parent_task_id)
+            if rel["relationship_type"] == "parent":
+                continue
+            clone_rel_id = f"rel-{new_id}-{rel['target_id']}-{rel['relationship_type']}"
+            await self.db.insert_record("relationships", {
+                "id": clone_rel_id,
+                "source_type": "task",
+                "source_id": new_id,
+                "target_type": rel["target_type"],
+                "target_id": rel["target_id"],
+                "relationship_type": rel["relationship_type"],
+                "project_id": project_id,
+            })
+
+        cloned_ids = [new_id]
+
+        # Recursively clone children if requested
+        if include_children:
+            children = await self.db.get_records(
+                "tasks",
+                where_clause="parent_task_id = ? AND is_archived = 0",
+                where_params=[original["id"]],
+            )
+            for child in children:
+                child_dict = dict(child)
+                child_cloned = await self._clone_task_recursive(
+                    child_dict, project_id, include_children=True, parent_task_id=new_id
+                )
+                cloned_ids.extend(child_cloned)
+
+        return cloned_ids
+
+    # ------------------------------------------------------------------
+    # Context tools
+    # ------------------------------------------------------------------
+
+    async def _get_task_requirement_context(self, params: dict[str, Any]) -> list[TextContent]:
+        """Get requirements linked to this task."""
+        error = self._validate_required_params(params, ["task_id"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        error = await self._validate_entity_exists("task", task_id)
+        if error:
+            return self._create_error_response(error)
+
+        requirements = await self._get_linked_requirements(task_id)
+
+        if not requirements:
+            return self._create_above_fold_response(
+                "INFO", f"No linked requirements for {task_id}"
+            )
+
+        lines = []
+        for req in requirements:
+            lines.append(f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}")
+
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"{len(requirements)} requirement(s) linked to {task_id}",
+            "",
+            "\n".join(lines),
+        )
+
+    async def _get_task_adr_context(self, params: dict[str, Any]) -> list[TextContent]:
+        """Get ADRs linked to this task."""
+        error = self._validate_required_params(params, ["task_id"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        error = await self._validate_entity_exists("task", task_id)
+        if error:
+            return self._create_error_response(error)
+
+        adrs = await self._get_linked_adrs(task_id)
+
+        if not adrs:
+            return self._create_above_fold_response(
+                "INFO", f"No linked ADRs for {task_id}"
+            )
+
+        lines = []
+        for adr in adrs:
+            lines.append(f"- {adr['id']}: {adr['title']} [{adr['status']}]")
+
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"{len(adrs)} ADR(s) linked to {task_id}",
+            "",
+            "\n".join(lines),
+        )
+
+    async def _get_task_full_context(self, params: dict[str, Any]) -> list[TextContent]:
+        """Get both requirements AND ADRs linked to this task."""
+        error = self._validate_required_params(params, ["task_id"])
+        if error:
+            return self._create_error_response(error)
+
+        task_id = params["task_id"]
+        error = await self._validate_entity_exists("task", task_id)
+        if error:
+            return self._create_error_response(error)
+
+        requirements = await self._get_linked_requirements(task_id)
+        adrs = await self._get_linked_adrs(task_id)
+
+        lines = []
+        if requirements:
+            lines.append(f"## Requirements ({len(requirements)})")
+            for req in requirements:
+                lines.append(f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}")
+            lines.append("")
+
+        if adrs:
+            lines.append(f"## Architecture Decisions ({len(adrs)})")
+            for adr in adrs:
+                lines.append(f"- {adr['id']}: {adr['title']} [{adr['status']}]")
+
+        if not requirements and not adrs:
+            return self._create_above_fold_response(
+                "INFO", f"No linked entities for {task_id}"
+            )
+
+        total = len(requirements) + len(adrs)
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"{total} linked entity(ies) for {task_id}",
+            f"{len(requirements)} requirement(s), {len(adrs)} ADR(s)",
+            "\n".join(lines),
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _build_task_data(self, task_id: str, project_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Build a task data dict for INSERT."""
+        data: dict[str, Any] = {
+            "id": task_id,
+            "project_id": project_id,
+            "title": params["title"],
+            "priority": params["priority"],
+            "status": "Not Started",
+        }
+        # Optional scalar fields
+        for field in ["effort", "user_story", "assignee", "parent_task_id",
+                       "scope_boundaries", "technical_outline", "risk_notes"]:
+            if field in params and params[field] is not None:
+                data[field] = params[field]
+        # Optional JSON array fields
+        for field in ["acceptance_criteria", "files_touched", "verification_commands", "public_symbols"]:
+            if field in params and params[field] is not None:
+                data[field] = self._safe_json_dumps(params[field])
+        return data
+
+    def _build_query_filters(self, params: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """Build WHERE conditions for query_tasks / query_tasks_json."""
+        conditions: list[str] = []
+        query_params: list[Any] = []
+
+        include_archived = params.get("include_archived", False)
+        if not include_archived:
+            conditions.append("is_archived = 0")
+
+        if params.get("project_id"):
+            conditions.append("project_id = ?")
+            query_params.append(params["project_id"])
+        if params.get("status"):
+            conditions.append("status = ?")
+            query_params.append(params["status"])
+        if params.get("priority"):
+            conditions.append("priority = ?")
+            query_params.append(params["priority"])
+        if params.get("assignee"):
+            conditions.append("assignee = ?")
+            query_params.append(params["assignee"])
+
+        return conditions, query_params
+
+    def _build_filter_description(self, params: dict[str, Any]) -> str:
+        """Build a human-readable filter description."""
+        filters = []
+        if params.get("project_id"):
+            filters.append(f"project: {params['project_id']}")
+        if params.get("status"):
+            filters.append(f"status: {params['status']}")
+        if params.get("priority"):
+            filters.append(f"priority: {params['priority']}")
+        if params.get("assignee"):
+            filters.append(f"assignee: {params['assignee']}")
+        return " | ".join(filters) if filters else "all tasks"
+
+    async def _get_linked_requirements(self, task_id: str) -> list:
+        """Get requirements linked to a task via relationships (both directions)."""
+        return await self.db.execute_query(
+            """
+            SELECT DISTINCT r.* FROM requirements r
+            JOIN relationships rel ON
+                (rel.source_id = ? AND rel.target_id = r.id AND rel.target_type = 'requirement')
+                OR (rel.target_id = ? AND rel.source_id = r.id AND rel.source_type = 'requirement')
+            WHERE r.is_archived = 0
             """,
-                [params["task_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
+            [task_id, task_id],
+            fetch_all=True,
+            row_factory=True,
+        )
 
-            if requirements:
-                task_info += f"\n## Linked Requirements ({len(requirements)})\n"
-                for req in requirements:
-                    task_info += f"- {req['id']}: {req['title']}\n"
-
-            # Get subtasks if this is a parent task
-            # Query relationships table for child tasks
-            child_relationship_records = await self.db.get_records(
-                "relationships", "source_id",
-                "target_type = 'task' AND target_id = ? AND relationship_type = 'parent'",
-                [params["task_id"]]
-            )
-
-            subtasks = []
-            if child_relationship_records:
-                child_task_ids = [r["source_id"] for r in child_relationship_records]
-                for child_task_id in child_task_ids:
-                    task_records = await self.db.get_records("tasks", "id, title, status", "id = ?", [child_task_id])
-                    if task_records:
-                        subtasks.extend(task_records)
-
-            if subtasks:
-                task_info += f"\n## Subtasks ({len(subtasks)})\n"
-                for subtask in subtasks:
-                    task_info += f"- {subtask['id']}: {subtask['title']} [{subtask['status']}]\n"
-
-            # Show parent task if this is a subtask
-            # Query relationships table for parent tasks
-            parent_relationship_records = await self.db.get_records(
-                "relationships", "target_id",
-                "source_type = 'task' AND source_id = ? AND relationship_type = 'parent'",
-                [params["task_id"]]
-            )
-
-            if parent_relationship_records:
-                parent_task_id = parent_relationship_records[0]["target_id"]
-                parent_tasks = await self.db.get_records("tasks", "id, title, status", "id = ?", [parent_task_id])
-
-                if parent_tasks:
-                    parent = dict(parent_tasks[0])  # Convert Row to dict for consistency
-                    task_info += "\n## Parent Task\n"
-                    task_info += f"- {parent['id']}: {parent['title']} [{parent['status']}]\n"
-
-            # Create above-the-fold summary
-            key_info = self._format_status_summary("Task", task["id"], task["status"])
-            action_info = f"📋 {task['title']} | {task['priority']} | {task['effort'] or 'No effort'}"
-            if task["assignee"]:
-                action_info += f" | 👤 {task['assignee']}"
-
-            return self._create_above_fold_response("INFO", key_info, action_info, task_info)
-
-        except Exception as e:
-            return self._create_error_response("Failed to get task details", e)
+    async def _get_linked_adrs(self, task_id: str) -> list:
+        """Get architecture decisions linked to a task via relationships (both directions)."""
+        return await self.db.execute_query(
+            """
+            SELECT DISTINCT a.* FROM architecture a
+            JOIN relationships rel ON
+                (rel.source_id = ? AND rel.target_id = a.id AND rel.target_type = 'architecture')
+                OR (rel.target_id = ? AND rel.source_id = a.id AND rel.source_type = 'architecture')
+            WHERE a.is_archived = 0
+            """,
+            [task_id, task_id],
+            fetch_all=True,
+            row_factory=True,
+        )

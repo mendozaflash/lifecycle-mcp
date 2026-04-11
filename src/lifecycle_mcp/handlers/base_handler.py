@@ -110,13 +110,80 @@ class BaseHandler(ABC):
             self.logger.warning(f"Failed to serialize to JSON: {str(e)}")
             return "[]"
 
-    async def _log_operation(self, entity_type: str, entity_id: str, event_type: str, actor: str = "MCP User"):
-        """Log lifecycle events"""
+    # ------------------------------------------------------------------
+    # Validation helpers (v2)
+    # ------------------------------------------------------------------
+
+    _ENTITY_TABLE_MAP = {
+        "project": "projects",
+        "requirement": "requirements",
+        "task": "tasks",
+        "architecture": "architecture",
+    }
+
+    async def _validate_project_exists(self, project_id: str) -> str | None:
+        """Check that a project exists.  Returns error string if not found, None if OK."""
+        exists = await self.db.check_exists("projects", "id = ?", [project_id])
+        if not exists:
+            return f"Project not found: {project_id}"
+        return None
+
+    async def _validate_entity_exists(self, entity_type: str, entity_id: str) -> str | None:
+        """Check that an entity exists.  Returns error string if not found, None if OK.
+
+        *entity_type* must be one of: project, requirement, task, architecture.
+        """
+        table = self._ENTITY_TABLE_MAP.get(entity_type)
+        if table is None:
+            return f"Unknown entity type: {entity_type}"
+        exists = await self.db.check_exists(table, "id = ?", [entity_id])
+        if not exists:
+            return f"{entity_type.capitalize()} not found: {entity_id}"
+        return None
+
+    async def _validate_not_archived(self, entity_type: str, entity_id: str) -> str | None:
+        """Check that an entity is not archived.
+
+        Returns error string if archived or not found, None if active.
+        """
+        table = self._ENTITY_TABLE_MAP.get(entity_type)
+        if table is None:
+            return f"Unknown entity type: {entity_type}"
+        row = await self.db.execute_query(
+            f"SELECT is_archived FROM {table} WHERE id = ?",
+            [entity_id],
+            fetch_one=True,
+            row_factory=True,
+        )
+        if row is None:
+            return f"{entity_type.capitalize()} not found: {entity_id}"
+        if row["is_archived"]:
+            return f"{entity_type.capitalize()} is archived: {entity_id}"
+        return None
+
+    # ------------------------------------------------------------------
+    # Event logging
+    # ------------------------------------------------------------------
+
+    async def _log_operation(
+        self,
+        entity_type: str,
+        entity_id: str,
+        event_type: str,
+        actor: str = "MCP User",
+        project_id: str | None = None,
+    ):
+        """Log lifecycle events, optionally scoped to a project."""
         try:
-            await self.db.insert_record(
-                "lifecycle_events",
-                {"entity_type": entity_type, "entity_id": entity_id, "event_type": event_type, "actor": actor},
-            )
+            data: dict[str, Any] = {
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "event_type": event_type,
+                "actor": actor,
+            }
+            if project_id is not None:
+                data["project_id"] = project_id
+            await self.db.insert_record("lifecycle_events", data)
         except Exception as e:
             self.logger.warning(f"Failed to log event: {str(e)}")
 

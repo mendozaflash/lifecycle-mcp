@@ -40,8 +40,9 @@ class RelationshipHandler(BaseHandler):
                                 "relates",     # generic relationship
                             ],
                         },
+                        "project_id": {"type": "string", "description": "Project ID"},
                     },
-                    "required": ["source_id", "target_id", "relationship_type"],
+                    "required": ["source_id", "target_id", "relationship_type", "project_id"],
                 },
             },
             {
@@ -67,6 +68,7 @@ class RelationshipHandler(BaseHandler):
                         "relationship_type": {"type": "string"},
                         "include_incoming": {"type": "boolean", "default": True},
                         "include_outgoing": {"type": "boolean", "default": True},
+                        "project_id": {"type": "string", "description": "Filter by project"},
                     },
                 },
             },
@@ -92,6 +94,7 @@ class RelationshipHandler(BaseHandler):
                             "items": {"type": "string", "enum": ["requirement", "task", "architecture"]},
                             "default": ["requirement", "task", "architecture"],
                         },
+                        "project_id": {"type": "string", "description": "Filter by project"},
                     },
                 },
             },
@@ -118,13 +121,14 @@ class RelationshipHandler(BaseHandler):
 
     async def _create_relationship(self, args: dict[str, Any]) -> list[TextContent]:
         """Create a relationship between two entities"""
-        error = self._validate_required_params(args, ["source_id", "target_id", "relationship_type"])
+        error = self._validate_required_params(args, ["source_id", "target_id", "relationship_type", "project_id"])
         if error:
             return self._create_error_response(error)
 
         source_id = args["source_id"]
         target_id = args["target_id"]
         rel_type = args["relationship_type"]
+        project_id = args["project_id"]
 
         # Determine entity types from IDs
         source_type = self._get_entity_type(source_id)
@@ -132,6 +136,16 @@ class RelationshipHandler(BaseHandler):
 
         if not source_type or not target_type:
             return self._create_error_response(f"Invalid entity IDs: {source_id}, {target_id}")
+
+        # Validate source entity exists
+        source_err = await self._validate_entity_exists(source_type, source_id)
+        if source_err:
+            return self._create_error_response(source_err)
+
+        # Validate target entity exists
+        target_err = await self._validate_entity_exists(target_type, target_id)
+        if target_err:
+            return self._create_error_response(target_err)
 
         # Validate relationship makes sense
         if not self._validate_relationship(source_type, target_type, rel_type):
@@ -146,11 +160,11 @@ class RelationshipHandler(BaseHandler):
             )
 
         # Create the relationship in appropriate table
-        success = await self._insert_relationship(source_id, target_id, source_type, target_type, rel_type)
+        success = await self._insert_relationship(source_id, target_id, source_type, target_type, rel_type, project_id)
 
         if success:
             # Log the operation
-            await self._log_operation("relationship", f"{source_id}-{target_id}", "created")
+            await self._log_operation("relationship", f"{source_id}-{target_id}", "created", project_id=project_id)
 
             return self._create_above_fold_response(
                 "SUCCESS",
@@ -197,8 +211,9 @@ class RelationshipHandler(BaseHandler):
         """Query relationships for a specific entity or type"""
         entity_id = args.get("entity_id")
         rel_type = args.get("relationship_type")
+        project_id = args.get("project_id")
 
-        relationships = await self._fetch_all_relationships()
+        relationships = await self._fetch_all_relationships(project_id=project_id)
 
         # Filter by entity_id if specified
         if entity_id:
@@ -238,8 +253,9 @@ class RelationshipHandler(BaseHandler):
     async def _query_all_relationships(self, args: dict[str, Any]) -> list[TextContent]:
         """Get all relationships for graph visualization"""
         entity_types = args.get("entity_types", ["requirement", "task", "architecture"])
+        project_id = args.get("project_id")
 
-        all_relationships = await self._fetch_all_relationships()
+        all_relationships = await self._fetch_all_relationships(project_id=project_id)
 
         # Filter by entity types if specified
         if entity_types != ["requirement", "task", "architecture"]:
@@ -262,8 +278,10 @@ class RelationshipHandler(BaseHandler):
             return "requirement"
         elif entity_id.startswith("TASK-"):
             return "task"
-        elif entity_id.startswith("ADR-") or entity_id.startswith("TDD-"):
+        elif entity_id.startswith("ADR-"):
             return "architecture"
+        elif entity_id.startswith("PROJ-"):
+            return "project"
         return None
 
     def _validate_relationship(self, source_type: str, target_type: str, rel_type: str) -> bool:
@@ -303,21 +321,25 @@ class RelationshipHandler(BaseHandler):
         )
         return len(results) > 0
 
-    async def _insert_relationship(self, source_id: str, target_id: str, source_type: str, target_type: str, rel_type: str) -> bool:
+    async def _insert_relationship(self, source_id: str, target_id: str, source_type: str, target_type: str, rel_type: str, project_id: str | None = None) -> bool:
         """Insert relationship into unified relationships table"""
         try:
             # Generate unique relationship ID
             relationship_id = f"rel-{source_id}-{target_id}-{rel_type}"
 
-            # Insert into unified relationships table
-            await self.db.insert_record("relationships", {
+            data: dict[str, Any] = {
                 "id": relationship_id,
                 "source_type": source_type,
                 "source_id": source_id,
                 "target_type": target_type,
                 "target_id": target_id,
-                "relationship_type": rel_type
-            })
+                "relationship_type": rel_type,
+            }
+            if project_id is not None:
+                data["project_id"] = project_id
+
+            # Insert into unified relationships table
+            await self.db.insert_record("relationships", data)
 
             return True
         except Exception as e:
@@ -352,12 +374,17 @@ class RelationshipHandler(BaseHandler):
             self.logger.error(f"Failed to delete relationship: {str(e)}")
             return 0
 
-    async def _fetch_all_relationships(self) -> list[dict[str, Any]]:
+    async def _fetch_all_relationships(self, project_id: str | None = None) -> list[dict[str, Any]]:
         """Fetch all relationships from unified relationships table"""
         relationships = []
 
-        # Get all relationships from unified table
-        relationship_rows = await self.db.get_records("relationships", "*")
+        # Get all relationships from unified table, optionally filtered by project
+        if project_id:
+            relationship_rows = await self.db.get_records(
+                "relationships", "*", "project_id = ?", [project_id]
+            )
+        else:
+            relationship_rows = await self.db.get_records("relationships", "*")
 
         for row in relationship_rows:
             source_id = row["source_id"]

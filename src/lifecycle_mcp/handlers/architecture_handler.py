@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Architecture Handler for MCP Lifecycle Management Server
-Handles all architecture decision-related operations
+Architecture Handler for MCP Lifecycle Management Server (v2)
+
+Handles all architecture decision-related operations using the v2 schema:
+- Sequential IDs via generate_id("architecture")
+- Project-scoped ADRs (project_id FK)
+- Polymorphic relationships table
+- No type/decision_outcome columns -- uses decision column
+- Supersession via superseded_by FK + Deprecated status (no Superseded status)
+- Archive (soft delete) support
 """
 
 import json
@@ -13,37 +20,75 @@ from .base_handler import BaseHandler
 
 
 class ArchitectureHandler(BaseHandler):
-    """Handler for architecture decision-related MCP tools"""
+    """Handler for architecture decision-related MCP tools (v2 schema)"""
+
+    VALID_TRANSITIONS = {
+        "Draft": ["Under Review", "Deprecated"],
+        "Under Review": ["Proposed", "Approved", "Deprecated"],
+        "Proposed": ["Accepted", "Rejected", "Deprecated"],
+        "Accepted": ["Implemented", "Deprecated"],
+        "Rejected": ["Deprecated"],
+        "Deprecated": [],
+        "Approved": ["Implemented", "Deprecated"],
+        "Implemented": ["Deprecated"],
+    }
+
+    # Fields that may be updated via update_architecture_decision
+    _UPDATABLE_FIELDS = ["title", "context", "decision"]
+    _UPDATABLE_JSON_FIELDS = ["decision_drivers", "considered_options", "consequences", "authors"]
 
     def __init__(self, db_manager, mcp_client=None):
         """Initialize handler with database manager and optional MCP client"""
         super().__init__(db_manager)
         self.mcp_client = mcp_client
+        self._testing_mode = False
+
+    # ------------------------------------------------------------------
+    # Tool definitions
+    # ------------------------------------------------------------------
 
     def get_tool_definitions(self) -> list[dict[str, Any]]:
         """Return architecture tool definitions"""
         return [
             {
                 "name": "create_architecture_decision",
-                "description": "Record architecture decision (ADR)",
+                "description": "Record architecture decision (ADR) linked to a project",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "requirement_ids": {"type": "array", "items": {"type": "string"}},
+                        "project_id": {"type": "string", "description": "Project ID (PROJ-XXXX)"},
                         "title": {"type": "string"},
                         "context": {"type": "string"},
                         "decision": {"type": "string"},
-                        "consequences": {"type": "object"},
                         "decision_drivers": {"type": "array", "items": {"type": "string"}},
                         "considered_options": {"type": "array", "items": {"type": "string"}},
+                        "consequences": {"type": "object"},
                         "authors": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["requirement_ids", "title", "context", "decision"],
+                    "required": ["project_id", "title", "context", "decision"],
+                },
+            },
+            {
+                "name": "update_architecture_decision",
+                "description": "Update architecture decision fields (title, context, decision, etc.)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "architecture_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "context": {"type": "string"},
+                        "decision": {"type": "string"},
+                        "decision_drivers": {"type": "array", "items": {"type": "string"}},
+                        "considered_options": {"type": "array", "items": {"type": "string"}},
+                        "consequences": {"type": "object"},
+                        "authors": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["architecture_id"],
                 },
             },
             {
                 "name": "update_architecture_status",
-                "description": "Update architecture decision status",
+                "description": "Update architecture decision status with transition validation",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -51,20 +96,28 @@ class ArchitectureHandler(BaseHandler):
                         "new_status": {
                             "type": "string",
                             "enum": [
-                                "Proposed",
-                                "Accepted",
-                                "Rejected",
-                                "Deprecated",
-                                "Superseded",
-                                "Draft",
-                                "Under Review",
-                                "Approved",
-                                "Implemented",
+                                "Draft", "Under Review", "Proposed", "Accepted",
+                                "Rejected", "Deprecated", "Approved", "Implemented",
                             ],
                         },
                         "comment": {"type": "string"},
+                        "superseded_by": {
+                            "type": "string",
+                            "description": "ADR ID that supersedes this one (used with Deprecated status)",
+                        },
                     },
                     "required": ["architecture_id", "new_status"],
+                },
+            },
+            {
+                "name": "archive_architecture_decision",
+                "description": "Archive an architecture decision (soft delete)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "architecture_id": {"type": "string", "description": "ADR ID (ADR-XXXX)"},
+                    },
+                    "required": ["architecture_id"],
                 },
             },
             {
@@ -73,10 +126,13 @@ class ArchitectureHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string"},
                         "status": {"type": "string"},
-                        "type": {"type": "string"},
-                        "requirement_id": {"type": "string"},
                         "search_text": {"type": "string"},
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Include archived decisions (default: false)",
+                        },
                     },
                 },
             },
@@ -86,16 +142,19 @@ class ArchitectureHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {"type": "string"},
                         "status": {"type": "string"},
-                        "type": {"type": "string"},
-                        "requirement_id": {"type": "string"},
                         "search_text": {"type": "string"},
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Include archived decisions (default: false)",
+                        },
                     },
                 },
             },
             {
                 "name": "get_architecture_details",
-                "description": "Get full architecture decision details",
+                "description": "Get full architecture decision details with relationships and reviews",
                 "inputSchema": {
                     "type": "object",
                     "properties": {"architecture_id": {"type": "string"}},
@@ -117,420 +176,427 @@ class ArchitectureHandler(BaseHandler):
             },
         ]
 
-    async def handle_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> list[TextContent]:
-        """Route tool calls to appropriate handler methods"""
-        try:
-            if tool_name == "create_architecture_decision":
-                return await self._create_architecture_decision(**arguments)
-            elif tool_name == "update_architecture_status":
-                return await self._update_architecture_status(**arguments)
-            elif tool_name == "query_architecture_decisions":
-                return await self._query_architecture_decisions(**arguments)
-            elif tool_name == "query_architecture_decisions_json":
-                return await self._query_architecture_decisions_json(**arguments)
-            elif tool_name == "get_architecture_details":
-                return await self._get_architecture_details(**arguments)
-            elif tool_name == "add_architecture_review":
-                return await self._add_architecture_review(**arguments)
-            else:
-                return self._create_error_response(f"Unknown tool: {tool_name}")
-        except Exception as e:
-            return self._create_error_response(f"Error handling {tool_name}", e)
+    # ------------------------------------------------------------------
+    # Tool routing
+    # ------------------------------------------------------------------
 
-    async def _create_architecture_decision(self, **params) -> list[TextContent]:
-        """Create ADR"""
-        # Validate required parameters
-        error = self._validate_required_params(params, ["requirement_ids", "title", "context", "decision"])
+    async def handle_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        """Route tool calls to handler methods"""
+        handlers = {
+            "create_architecture_decision": self._create_architecture_decision,
+            "update_architecture_decision": self._update_architecture_decision,
+            "update_architecture_status": self._update_architecture_status,
+            "archive_architecture_decision": self._archive_architecture_decision,
+            "query_architecture_decisions": self._query_architecture_decisions,
+            "query_architecture_decisions_json": self._query_architecture_decisions_json,
+            "get_architecture_details": self._get_architecture_details,
+            "add_architecture_review": self._add_architecture_review,
+        }
+        handler = handlers.get(tool_name)
+        if not handler:
+            return self._create_error_response(f"Unknown tool: {tool_name}")
+        try:
+            return await handler(arguments)
+        except Exception as e:
+            return self._create_error_response(f"Error in {tool_name}", exception=e)
+
+    # ------------------------------------------------------------------
+    # create_architecture_decision
+    # ------------------------------------------------------------------
+
+    async def _create_architecture_decision(self, params: dict[str, Any]) -> list[TextContent]:
+        """Create an ADR linked to a project."""
+        error = self._validate_required_params(params, ["project_id", "title", "context", "decision"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Use transaction for atomic ADR number assignment + insert
-            async with self.db.transaction() as conn:
-                # Get next ADR number
-                cursor = await conn.execute(
-                    "SELECT COALESCE(MAX(CAST(SUBSTR(id, 5, 4) AS INTEGER)), 0) + 1 "
-                    "FROM architecture WHERE type = 'ADR'"
-                )
-                row = await cursor.fetchone()
-                adr_number = row[0] if row else 1
+        project_id = params["project_id"]
+        error = await self._validate_project_exists(project_id)
+        if error:
+            return self._create_error_response(error)
 
-                adr_id = f"ADR-{adr_number:04d}"
+        adr_id, _ = await self.db.generate_id("architecture")
 
-                # Prepare architecture data
-                arch_data = {
-                    "id": adr_id,
-                    "type": "ADR",
-                    "title": params["title"],
-                    "status": "Proposed",
-                    "context": params["context"],
-                    "decision_outcome": params["decision"],
-                    "decision_drivers": self._safe_json_dumps(params.get("decision_drivers", [])),
-                    "considered_options": self._safe_json_dumps(params.get("considered_options", [])),
-                    "consequences": self._safe_json_dumps(params.get("consequences", {})),
-                    "authors": self._safe_json_dumps(params.get("authors", ["MCP User"])),
-                }
+        data: dict[str, Any] = {
+            "id": adr_id,
+            "project_id": project_id,
+            "title": params["title"],
+            "context": params["context"],
+            "decision": params["decision"],
+            "status": "Draft",
+        }
 
-                # Insert ADR inside the transaction
-                columns = ", ".join(arch_data.keys())
-                placeholders = ", ".join(["?"] * len(arch_data))
-                await conn.execute(
-                    f"INSERT INTO architecture ({columns}) VALUES ({placeholders})",
-                    list(arch_data.values()),
-                )
+        # Optional JSON fields
+        for field in self._UPDATABLE_JSON_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = self._safe_json_dumps(params[field])
 
-            # Outside transaction: link to requirements
-            for req_id in params["requirement_ids"]:
-                await self.db.insert_record(
-                    "relationships",
-                    {
-                        "id": f"rel-{req_id}-{adr_id}-addresses",
-                        "source_type": "requirement",
-                        "source_id": req_id,
-                        "target_type": "architecture",
-                        "target_id": adr_id,
-                        "relationship_type": "addresses",
-                    },
-                )
+        await self.db.insert_record("architecture", data)
+        await self._log_operation("architecture", adr_id, "created", project_id=project_id)
 
-            # Analyze ADR for diagram suggestions using LLM
-            diagram_suggestions = await self._analyze_adr_for_diagrams(arch_data)
-
+        # Analyze ADR for diagram suggestions (if not in testing mode)
+        if not self._testing_mode:
+            diagram_suggestions = await self._analyze_adr_for_diagrams(data)
             if diagram_suggestions and diagram_suggestions.get("suggested_diagrams"):
-                # Format diagram suggestions for user
                 suggestions_text = self._format_diagram_suggestions(diagram_suggestions, adr_id)
                 key_info = f"Architecture decision {adr_id} created with diagram suggestions"
                 suggestions_count = len(diagram_suggestions["suggested_diagrams"])
-                action_info = f"📐 {params['title']} | {suggestions_count} diagram suggestions"
+                action_info = f"{params['title']} | {suggestions_count} diagram suggestions"
                 return self._create_above_fold_response("SUCCESS", key_info, action_info, suggestions_text)
-            else:
-                # Standard response without suggestions
-                key_info = f"Architecture decision {adr_id} created"
-                action_info = f"📐 {params['title']} | {params.get('status', 'Proposed')} | ADR"
-                return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
-        except Exception as e:
-            return self._create_error_response("Failed to create architecture decision", e)
+        key_info = f"Architecture decision {adr_id} created"
+        action_info = f"{params['title']} | Draft"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
-    async def _update_architecture_status(self, **params) -> list[TextContent]:
-        """Update architecture decision status"""
-        # Validate required parameters
-        error = self._validate_required_params(params, ["architecture_id", "new_status"])
-        if error:
-            return self._create_error_response(error)
+    # ------------------------------------------------------------------
+    # update_architecture_decision (broad field update)
+    # ------------------------------------------------------------------
 
-        try:
-            # Get current status
-            current_arch = await self.db.get_records("architecture", "status", "id = ?", [params["architecture_id"]])
-
-            if not current_arch:
-                return self._create_error_response("Architecture decision not found")
-
-            current_status = current_arch[0]["status"]
-            new_status = params["new_status"]
-
-            # Update status
-            await self.db.update_record(
-                "architecture",
-                {"status": new_status, "updated_at": "CURRENT_TIMESTAMP"},
-                "id = ?",
-                [params["architecture_id"]],
-            )
-
-            # Add review comment if provided
-            if params.get("comment"):
-                await self._add_review_comment("architecture", params["architecture_id"], params["comment"])
-
-            # Create above-the-fold response
-            key_info = f"Architecture {params['architecture_id']} updated"
-            action_info = f"📈 {current_status} → {new_status}"
-            return self._create_above_fold_response("SUCCESS", key_info, action_info)
-
-        except Exception as e:
-            return self._create_error_response("Failed to update architecture status", e)
-
-    async def _query_architecture_decisions(self, **params) -> list[TextContent]:
-        """Query architecture decisions with filters"""
-        try:
-            where_clauses = []
-            where_params = []
-            base_query = "SELECT * FROM architecture"
-
-            # Handle requirement_id filter specially (requires join)
-            if params.get("requirement_id"):
-                base_query = """
-                    SELECT a.* FROM architecture a
-                    JOIN relationships ra ON a.id = ra.target_id
-                    WHERE ra.source_type = 'requirement' AND ra.target_type = 'architecture' AND ra.source_id = ?
-                """
-                where_params.append(params["requirement_id"])
-
-                # Add additional filters for the joined query
-                if params.get("search_text"):
-                    where_clauses.append("(a.title LIKE ? OR a.context LIKE ?)")
-                    search = f"%{params['search_text']}%"
-                    where_params.extend([search, search])
-            else:
-                # Build standard filters
-                if params.get("status"):
-                    where_clauses.append("status = ?")
-                    where_params.append(params["status"])
-
-                if params.get("type"):
-                    where_clauses.append("type = ?")
-                    where_params.append(params["type"])
-
-                if params.get("search_text"):
-                    where_clauses.append("(title LIKE ? OR context LIKE ?)")
-                    search = f"%{params['search_text']}%"
-                    where_params.extend([search, search])
-
-            # Construct final query
-            if where_clauses:
-                if "WHERE" in base_query:
-                    base_query += " AND " + " AND ".join(where_clauses)
-                else:
-                    base_query += " WHERE " + " AND ".join(where_clauses)
-
-            base_query += " ORDER BY created_at DESC"
-
-            decisions = await self.db.execute_query(base_query, where_params, fetch_all=True, row_factory=True)
-
-            if not decisions:
-                return self._create_above_fold_response(
-                    "INFO", "No architecture decisions found", "Try adjusting search criteria"
-                )
-
-            # Build filter description for above-the-fold
-            filters = []
-            if params.get("status"):
-                filters.append(f"status: {params['status']}")
-            if params.get("requirement_id"):
-                filters.append(f"requirement: {params['requirement_id']}")
-            if params.get("search_text"):
-                filters.append(f"search: {params['search_text']}")
-            filter_desc = " | ".join(filters) if filters else "all decisions"
-
-            # Build detailed list
-            decision_list = []
-            for decision in decisions:
-                decision_info = f"- {decision['id']}: {decision['title']} [{decision['status']}] ({decision['type']})"
-                decision_list.append(decision_info)
-
-            key_info = self._format_count_summary("architecture decision", len(decisions), filter_desc)
-            details = "\n".join(decision_list)
-
-            return self._create_above_fold_response("SUCCESS", key_info, "", details)
-
-        except Exception as e:
-            return self._create_error_response("Failed to query architecture decisions", e)
-
-    async def _query_architecture_decisions_json(self, **params) -> list[TextContent]:
-        """Query architecture decisions and return structured JSON data for UI"""
-        try:
-            import json
-
-            where_clauses = []
-            where_params = []
-            base_query = "SELECT * FROM architecture"
-
-            # Handle requirement_id filter specially (requires join)
-            if params.get("requirement_id"):
-                base_query = """
-                    SELECT a.* FROM architecture a
-                    JOIN relationships ra ON a.id = ra.target_id
-                    WHERE ra.source_type = 'requirement' AND ra.target_type = 'architecture' AND ra.source_id = ?
-                """
-                where_params.append(params["requirement_id"])
-
-                # Add additional filters for the joined query
-                if params.get("search_text"):
-                    where_clauses.append("(a.title LIKE ? OR a.context LIKE ?)")
-                    search = f"%{params['search_text']}%"
-                    where_params.extend([search, search])
-            else:
-                # Build standard filters
-                if params.get("status"):
-                    where_clauses.append("status = ?")
-                    where_params.append(params["status"])
-
-                if params.get("type"):
-                    where_clauses.append("type = ?")
-                    where_params.append(params["type"])
-
-                if params.get("search_text"):
-                    where_clauses.append("(title LIKE ? OR context LIKE ?)")
-                    search = f"%{params['search_text']}%"
-                    where_params.extend([search, search])
-
-            # Construct final query
-            if where_clauses:
-                if "WHERE" in base_query:
-                    base_query += " AND " + " AND ".join(where_clauses)
-                else:
-                    base_query += " WHERE " + " AND ".join(where_clauses)
-
-            base_query += " ORDER BY created_at DESC"
-
-            decisions = await self.db.execute_query(base_query, where_params, fetch_all=True, row_factory=True)
-
-            # Convert to list of dictionaries with JSON parsing
-            decisions_list = []
-            for decision in decisions:
-                decision_dict = dict(decision) if hasattr(decision, 'keys') else decision
-
-                # Parse JSON fields if they exist as strings
-                json_fields = ['consequences', 'decision_drivers', 'considered_options', 'authors']
-                for field in json_fields:
-                    if field in decision_dict and isinstance(decision_dict[field], str):
-                        try:
-                            decision_dict[field] = json.loads(decision_dict[field]) if decision_dict[field] else []
-                        except (json.JSONDecodeError, TypeError):
-                            decision_dict[field] = []
-
-                decisions_list.append(decision_dict)
-
-            return [TextContent(type="text", text=json.dumps(decisions_list))]
-
-        except Exception as e:
-            return self._create_error_response("Failed to query architecture decisions for JSON", e)
-
-    async def _get_architecture_details(self, **params) -> list[TextContent]:
-        """Get full architecture decision details"""
-        # Validate required parameters
+    async def _update_architecture_decision(self, params: dict[str, Any]) -> list[TextContent]:
+        """Update architecture decision fields."""
         error = self._validate_required_params(params, ["architecture_id"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Get architecture decision
-            arch_decisions = await self.db.get_records("architecture", "*", "id = ?", [params["architecture_id"]])
+        adr_id = params["architecture_id"]
+        error = await self._validate_not_archived("architecture", adr_id)
+        if error:
+            return self._create_error_response(error)
 
-            if not arch_decisions:
-                return self._create_error_response("Architecture decision not found")
+        data: dict[str, Any] = {}
+        for field in self._UPDATABLE_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = params[field]
+        for field in self._UPDATABLE_JSON_FIELDS:
+            if field in params and params[field] is not None:
+                data[field] = self._safe_json_dumps(params[field])
 
-            arch = arch_decisions[0]
+        if not data:
+            return self._create_error_response("No fields to update")
 
-            # Build detailed report
-            report = f"""# Architecture Decision: {arch["id"]}
+        await self.db.update_record("architecture", data, "id = ?", [adr_id])
+        await self._log_operation("architecture", adr_id, "updated")
+
+        return self._create_above_fold_response(
+            "SUCCESS",
+            f"Architecture decision {adr_id} updated",
+            f"Updated fields: {', '.join(data.keys())}",
+        )
+
+    # ------------------------------------------------------------------
+    # update_architecture_status
+    # ------------------------------------------------------------------
+
+    async def _update_architecture_status(self, params: dict[str, Any]) -> list[TextContent]:
+        """Update architecture decision status with transition validation."""
+        error = self._validate_required_params(params, ["architecture_id", "new_status"])
+        if error:
+            return self._create_error_response(error)
+
+        adr_id = params["architecture_id"]
+        new_status = params["new_status"]
+
+        # Get current status
+        rows = await self.db.get_records(
+            "architecture", "status", where_clause="id = ?", where_params=[adr_id]
+        )
+        if not rows:
+            return self._create_error_response(f"Architecture decision not found: {adr_id}")
+
+        current_status = rows[0]["status"]
+        allowed = self.VALID_TRANSITIONS.get(current_status, [])
+        if new_status not in allowed:
+            return self._create_error_response(
+                f"Invalid transition from '{current_status}' to '{new_status}'. "
+                f"Allowed transitions: {allowed or 'none (terminal state)'}"
+            )
+
+        # Build update data
+        update_data: dict[str, Any] = {"status": new_status}
+
+        # Handle superseded_by when setting to Deprecated
+        if new_status == "Deprecated" and params.get("superseded_by"):
+            update_data["superseded_by"] = params["superseded_by"]
+
+        await self.db.update_record("architecture", update_data, "id = ?", [adr_id])
+
+        # Add review comment if provided
+        if params.get("comment"):
+            await self._add_review_comment("architecture", adr_id, params["comment"])
+
+        key_info = f"Architecture {adr_id} updated"
+        action_info = f"{current_status} -> {new_status}"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+
+    # ------------------------------------------------------------------
+    # archive_architecture_decision
+    # ------------------------------------------------------------------
+
+    async def _archive_architecture_decision(self, params: dict[str, Any]) -> list[TextContent]:
+        """Archive an architecture decision (soft delete)."""
+        error = self._validate_required_params(params, ["architecture_id"])
+        if error:
+            return self._create_error_response(error)
+
+        adr_id = params["architecture_id"]
+        error = await self._validate_entity_exists("architecture", adr_id)
+        if error:
+            return self._create_error_response(error)
+
+        await self.db.execute_query(
+            "UPDATE architecture SET is_archived = 1, archived_at = datetime('now') WHERE id = ?",
+            [adr_id],
+        )
+        await self._log_operation("architecture", adr_id, "archived")
+
+        return self._create_above_fold_response("SUCCESS", f"Architecture decision {adr_id} archived")
+
+    # ------------------------------------------------------------------
+    # query_architecture_decisions
+    # ------------------------------------------------------------------
+
+    async def _query_architecture_decisions(self, params: dict[str, Any]) -> list[TextContent]:
+        """Query architecture decisions with filters."""
+        conditions, query_params = self._build_query_filters(params)
+        where_clause = " AND ".join(conditions) if conditions else ""
+
+        decisions = await self.db.get_records(
+            "architecture", "*",
+            where_clause=where_clause,
+            where_params=query_params,
+            order_by="created_at DESC",
+        )
+
+        if not decisions:
+            return self._create_above_fold_response(
+                "INFO", "No architecture decisions found", "Try adjusting search criteria"
+            )
+
+        lines = []
+        for decision in decisions:
+            info = f"- {decision['id']}: {decision['title']} [{decision['status']}]"
+            lines.append(info)
+
+        filter_desc = self._build_filter_description(params)
+        key_info = self._format_count_summary("architecture decision", len(decisions), filter_desc)
+        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # query_architecture_decisions_json
+    # ------------------------------------------------------------------
+
+    async def _query_architecture_decisions_json(self, params: dict[str, Any]) -> list[TextContent]:
+        """Query architecture decisions and return structured JSON."""
+        conditions, query_params = self._build_query_filters(params)
+        where_clause = " AND ".join(conditions) if conditions else ""
+
+        decisions = await self.db.get_records(
+            "architecture", "*",
+            where_clause=where_clause,
+            where_params=query_params,
+            order_by="created_at DESC",
+        )
+
+        json_fields = ["decision_drivers", "considered_options", "consequences", "authors"]
+        result_list = []
+        for decision in decisions:
+            decision_dict = dict(decision) if hasattr(decision, "keys") else decision
+            for field in json_fields:
+                if field in decision_dict and isinstance(decision_dict[field], str):
+                    try:
+                        decision_dict[field] = json.loads(decision_dict[field]) if decision_dict[field] else []
+                    except (json.JSONDecodeError, TypeError):
+                        decision_dict[field] = []
+            result_list.append(decision_dict)
+
+        return [TextContent(type="text", text=json.dumps(result_list))]
+
+    # ------------------------------------------------------------------
+    # get_architecture_details
+    # ------------------------------------------------------------------
+
+    async def _get_architecture_details(self, params: dict[str, Any]) -> list[TextContent]:
+        """Get full architecture decision details with relationships and reviews."""
+        error = self._validate_required_params(params, ["architecture_id"])
+        if error:
+            return self._create_error_response(error)
+
+        adr_id = params["architecture_id"]
+        rows = await self.db.get_records("architecture", "*", where_clause="id = ?", where_params=[adr_id])
+        if not rows:
+            return self._create_error_response(f"Architecture decision not found: {adr_id}")
+
+        arch = dict(rows[0])
+
+        # Build detailed report
+        report = f"""# Architecture Decision: {arch["id"]}
 
 ## Basic Information
 - **Title**: {arch["title"]}
-- **Type**: {arch["type"]}
 - **Status**: {arch["status"]}
+- **Project**: {arch["project_id"]}
 - **Created**: {arch["created_at"]}
 - **Updated**: {arch["updated_at"]}
-- **Authors**: {arch["authors"] or "Not specified"}
+- **Authors**: {arch.get("authors") or "Not specified"}
 
 ## Context
-{arch["context"]}
+{arch.get("context") or "Not specified"}
 
 ## Decision
-{arch["decision_outcome"]}
+{arch.get("decision") or "Not specified"}
 """
 
-            if arch["decision_drivers"]:
-                drivers = self._safe_json_loads(arch["decision_drivers"])
-                if drivers:
-                    report += "\n## Decision Drivers\n"
-                    for driver in drivers:
-                        report += f"- {driver}\n"
+        if arch.get("decision_drivers"):
+            drivers = self._safe_json_loads(arch["decision_drivers"])
+            if drivers:
+                report += "\n## Decision Drivers\n"
+                for driver in drivers:
+                    report += f"- {driver}\n"
 
-            if arch["considered_options"]:
-                options = self._safe_json_loads(arch["considered_options"])
-                if options:
-                    report += "\n## Considered Options\n"
-                    for option in options:
-                        report += f"- {option}\n"
+        if arch.get("considered_options"):
+            options = self._safe_json_loads(arch["considered_options"])
+            if options:
+                report += "\n## Considered Options\n"
+                for option in options:
+                    report += f"- {option}\n"
 
-            if arch["consequences"]:
-                consequences = self._safe_json_loads(arch["consequences"])
-                if consequences:
-                    report += "\n## Consequences\n"
-                    if isinstance(consequences, dict):
-                        for key, value in consequences.items():
-                            report += f"**{key.title()}**: {value}\n"
-                    else:
-                        report += f"{consequences}\n"
+        if arch.get("consequences"):
+            consequences = self._safe_json_loads(arch["consequences"])
+            if consequences:
+                report += "\n## Consequences\n"
+                if isinstance(consequences, dict):
+                    for key, value in consequences.items():
+                        report += f"**{key.title()}**: {value}\n"
+                else:
+                    report += f"{consequences}\n"
 
-            # Get linked requirements
-            requirements = await self.db.execute_query(
-                """
-                SELECT r.id, r.title FROM requirements r
-                JOIN relationships ra ON r.id = ra.source_id
-                WHERE ra.source_type = 'requirement' AND ra.target_type = 'architecture' AND ra.target_id = ?
-            """,
-                [params["architecture_id"]],
-                fetch_all=True,
-                row_factory=True,
+        # Superseding ADR info
+        if arch.get("superseded_by"):
+            superseding = await self.db.get_records(
+                "architecture", "id, title, status",
+                where_clause="id = ?",
+                where_params=[arch["superseded_by"]],
             )
+            if superseding:
+                s = superseding[0]
+                report += "\n## Superseded By\n"
+                report += f"- {s['id']}: {s['title']} [{s['status']}]\n"
+            else:
+                report += "\n## Superseded By\n"
+                report += f"- {arch['superseded_by']} (details unavailable)\n"
 
-            if requirements:
-                report += f"\n## Linked Requirements ({len(requirements)})\n"
-                for req in requirements:
-                    report += f"- {req['id']}: {req['title']}\n"
-
-            # Get reviews
-            reviews = await self.db.execute_query(
-                """
-                SELECT reviewer, comment, created_at FROM reviews
-                WHERE entity_type = 'architecture' AND entity_id = ?
-                ORDER BY created_at DESC
+        # Get linked requirements via relationships (both directions)
+        requirements = await self.db.execute_query(
+            """
+            SELECT DISTINCT r.* FROM requirements r
+            JOIN relationships rel ON
+                (rel.source_id = ? AND rel.target_id = r.id AND rel.target_type = 'requirement')
+                OR (rel.target_id = ? AND rel.source_id = r.id AND rel.source_type = 'requirement')
+            WHERE r.is_archived = 0
             """,
-                [params["architecture_id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
+            [adr_id, adr_id],
+            fetch_all=True,
+            row_factory=True,
+        )
 
-            if reviews:
-                report += f"\n## Reviews ({len(reviews)})\n"
-                for review in reviews:
-                    report += f"- **{review['reviewer']}** ({review['created_at']}): {review['comment']}\n"
+        if requirements:
+            report += f"\n## Linked Requirements ({len(requirements)})\n"
+            for req in requirements:
+                report += f"- {req['id']}: {req['title']}\n"
 
-            # Create above-the-fold response for architecture details
-            key_info = f"Architecture {arch['id']} details"
-            action_info = f"📐 {arch['title']} | {arch['status']} | {arch.get('type', 'ADR')}"
-            return self._create_above_fold_response("INFO", key_info, action_info, report)
+        # Get reviews
+        reviews = await self.db.execute_query(
+            """
+            SELECT reviewer, comment, created_at FROM reviews
+            WHERE entity_type = 'architecture' AND entity_id = ?
+            ORDER BY created_at DESC
+            """,
+            [adr_id],
+            fetch_all=True,
+            row_factory=True,
+        )
 
-        except Exception as e:
-            return self._create_error_response("Failed to get architecture details", e)
+        if reviews:
+            report += f"\n## Reviews ({len(reviews)})\n"
+            for review in reviews:
+                report += f"- **{review['reviewer']}** ({review['created_at']}): {review['comment']}\n"
 
-    async def _add_architecture_review(self, **params) -> list[TextContent]:
-        """Add review comment to architecture decision"""
-        # Validate required parameters
+        key_info = f"Architecture {arch['id']} details"
+        action_info = f"{arch['title']} | {arch['status']}"
+        return self._create_above_fold_response("INFO", key_info, action_info, report)
+
+    # ------------------------------------------------------------------
+    # add_architecture_review
+    # ------------------------------------------------------------------
+
+    async def _add_architecture_review(self, params: dict[str, Any]) -> list[TextContent]:
+        """Add review comment to architecture decision."""
         error = self._validate_required_params(params, ["architecture_id", "comment"])
         if error:
             return self._create_error_response(error)
 
-        try:
-            # Verify architecture exists
-            if not await self.db.check_exists("architecture", "id = ?", [params["architecture_id"]]):
-                return self._create_error_response("Architecture decision not found")
+        adr_id = params["architecture_id"]
+        error = await self._validate_entity_exists("architecture", adr_id)
+        if error:
+            return self._create_error_response(error)
 
-            # Add review
-            await self._add_review_comment(
-                "architecture", params["architecture_id"], params["comment"], params.get("reviewer", "MCP User")
-            )
+        reviewer = params.get("reviewer", "MCP User")
+        await self._add_review_comment("architecture", adr_id, params["comment"], reviewer)
 
-            # Create above-the-fold response
-            key_info = f"Review added to {params['architecture_id']}"
-            action_info = f"📝 Review by {params.get('reviewer', 'MCP User')}"
-            return self._create_above_fold_response("SUCCESS", key_info, action_info)
+        key_info = f"Review added to {adr_id}"
+        action_info = f"Review by {reviewer}"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
-        except Exception as e:
-            return self._create_error_response("Failed to add review", e)
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _build_query_filters(self, params: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        """Build WHERE conditions for query methods."""
+        conditions: list[str] = []
+        query_params: list[Any] = []
+
+        include_archived = params.get("include_archived", False)
+        if not include_archived:
+            conditions.append("is_archived = 0")
+
+        if params.get("project_id"):
+            conditions.append("project_id = ?")
+            query_params.append(params["project_id"])
+        if params.get("status"):
+            conditions.append("status = ?")
+            query_params.append(params["status"])
+        if params.get("search_text"):
+            conditions.append("(title LIKE ? OR context LIKE ?)")
+            search = f"%{params['search_text']}%"
+            query_params.extend([search, search])
+
+        return conditions, query_params
+
+    def _build_filter_description(self, params: dict[str, Any]) -> str:
+        """Build a human-readable filter description."""
+        filters = []
+        if params.get("project_id"):
+            filters.append(f"project: {params['project_id']}")
+        if params.get("status"):
+            filters.append(f"status: {params['status']}")
+        if params.get("search_text"):
+            filters.append(f"search: {params['search_text']}")
+        return " | ".join(filters) if filters else "all decisions"
+
+    # ------------------------------------------------------------------
+    # LLM diagram suggestion (kept from v1, gated by _testing_mode)
+    # ------------------------------------------------------------------
 
     async def _analyze_adr_for_diagrams(self, adr_data: dict[str, Any]) -> dict[str, Any] | None:
-        """Analyze ADR context using LLM sampling to suggest relevant diagrams"""
+        """Analyze ADR context using LLM sampling to suggest relevant diagrams."""
         if not self.mcp_client:
             self.logger.info("No MCP client available for sampling - skipping diagram suggestions")
             return None
 
         try:
-            # Build context for LLM analysis
             adr_context = self._build_adr_context(adr_data)
 
-            # Prepare LLM sampling request
             sampling_request = {
                 "messages": [{"role": "user", "content": {"type": "text", "text": adr_context}}],
                 "modelPreferences": {"intelligencePriority": 0.8, "speedPriority": 0.2, "costPriority": 0.1},
@@ -541,10 +607,8 @@ class ArchitectureHandler(BaseHandler):
                 "stopSequences": ["```"],
             }
 
-            # Check if the MCP client has sampling capability
             if hasattr(self.mcp_client, "sample") and callable(self.mcp_client.sample):
                 try:
-                    # Make the actual MCP sampling request
                     response = await self.mcp_client.sample(sampling_request)
                     if response and hasattr(response, "content") and hasattr(response.content, "text"):
                         return json.loads(response.content.text)
@@ -559,12 +623,11 @@ class ArchitectureHandler(BaseHandler):
                 return None
 
         except Exception as e:
-            # Log error but don't fail ADR creation
             self.logger.warning(f"LLM diagram analysis failed: {e}")
             return None
 
     def _build_adr_context(self, adr_data: dict[str, Any]) -> str:
-        """Build context string for ADR diagram analysis"""
+        """Build context string for ADR diagram analysis."""
         decision_drivers = self._safe_json_loads(adr_data.get("decision_drivers", "[]"))
         considered_options = self._safe_json_loads(adr_data.get("considered_options", "[]"))
         consequences = self._safe_json_loads(adr_data.get("consequences", "{}"))
@@ -573,49 +636,26 @@ class ArchitectureHandler(BaseHandler):
             f"Analyze this Architecture Decision Record (ADR) to suggest helpful "
             f"diagrams for implementation and understanding:\n\n"
             f"**ADR Title**: {adr_data['title']}\n\n"
-            f"**Context**: {adr_data['context']}\n\n"
-            f"**Decision**: {adr_data['decision_outcome']}\n\n"
+            f"**Context**: {adr_data.get('context', '')}\n\n"
+            f"**Decision**: {adr_data.get('decision', '')}\n\n"
             f"**Decision Drivers**:\n"
             f"{self._format_list_items(decision_drivers)}\n\n"
             f"**Considered Options**:\n"
             f"{self._format_list_items(considered_options)}\n\n"
             f"**Consequences**:\n"
             f"{self._format_consequences(consequences)}\n\n"
-            f"Please analyze this ADR and suggest 2-4 diagrams that would:\n"
-            f"1. Help developers implement this decision effectively\n"
-            f"2. Enhance stakeholder understanding of the architecture\n"
-            f"3. Document key relationships and dependencies\n"
-            f"4. Support future maintenance and evolution\n\n"
-            f"Focus on practical diagrams that provide real implementation value.\n\n"
-            f"Respond with valid JSON in this format:\n"
-            f"{{\n"
-            f'  "analysis": {{\n'
-            f'    "architectural_scope": "component|system|integration|deployment",\n'
-            f'    "complexity_level": 1-5,\n'
-            f'    "implementation_focus": "string describing main implementation challenges"\n'
-            f"  }},\n"
-            f'  "suggested_diagrams": [\n'
-            f"    {{\n"
-            f'      "type": "requirements|tasks|architecture|full_project|dependencies",\n'
-            f'      "title": "Descriptive diagram title",\n'
-            f'      "purpose": "implementation|understanding|documentation|maintenance",\n'
-            f'      "rationale": "Why this diagram helps with the ADR implementation",\n'
-            f'      "priority": "high|medium|low"\n'
-            f"    }}\n"
-            f"  ],\n"
-            f'  "implementation_notes": "Additional context for using these diagrams during implementation"\n'
-            f"}}"
+            f"Please analyze this ADR and suggest 2-4 diagrams."
         )
         return context
 
     def _format_list_items(self, items: list[str]) -> str:
-        """Format list items for context"""
+        """Format list items for context."""
         if not items:
             return "- None specified"
         return "\n".join(f"- {item}" for item in items)
 
     def _format_consequences(self, consequences: dict[str, Any]) -> str:
-        """Format consequences object for context"""
+        """Format consequences object for context."""
         if not consequences:
             return "- None specified"
 
@@ -633,7 +673,7 @@ class ArchitectureHandler(BaseHandler):
         return "\n".join(formatted) if formatted else "- None specified"
 
     def _get_diagram_analysis_system_prompt(self) -> str:
-        """Get system prompt for ADR diagram analysis"""
+        """Get system prompt for ADR diagram analysis."""
         return (
             "You are an expert software architect analyzing Architecture Decision Records "
             "(ADRs) to suggest helpful diagrams.\n\n"
@@ -641,55 +681,25 @@ class ArchitectureHandler(BaseHandler):
             "- Implementation teams who need to understand how to build the solution\n"
             "- Stakeholders who need to understand the architectural impact\n"
             "- Future maintainers who need to understand the system structure\n\n"
-            "Guidelines:\n"
-            "- Prioritize diagrams that directly support implementation activities\n"
-            "- Consider both technical and communication needs\n"
-            "- Focus on diagrams that show relationships, dependencies, and data flows\n"
-            "- Avoid suggesting diagrams that would be too simple or too complex for the context\n"
-            "- Always provide clear rationale for each suggestion\n"
-            "- Limit suggestions to 2-4 most valuable diagrams\n"
-            "- Always respond with valid JSON matching the specified format"
+            "Always respond with valid JSON matching the specified format."
         )
 
     def _format_diagram_suggestions(self, suggestions: dict[str, Any], adr_id: str) -> str:
-        """Format diagram suggestions for user response"""
+        """Format diagram suggestions for user response."""
         suggested_diagrams = suggestions.get("suggested_diagrams", [])
         implementation_notes = suggestions.get("implementation_notes", "")
 
-        response = f"""# Diagram Suggestions for {adr_id}
-
-Based on your ADR content, I recommend the following diagrams to support implementation and understanding:
-
-"""
+        response = f"# Diagram Suggestions for {adr_id}\n\n"
 
         for i, diagram in enumerate(suggested_diagrams, 1):
-            priority_emoji = {"high": "🔥", "medium": "⭐", "low": "💡"}.get(diagram.get("priority", "medium"), "⭐")
-            purpose_emoji = {
-                "implementation": "🔧",
-                "understanding": "📖",
-                "documentation": "📋",
-                "maintenance": "🔍",
-            }.get(diagram.get("purpose", "implementation"), "🔧")
-
-            response += f"""{i}. {priority_emoji} **{diagram["title"]}** {purpose_emoji}
-   - **Type**: {diagram["type"]}
-   - **Purpose**: {diagram["purpose"].title()}
-   - **Rationale**: {diagram["rationale"]}
-
-"""
+            response += (
+                f"{i}. **{diagram.get('title', 'Untitled')}**\n"
+                f"   - **Type**: {diagram.get('type', 'unknown')}\n"
+                f"   - **Purpose**: {diagram.get('purpose', 'unknown')}\n"
+                f"   - **Rationale**: {diagram.get('rationale', '')}\n\n"
+            )
 
         if implementation_notes:
-            response += f"""## Implementation Notes
-{implementation_notes}
-
-"""
-
-        response += """## Next Steps
-To generate these diagrams, use the `create_architectural_diagrams` tool:
-- For individual diagrams: specify the `diagram_type` (e.g., "requirements", "architecture")
-- For custom diagrams: use the interactive mode with `"interactive": true`
-
-Example: `create_architectural_diagrams(diagram_type="architecture", output_format="markdown_with_mermaid")`
-"""
+            response += f"## Implementation Notes\n{implementation_notes}\n"
 
         return response

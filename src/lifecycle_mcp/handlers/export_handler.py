@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Export Handler for MCP Lifecycle Management Server
-Handles export and diagram generation operations
+Export Handler for MCP Lifecycle Management Server (v2)
+
+Handles export and diagram generation operations with project scoping.
+All queries are scoped to a project_id and use the polymorphic
+relationships table (no legacy join tables).
 """
 
+import asyncio
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from mcp.types import TextContent
@@ -25,12 +30,19 @@ class ExportHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "project_name": {"type": "string", "description": "Name for the project to use in filenames"},
+                        "project_id": {
+                            "type": "string",
+                            "description": "Project ID (PROJ-XXXX)",
+                        },
                         "include_requirements": {"type": "boolean", "default": True},
                         "include_tasks": {"type": "boolean", "default": True},
                         "include_architecture": {"type": "boolean", "default": True},
-                        "output_directory": {"type": "string", "description": "Directory to save the exported files"},
+                        "output_directory": {
+                            "type": "string",
+                            "description": "Directory to save the exported files",
+                        },
                     },
+                    "required": ["project_id"],
                 },
             },
             {
@@ -39,6 +51,10 @@ class ExportHandler(BaseHandler):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "project_id": {
+                            "type": "string",
+                            "description": "Project ID (PROJ-XXXX)",
+                        },
                         "diagram_type": {
                             "type": "string",
                             "enum": [
@@ -72,6 +88,7 @@ class ExportHandler(BaseHandler):
                             "description": "Directory path to save diagram files (defaults to 'exports')",
                         },
                     },
+                    "required": ["project_id"],
                 },
             },
         ]
@@ -88,10 +105,36 @@ class ExportHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response(f"Error handling {tool_name}", e)
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _get_project_name(self, project_id: str) -> str | None:
+        """Look up project name from the projects table. Returns None if not found."""
+        row = await self.db.execute_query(
+            "SELECT name FROM projects WHERE id = ? AND is_archived = 0",
+            [project_id],
+            fetch_one=True,
+            row_factory=True,
+        )
+        return row["name"] if row else None
+
+    # ------------------------------------------------------------------
+    # export_project_documentation
+    # ------------------------------------------------------------------
+
     async def _export_project_documentation(self, **params) -> list[TextContent]:
         """Export comprehensive project documentation in markdown format"""
         try:
-            project_name = params.get("project_name", "project")
+            project_id = params.get("project_id")
+            if not project_id:
+                return self._create_error_response("Missing required parameter: project_id")
+
+            # Validate project exists
+            project_name = await self._get_project_name(project_id)
+            if project_name is None:
+                return self._create_error_response(f"Project not found: {project_id}")
+
             output_dir = params.get("output_directory", ".")
 
             # Create output directory if needed
@@ -100,31 +143,46 @@ class ExportHandler(BaseHandler):
             exported_files = []
 
             if params.get("include_requirements", True):
-                exported_files.extend(await self._export_requirements(project_name, output_dir))
+                exported_files.extend(
+                    await self._export_requirements(project_id, project_name, output_dir)
+                )
 
             if params.get("include_tasks", True):
-                exported_files.extend(await self._export_tasks(project_name, output_dir))
+                exported_files.extend(
+                    await self._export_tasks(project_id, project_name, output_dir)
+                )
 
             if params.get("include_architecture", True):
-                exported_files.extend(await self._export_architecture(project_name, output_dir))
+                exported_files.extend(
+                    await self._export_architecture(project_id, project_name, output_dir)
+                )
 
             if exported_files:
-                # Create above-the-fold response for successful export
                 key_info = f"Exported {len(exported_files)} files to {output_dir}"
-                action_info = f"📄 {project_name} documentation"
+                action_info = f"{project_name} documentation"
                 details = "\n".join(f"- {f}" for f in exported_files)
                 return self._create_above_fold_response("SUCCESS", key_info, action_info, details)
             else:
                 return self._create_above_fold_response(
-                    "INFO", "No data found to export", "Check if requirements, tasks, or architecture exist"
+                    "INFO",
+                    "No data found to export",
+                    "Check if requirements, tasks, or architecture exist",
                 )
 
         except Exception as e:
             return self._create_error_response("Failed to export project documentation", e)
 
-    async def _export_requirements(self, project_name: str, output_dir: str) -> list[str]:
-        """Export requirements to markdown file"""
-        requirements = await self.db.get_records("requirements", "*", order_by="type, requirement_number")
+    async def _export_requirements(
+        self, project_id: str, project_name: str, output_dir: str
+    ) -> list[str]:
+        """Export requirements to markdown file, scoped to project."""
+        requirements = await self.db.get_records(
+            "requirements",
+            "*",
+            where_clause="project_id = ? AND is_archived = 0",
+            where_params=[project_id],
+            order_by="type, id",
+        )
 
         if not requirements:
             return []
@@ -136,7 +194,7 @@ class ExportHandler(BaseHandler):
         content += f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
         # Group by type
-        req_by_type = {}
+        req_by_type: dict[str, list] = {}
         for req in requirements:
             req_type = req["type"]
             if req_type not in req_by_type:
@@ -149,14 +207,15 @@ class ExportHandler(BaseHandler):
                 content += f"### {req['id']}: {req['title']}\n\n"
                 content += f"- **Status**: {req['status']}\n"
                 content += f"- **Priority**: {req['priority']}\n"
-                content += f"- **Risk Level**: {req['risk_level']}\n"
-                content += f"- **Author**: {req['author']}\n"
+                if req["author"]:
+                    content += f"- **Author**: {req['author']}\n"
                 content += f"- **Created**: {req['created_at']}\n"
                 content += f"- **Updated**: {req['updated_at']}\n\n"
 
-                content += f"**Current State**: {req['current_state']}\n\n"
-                content += f"**Desired State**: {req['desired_state']}\n\n"
-
+                if req["current_state"]:
+                    content += f"**Current State**: {req['current_state']}\n\n"
+                if req["desired_state"]:
+                    content += f"**Desired State**: {req['desired_state']}\n\n"
                 if req["business_value"]:
                     content += f"**Business Value**: {req['business_value']}\n\n"
 
@@ -169,23 +228,30 @@ class ExportHandler(BaseHandler):
                         content += "\n"
 
                 if req["acceptance_criteria"]:
-                    acc_criteria = self._safe_json_loads(req["acceptance_criteria"])
-                    if acc_criteria:
+                    acc = self._safe_json_loads(req["acceptance_criteria"])
+                    if acc:
                         content += "**Acceptance Criteria**:\n"
-                        for ac in acc_criteria:
+                        for ac in acc:
                             content += f"- {ac}\n"
                         content += "\n"
 
                 content += "---\n\n"
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        await asyncio.to_thread(Path(filepath).write_text, content, encoding="utf-8")
 
         return [filename]
 
-    async def _export_tasks(self, project_name: str, output_dir: str) -> list[str]:
-        """Export tasks to markdown file"""
-        tasks = await self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
+    async def _export_tasks(
+        self, project_id: str, project_name: str, output_dir: str
+    ) -> list[str]:
+        """Export tasks to markdown file, scoped to project."""
+        tasks = await self.db.get_records(
+            "tasks",
+            "*",
+            where_clause="project_id = ? AND is_archived = 0",
+            where_params=[project_id],
+            order_by="id",
+        )
 
         if not tasks:
             return []
@@ -197,7 +263,7 @@ class ExportHandler(BaseHandler):
         content += f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
         # Group by status
-        tasks_by_status = {}
+        tasks_by_status: dict[str, list] = {}
         for task in tasks:
             status = task["status"]
             if status not in tasks_by_status:
@@ -219,21 +285,25 @@ class ExportHandler(BaseHandler):
                     content += f"**User Story**: {task['user_story']}\n\n"
 
                 if task["acceptance_criteria"]:
-                    acc_criteria = self._safe_json_loads(task["acceptance_criteria"])
-                    if acc_criteria:
+                    acc = self._safe_json_loads(task["acceptance_criteria"])
+                    if acc:
                         content += "**Acceptance Criteria**:\n"
-                        for ac in acc_criteria:
+                        for ac in acc:
                             content += f"- {ac}\n"
                         content += "\n"
 
-                # Get linked requirements
+                # Linked requirements via relationships table
                 linked_reqs = await self.db.execute_query(
                     """
                     SELECT r.id, r.title FROM requirements r
-                    JOIN requirement_tasks rt ON r.id = rt.requirement_id
-                    WHERE rt.task_id = ?
-                """,
-                    [task["id"]],
+                    JOIN relationships rel
+                      ON rel.source_type = 'requirement'
+                     AND rel.source_id = r.id
+                     AND rel.target_type = 'task'
+                     AND rel.target_id = ?
+                    WHERE rel.project_id = ?
+                    """,
+                    [task["id"], project_id],
                     fetch_all=True,
                     row_factory=True,
                 )
@@ -246,14 +316,21 @@ class ExportHandler(BaseHandler):
 
                 content += "---\n\n"
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        await asyncio.to_thread(Path(filepath).write_text, content, encoding="utf-8")
 
         return [filename]
 
-    async def _export_architecture(self, project_name: str, output_dir: str) -> list[str]:
-        """Export architecture decisions to markdown file"""
-        architecture = await self.db.get_records("architecture", "*", order_by="created_at DESC")
+    async def _export_architecture(
+        self, project_id: str, project_name: str, output_dir: str
+    ) -> list[str]:
+        """Export architecture decisions to markdown file, scoped to project."""
+        architecture = await self.db.get_records(
+            "architecture",
+            "*",
+            where_clause="project_id = ? AND is_archived = 0",
+            where_params=[project_id],
+            order_by="created_at DESC",
+        )
 
         if not architecture:
             return []
@@ -266,7 +343,6 @@ class ExportHandler(BaseHandler):
 
         for arch in architecture:
             content += f"## {arch['id']}: {arch['title']}\n\n"
-            content += f"- **Type**: {arch['type']}\n"
             content += f"- **Status**: {arch['status']}\n"
             content += f"- **Created**: {arch['created_at']}\n"
             content += f"- **Updated**: {arch['updated_at']}\n\n"
@@ -276,8 +352,10 @@ class ExportHandler(BaseHandler):
                 if authors:
                     content += f"- **Authors**: {', '.join(authors)}\n\n"
 
-            content += f"### Context\n{arch['context']}\n\n"
-            content += f"### Decision\n{arch['decision_outcome']}\n\n"
+            if arch["context"]:
+                content += f"### Context\n{arch['context']}\n\n"
+            if arch["decision"]:
+                content += f"### Decision\n{arch['decision']}\n\n"
 
             if arch["decision_drivers"]:
                 drivers = self._safe_json_loads(arch["decision_drivers"])
@@ -306,14 +384,18 @@ class ExportHandler(BaseHandler):
                         content += f"{consequences}\n"
                     content += "\n"
 
-            # Get linked requirements
+            # Linked requirements via relationships table
             linked_reqs = await self.db.execute_query(
                 """
                 SELECT r.id, r.title FROM requirements r
-                JOIN relationships ra ON r.id = ra.source_id AND ra.source_type='requirement' AND ra.target_type='architecture'
-                WHERE ra.target_id = ?
-            """,
-                [arch["id"]],
+                JOIN relationships rel
+                  ON rel.source_type = 'requirement'
+                 AND rel.source_id = r.id
+                 AND rel.target_type = 'architecture'
+                 AND rel.target_id = ?
+                WHERE rel.project_id = ?
+                """,
+                [arch["id"], project_id],
                 fetch_all=True,
                 row_factory=True,
             )
@@ -326,17 +408,18 @@ class ExportHandler(BaseHandler):
 
             content += "---\n\n"
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        await asyncio.to_thread(Path(filepath).write_text, content, encoding="utf-8")
 
         return [filename]
 
+    # ------------------------------------------------------------------
+    # create_architectural_diagrams
+    # ------------------------------------------------------------------
+
     async def _create_architectural_diagrams(self, **params) -> list[TextContent]:
         """Generate Mermaid diagrams for project architecture"""
-        # Check if interactive mode is requested
+        # Interactive mode redirect
         if params.get("interactive", False):
-            # For interactive mode, we'd need to integrate with InterviewHandler
-            # For now, provide a helpful message
             return self._create_above_fold_response(
                 "INFO",
                 "Interactive mode requires architectural conversation",
@@ -344,6 +427,15 @@ class ExportHandler(BaseHandler):
             )
 
         try:
+            project_id = params.get("project_id")
+            if not project_id:
+                return self._create_error_response("Missing required parameter: project_id")
+
+            # Validate project exists
+            project_name = await self._get_project_name(project_id)
+            if project_name is None:
+                return self._create_error_response(f"Project not found: {project_id}")
+
             diagram_type = params.get("diagram_type", "full_project")
             include_relationships = params.get("include_relationships", True)
             output_format = params.get("output_format", "mermaid")
@@ -367,21 +459,25 @@ class ExportHandler(BaseHandler):
             requirement_ids = params.get("requirement_ids", [])
 
             if diagram_type == "requirements":
-                mermaid_content = await self._generate_requirements_diagram(requirement_ids)
+                mermaid_content = await self._generate_requirements_diagram(project_id, requirement_ids)
             elif diagram_type == "tasks":
-                mermaid_content = await self._generate_tasks_diagram(requirement_ids)
+                mermaid_content = await self._generate_tasks_diagram(project_id, requirement_ids)
             elif diagram_type == "architecture":
-                mermaid_content = await self._generate_architecture_diagram(requirement_ids)
+                mermaid_content = await self._generate_architecture_diagram(project_id, requirement_ids)
             elif diagram_type == "full_project":
-                mermaid_content = await self._generate_full_project_diagram(include_relationships, requirement_ids)
+                mermaid_content = await self._generate_full_project_diagram(
+                    project_id, include_relationships, requirement_ids
+                )
             elif diagram_type == "directory_structure":
                 mermaid_content = self._generate_directory_structure_diagram()
             elif diagram_type == "dependencies":
-                mermaid_content = await self._generate_dependencies_diagram(requirement_ids)
+                mermaid_content = await self._generate_dependencies_diagram(project_id, requirement_ids)
 
             if not mermaid_content:
                 return self._create_above_fold_response(
-                    "INFO", "No data found for diagram", f"Check if {diagram_type} data exists in the system"
+                    "INFO",
+                    "No data found for diagram",
+                    f"Check if {diagram_type} data exists in the system",
                 )
 
             # Prepare content for output
@@ -395,29 +491,25 @@ class ExportHandler(BaseHandler):
             # Save to file if output_path is provided
             saved_file_path = None
             if output_path:
-                # Validate output path
                 if not self._validate_output_path(output_path):
                     return self._create_error_response("Invalid output path specified")
 
-                # Ensure output directory exists
                 if not self._ensure_output_directory(output_path):
                     return self._create_error_response(f"Cannot create output directory: {output_path}")
 
-                # Generate filename and full path
                 filename = self._generate_diagram_filename(diagram_type, output_format)
                 full_path = os.path.join(output_path, filename)
 
                 try:
-                    # Write file
-                    with open(full_path, "w", encoding="utf-8") as f:
-                        f.write(file_content)
+                    await asyncio.to_thread(
+                        Path(full_path).write_text, file_content, encoding="utf-8"
+                    )
                     saved_file_path = full_path
                 except (OSError, PermissionError) as e:
                     return self._create_error_response(f"Failed to save diagram file: {str(e)}")
 
-            # Create above-the-fold response
             key_info = f"{diagram_type.replace('_', ' ').title()} diagram generated"
-            action_info = f"📊 {output_format} format"
+            action_info = f"{output_format} format"
             if saved_file_path:
                 action_info += f" | Saved to {saved_file_path}"
 
@@ -426,19 +518,31 @@ class ExportHandler(BaseHandler):
         except Exception as e:
             return self._create_error_response("Failed to create architectural diagram", e)
 
-    async def _generate_requirements_diagram(self, requirement_ids: list[str] = None) -> str:
-        """Generate requirements flowchart"""
+    # ------------------------------------------------------------------
+    # Diagram generators (all project-scoped)
+    # ------------------------------------------------------------------
+
+    async def _generate_requirements_diagram(
+        self, project_id: str, requirement_ids: list[str] | None = None
+    ) -> str:
+        """Generate requirements flowchart, scoped to project."""
         if requirement_ids:
-            # Filter specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
             requirements = await self.db.execute_query(
-                f"SELECT * FROM requirements WHERE id IN ({placeholders}) ORDER BY type, requirement_number",
-                requirement_ids,
+                f"SELECT * FROM requirements WHERE id IN ({placeholders}) "
+                f"AND project_id = ? AND is_archived = 0 ORDER BY type, id",
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
         else:
-            requirements = await self.db.get_records("requirements", "*", order_by="type, requirement_number")
+            requirements = await self.db.get_records(
+                "requirements",
+                "*",
+                where_clause="project_id = ? AND is_archived = 0",
+                where_params=[project_id],
+                order_by="type, id",
+            )
 
         if not requirements:
             return ""
@@ -446,18 +550,16 @@ class ExportHandler(BaseHandler):
         mermaid_content = "flowchart TD\n"
 
         # Group by type
-        req_by_type = {}
+        req_by_type: dict[str, list] = {}
         for req in requirements:
             req_type = req["type"]
             if req_type not in req_by_type:
                 req_by_type[req_type] = []
             req_by_type[req_type].append(req)
 
-        # Add type nodes
         for req_type in req_by_type:
             mermaid_content += f"    {req_type}[{req_type} Requirements]\n"
 
-        # Add requirement nodes
         for req_type, reqs in req_by_type.items():
             for req in reqs:
                 node_id = req["id"].replace("-", "_")
@@ -478,31 +580,41 @@ class ExportHandler(BaseHandler):
 
         return mermaid_content
 
-    async def _generate_tasks_diagram(self, requirement_ids: list[str] = None) -> str:
-        """Generate task hierarchy diagram"""
+    async def _generate_tasks_diagram(
+        self, project_id: str, requirement_ids: list[str] | None = None
+    ) -> str:
+        """Generate task hierarchy diagram, scoped to project."""
         if requirement_ids:
-            # Get tasks for specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
             tasks = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT t.* FROM tasks t
-                JOIN requirement_tasks rt ON t.id = rt.task_id
-                WHERE rt.requirement_id IN ({placeholders})
-                ORDER BY t.task_number, t.subtask_number
-            """,
-                requirement_ids,
+                JOIN relationships rel
+                  ON rel.source_type = 'requirement'
+                 AND rel.target_type = 'task'
+                 AND rel.target_id = t.id
+                WHERE rel.source_id IN ({placeholders})
+                  AND t.project_id = ? AND t.is_archived = 0
+                ORDER BY t.id
+                """,
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
         else:
-            tasks = await self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
+            tasks = await self.db.get_records(
+                "tasks",
+                "*",
+                where_clause="project_id = ? AND is_archived = 0",
+                where_params=[project_id],
+                order_by="id",
+            )
 
         if not tasks:
             return ""
 
         mermaid_content = "flowchart TD\n"
 
-        # Add task nodes
         for task in tasks:
             node_id = task["id"].replace("-", "_")
             status_color = {
@@ -517,40 +629,42 @@ class ExportHandler(BaseHandler):
             mermaid_content += f'    {node_id}["{task["id"]}<br/>{title_short}"]\n'
             mermaid_content += f"    style {node_id} {status_color}\n"
 
-            # Add parent-child relationships
-            parent_rels = await self.db.execute_query(
-                """
-                SELECT target_id FROM relationships
-                WHERE source_id = ? AND source_type='task' AND target_type='task' AND relationship_type='parent'
-            """,
-                [task["id"]],
-                fetch_all=True,
-                row_factory=True,
-            )
-            for pr in parent_rels:
-                parent_id = pr["target_id"].replace("-", "_")
+            # Parent-child via parent_task_id column
+            if task["parent_task_id"]:
+                parent_id = task["parent_task_id"].replace("-", "_")
                 mermaid_content += f"    {parent_id} --> {node_id}\n"
 
         return mermaid_content
 
-    async def _generate_architecture_diagram(self, requirement_ids: list[str] = None) -> str:
-        """Generate architecture decisions diagram"""
+    async def _generate_architecture_diagram(
+        self, project_id: str, requirement_ids: list[str] | None = None
+    ) -> str:
+        """Generate architecture decisions diagram, scoped to project."""
         if requirement_ids:
-            # Get architecture decisions for specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
             architecture = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT a.* FROM architecture a
-                JOIN relationships ra ON a.id = ra.target_id AND ra.source_type='requirement' AND ra.target_type='architecture'
-                WHERE ra.source_id IN ({placeholders})
+                JOIN relationships rel
+                  ON rel.source_type = 'requirement'
+                 AND rel.target_type = 'architecture'
+                 AND rel.target_id = a.id
+                WHERE rel.source_id IN ({placeholders})
+                  AND a.project_id = ? AND a.is_archived = 0
                 ORDER BY a.created_at DESC
-            """,
-                requirement_ids,
+                """,
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
         else:
-            architecture = await self.db.get_records("architecture", "*", order_by="created_at DESC")
+            architecture = await self.db.get_records(
+                "architecture",
+                "*",
+                where_clause="project_id = ? AND is_archived = 0",
+                where_params=[project_id],
+                order_by="created_at DESC",
+            )
 
         if not architecture:
             return ""
@@ -564,7 +678,6 @@ class ExportHandler(BaseHandler):
                 "Accepted": "fill:#99ff99",
                 "Rejected": "fill:#ff9999",
                 "Deprecated": "fill:#cccccc",
-                "Superseded": "fill:#cccccc",
             }.get(arch["status"], "fill:#ffffff")
 
             title_short = arch["title"][:30] + "..." if len(arch["title"]) > 30 else arch["title"]
@@ -573,43 +686,68 @@ class ExportHandler(BaseHandler):
 
         return mermaid_content
 
-    async def _generate_full_project_diagram(self, include_relationships: bool, requirement_ids: list[str] = None) -> str:
-        """Generate full project overview diagram"""
+    async def _generate_full_project_diagram(
+        self, project_id: str, include_relationships: bool, requirement_ids: list[str] | None = None
+    ) -> str:
+        """Generate full project overview diagram, scoped to project."""
         if requirement_ids:
-            # Filter to specific requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
             requirements = await self.db.execute_query(
-                f"SELECT * FROM requirements WHERE id IN ({placeholders}) ORDER BY type, requirement_number",
-                requirement_ids,
+                f"SELECT * FROM requirements WHERE id IN ({placeholders}) "
+                f"AND project_id = ? AND is_archived = 0 ORDER BY type, id",
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
             tasks = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT t.* FROM tasks t
-                JOIN requirement_tasks rt ON t.id = rt.task_id
-                WHERE rt.requirement_id IN ({placeholders})
-                ORDER BY t.task_number, t.subtask_number
-            """,
-                requirement_ids,
+                JOIN relationships rel
+                  ON rel.source_type = 'requirement'
+                 AND rel.target_type = 'task'
+                 AND rel.target_id = t.id
+                WHERE rel.source_id IN ({placeholders})
+                  AND t.project_id = ? AND t.is_archived = 0
+                ORDER BY t.id
+                """,
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
             architecture = await self.db.execute_query(
                 f"""
                 SELECT DISTINCT a.* FROM architecture a
-                JOIN relationships ra ON a.id = ra.target_id AND ra.source_type='requirement' AND ra.target_type='architecture'
-                WHERE ra.source_id IN ({placeholders})
+                JOIN relationships rel
+                  ON rel.source_type = 'requirement'
+                 AND rel.target_type = 'architecture'
+                 AND rel.target_id = a.id
+                WHERE rel.source_id IN ({placeholders})
+                  AND a.project_id = ? AND a.is_archived = 0
                 ORDER BY a.created_at DESC
-            """,
-                requirement_ids,
+                """,
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
         else:
-            requirements = await self.db.get_records("requirements", "*", order_by="type, requirement_number")
-            tasks = await self.db.get_records("tasks", "*", order_by="task_number, subtask_number")
-            architecture = await self.db.get_records("architecture", "*", order_by="created_at DESC")
+            requirements = await self.db.get_records(
+                "requirements", "*",
+                where_clause="project_id = ? AND is_archived = 0",
+                where_params=[project_id],
+                order_by="type, id",
+            )
+            tasks = await self.db.get_records(
+                "tasks", "*",
+                where_clause="project_id = ? AND is_archived = 0",
+                where_params=[project_id],
+                order_by="id",
+            )
+            architecture = await self.db.get_records(
+                "architecture", "*",
+                where_clause="project_id = ? AND is_archived = 0",
+                where_params=[project_id],
+                order_by="created_at DESC",
+            )
 
         mermaid_content = "flowchart TD\n"
         mermaid_content += "    Requirements[Requirements]\n"
@@ -639,20 +777,23 @@ class ExportHandler(BaseHandler):
 
         # Add relationships if requested
         if include_relationships:
-            req_tasks = await self.db.execute_query(
+            rels = await self.db.execute_query(
                 """
-                SELECT rt.requirement_id, rt.task_id
-                FROM requirement_tasks rt
+                SELECT source_id, target_id, relationship_type
+                FROM relationships
+                WHERE project_id = ?
+                  AND source_type IN ('requirement', 'task', 'architecture')
+                  AND target_type IN ('requirement', 'task', 'architecture')
                 LIMIT 20
-            """,
+                """,
+                [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
-
-            for rt in req_tasks:
-                req_id = rt["requirement_id"].replace("-", "_")
-                task_id = rt["task_id"].replace("-", "_")
-                mermaid_content += f"    {req_id} -.-> {task_id}\n"
+            for rel in rels:
+                src = rel["source_id"].replace("-", "_")
+                tgt = rel["target_id"].replace("-", "_")
+                mermaid_content += f"    {src} -.-> {tgt}\n"
 
         return mermaid_content
 
@@ -667,35 +808,42 @@ class ExportHandler(BaseHandler):
     Root --> Docs
     Root --> Tests"""
 
-    async def _generate_dependencies_diagram(self, requirement_ids: list[str] = None) -> str:
-        """Generate dependencies diagram"""
+    async def _generate_dependencies_diagram(
+        self, project_id: str, requirement_ids: list[str] | None = None
+    ) -> str:
+        """Generate dependencies diagram using relationships table, scoped to project."""
         if requirement_ids:
-            # Get task dependencies for specific requirements
+            # Get task IDs linked to these requirements
             placeholders = ",".join(["?"] * len(requirement_ids))
-            task_ids_query = await self.db.execute_query(
+            task_id_rows = await self.db.execute_query(
                 f"""
-                SELECT DISTINCT task_id FROM requirement_tasks
-                WHERE requirement_id IN ({placeholders})
-            """,
-                requirement_ids,
+                SELECT DISTINCT rel.target_id AS task_id
+                FROM relationships rel
+                WHERE rel.source_type = 'requirement'
+                  AND rel.target_type = 'task'
+                  AND rel.source_id IN ({placeholders})
+                  AND rel.project_id = ?
+                """,
+                requirement_ids + [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
+            task_ids = [row["task_id"] for row in task_id_rows]
 
-            task_ids = [row["task_id"] for row in task_ids_query]
             if task_ids:
                 task_placeholders = ",".join(["?"] * len(task_ids))
                 dependencies = await self.db.execute_query(
                     f"""
-                    SELECT td.source_id AS task_id, td.target_id AS depends_on_task_id
-                    FROM relationships td
-                    JOIN tasks t1 ON td.source_id = t1.id
-                    JOIN tasks t2 ON td.target_id = t2.id
-                    WHERE td.source_type='task' AND td.target_type='task' AND td.relationship_type IN ('depends', 'blocks')
-                      AND (td.source_id IN ({task_placeholders})
-                       OR td.target_id IN ({task_placeholders}))
-                """,
-                    task_ids + task_ids,
+                    SELECT rel.source_id AS task_id, rel.target_id AS depends_on_task_id
+                    FROM relationships rel
+                    WHERE rel.source_type = 'task'
+                      AND rel.target_type = 'task'
+                      AND rel.relationship_type IN ('depends', 'blocks')
+                      AND rel.project_id = ?
+                      AND (rel.source_id IN ({task_placeholders})
+                       OR rel.target_id IN ({task_placeholders}))
+                    """,
+                    [project_id] + task_ids + task_ids,
                     fetch_all=True,
                     row_factory=True,
                 )
@@ -704,12 +852,16 @@ class ExportHandler(BaseHandler):
         else:
             dependencies = await self.db.execute_query(
                 """
-                SELECT td.source_id AS task_id, td.target_id AS depends_on_task_id
-                FROM relationships td
-                JOIN tasks t1 ON td.source_id = t1.id
-                JOIN tasks t2 ON td.target_id = t2.id
-                WHERE td.source_type='task' AND td.target_type='task' AND td.relationship_type IN ('depends', 'blocks')
-            """,
+                SELECT rel.source_id AS task_id, rel.target_id AS depends_on_task_id
+                FROM relationships rel
+                JOIN tasks t1 ON rel.source_id = t1.id AND t1.is_archived = 0
+                JOIN tasks t2 ON rel.target_id = t2.id AND t2.is_archived = 0
+                WHERE rel.source_type = 'task'
+                  AND rel.target_type = 'task'
+                  AND rel.relationship_type IN ('depends', 'blocks')
+                  AND rel.project_id = ?
+                """,
+                [project_id],
                 fetch_all=True,
                 row_factory=True,
             )
@@ -726,37 +878,28 @@ class ExportHandler(BaseHandler):
 
         return mermaid_content
 
+    # ------------------------------------------------------------------
+    # File utilities
+    # ------------------------------------------------------------------
+
     def _get_diagram_file_extension(self, output_format: str) -> str:
         """Get appropriate file extension based on output format"""
         if output_format == "markdown_with_mermaid":
             return ".md"
-        else:  # mermaid format
-            return ".mmd"
+        return ".mmd"
 
     def _generate_diagram_filename(self, diagram_type: str, output_format: str) -> str:
         """Generate structured filename for diagram files"""
-        # Clean diagram_type for safe filename
         safe_diagram_type = diagram_type.replace("_", "-").lower()
-
-        # Generate timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-
-        # Get file extension
         extension = self._get_diagram_file_extension(output_format)
-
         return f"{safe_diagram_type}-diagram-{timestamp}{extension}"
 
     def _validate_output_path(self, output_path: str) -> bool:
         """Validate output path for security (prevent path traversal)"""
         if not output_path:
             return False
-
-        # Check for path traversal attempts
-        if ".." in output_path:
-            return False
-
-        # Additional safety checks could be added here
-        return True
+        return ".." not in output_path
 
     def _ensure_output_directory(self, output_path: str) -> bool:
         """Create output directory if it doesn't exist"""

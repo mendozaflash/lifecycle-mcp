@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-MCP Server for Software Lifecycle Management - Refactored Modular Architecture
-Provides structured access to requirements, tasks, and architecture artifacts
+MCP Server for Software Lifecycle Management (v2)
+
+Provides structured access to projects, requirements, tasks, and
+architecture decisions through 8 handler modules and 47 tools.
 """
 
 import argparse
@@ -18,88 +20,97 @@ from .database_manager import DatabaseManager
 from .handlers import (
     ArchitectureHandler,
     ExportHandler,
-    InterviewHandler,
+    ProjectHandler,
     RelationshipHandler,
     RequirementHandler,
     StatusHandler,
     TaskHandler,
+    ValidationHandler,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class LifecycleMCPServer:
-    """Refactored MCP Server using modular handler architecture"""
+    """MCP Server using modular handler architecture (v2)"""
 
     def __init__(self):
-        """Initialize server with database manager and handlers"""
+        """Initialize server with database manager and 8 handlers"""
         # Initialize database manager
         self.db_manager = DatabaseManager()
 
-        # MCP client will be set after server creation for LLM analysis features
-        self.mcp_client = None
-
-        # Initialize handlers
-        self.requirement_handler = RequirementHandler(self.db_manager, self.mcp_client)
+        # Initialize handlers (8 total)
+        self.project_handler = ProjectHandler(self.db_manager)
+        self.requirement_handler = RequirementHandler(self.db_manager)
         self.task_handler = TaskHandler(self.db_manager)
-        self.architecture_handler = ArchitectureHandler(self.db_manager, self.mcp_client)
+        self.architecture_handler = ArchitectureHandler(self.db_manager)
         self.relationship_handler = RelationshipHandler(self.db_manager)
-        self.interview_handler = InterviewHandler(self.db_manager, self.requirement_handler)
+        self.validation_handler = ValidationHandler(self.db_manager)
         self.export_handler = ExportHandler(self.db_manager)
         self.status_handler = StatusHandler(self.db_manager)
 
-        # Create handler registry for tool routing
+        # Create handler registry for tool routing (47 tools)
         self.handlers = {
-            # Requirement tools
+            # Project tools (5)
+            "create_project": self.project_handler,
+            "update_project": self.project_handler,
+            "archive_project": self.project_handler,
+            "query_projects": self.project_handler,
+            "get_project_details": self.project_handler,
+            # Requirement tools (10)
             "create_requirement": self.requirement_handler,
+            "update_requirement": self.requirement_handler,
             "update_requirement_status": self.requirement_handler,
+            "archive_requirement": self.requirement_handler,
             "query_requirements": self.requirement_handler,
             "query_requirements_json": self.requirement_handler,
             "get_requirement_details": self.requirement_handler,
             "trace_requirement": self.requirement_handler,
-            # Task tools
+            "batch_create_requirements": self.requirement_handler,
+            "clone_requirement": self.requirement_handler,
+            # Task tools (12)
             "create_task": self.task_handler,
+            "update_task": self.task_handler,
             "update_task_status": self.task_handler,
+            "archive_task": self.task_handler,
             "query_tasks": self.task_handler,
             "query_tasks_json": self.task_handler,
             "get_task_details": self.task_handler,
-            "sync_task_from_github": self.task_handler,
-            "bulk_sync_github_tasks": self.task_handler,
-            # Relationship tools
+            "batch_create_tasks": self.task_handler,
+            "clone_task": self.task_handler,
+            "get_task_requirement_context": self.task_handler,
+            "get_task_adr_context": self.task_handler,
+            "get_task_full_context": self.task_handler,
+            # Architecture tools (8)
+            "create_architecture_decision": self.architecture_handler,
+            "update_architecture_decision": self.architecture_handler,
+            "update_architecture_status": self.architecture_handler,
+            "archive_architecture_decision": self.architecture_handler,
+            "query_architecture_decisions": self.architecture_handler,
+            "query_architecture_decisions_json": self.architecture_handler,
+            "get_architecture_details": self.architecture_handler,
+            "add_architecture_review": self.architecture_handler,
+            # Relationship tools (5)
             "create_relationship": self.relationship_handler,
             "delete_relationship": self.relationship_handler,
             "query_relationships": self.relationship_handler,
             "get_entity_relationships": self.relationship_handler,
             "query_all_relationships": self.relationship_handler,
-            # Architecture tools
-            "create_architecture_decision": self.architecture_handler,
-            "update_architecture_status": self.architecture_handler,
-            "query_architecture_decisions": self.architecture_handler,
-            "query_architecture_decisions_json": self.architecture_handler,
-            "get_architecture_details": self.architecture_handler,
-            "add_architecture_review": self.architecture_handler,
-            # Interview tools
-            "start_requirement_interview": self.interview_handler,
-            "continue_requirement_interview": self.interview_handler,
-            "start_architectural_conversation": self.interview_handler,
-            "continue_architectural_conversation": self.interview_handler,
-            # Export tools
+            # Validation tools (2)
+            "validate_project_plan": self.validation_handler,
+            "get_valid_status_transitions": self.validation_handler,
+            # Export tools (2)
             "export_project_documentation": self.export_handler,
             "create_architectural_diagrams": self.export_handler,
-            # Status tools
+            # Status tools (3)
             "get_project_status": self.status_handler,
             "get_project_metrics": self.status_handler,
+            "diff_project": self.status_handler,
         }
 
         # Create MCP server instance
         self.server = Server("lifecycle-management")
         self._register_handlers()
-
-    def set_mcp_client(self, client):
-        """Set MCP client for LLM analysis features"""
-        self.mcp_client = client
-        self.requirement_handler.mcp_client = client
-        self.architecture_handler.mcp_client = client
 
     def _register_handlers(self):
         """Register MCP server handlers"""
@@ -111,11 +122,12 @@ class LifecycleMCPServer:
 
             # Collect tool definitions from all handlers
             for handler in [
+                self.project_handler,
                 self.requirement_handler,
                 self.task_handler,
                 self.architecture_handler,
                 self.relationship_handler,
-                self.interview_handler,
+                self.validation_handler,
                 self.export_handler,
                 self.status_handler,
             ]:
