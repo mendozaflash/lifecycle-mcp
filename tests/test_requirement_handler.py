@@ -5,6 +5,9 @@ Validates all 8 MCP tools:
   archive_requirement, query_requirements (with output_format/limit/offset),
   get_requirement_details (with trace), batch_create_requirements,
   clone_requirement
+
+Also includes TestAutoProgression (LI-05): integration tests for the 2
+consolidated DB triggers that auto-progress requirement status when tasks advance.
 """
 
 import json
@@ -12,6 +15,7 @@ import json
 import pytest
 
 from lifecycle_mcp.handlers.requirement_handler import RequirementHandler
+from lifecycle_mcp.handlers.task_handler import TaskHandler
 
 
 # -- Fixtures ----------------------------------------------------------------
@@ -994,3 +998,410 @@ async def test_unknown_tool(setup):
     handler, _, _ = setup
     result = await handler.handle_tool_call("nonexistent_tool", {})
     assert "ERROR" in result[0].text or "Unknown" in result[0].text
+
+
+# =============================================================================
+#  Auto-progression integration tests (LI-05)
+#  Verify that the 2 consolidated DB triggers correctly auto-progress
+#  requirement status when tasks advance, and that deprecated tasks
+#  are properly excluded from calculations.
+# =============================================================================
+
+
+class TestAutoProgression:
+    """Tests for the auto-progression DB triggers.
+
+    Each test creates a fresh DB, project, requirements, and tasks, then verifies
+    that requirement status is updated automatically when tasks reach Implemented
+    or Validated.
+    """
+
+    @pytest.fixture
+    async def env(self, v2_db_manager):
+        """Set up RequirementHandler + TaskHandler + a test project."""
+        req_handler = RequirementHandler(v2_db_manager)
+        req_handler._testing_mode = True
+        task_handler = TaskHandler(v2_db_manager)
+        pid = "PROJ-0001"
+        await v2_db_manager.execute_query(
+            "INSERT INTO projects (id, name) VALUES (?, ?)",
+            [pid, "Auto-Progression Test"],
+        )
+        return req_handler, task_handler, v2_db_manager, pid
+
+    # -- Helpers ----------------------------------------------------------
+
+    async def _create_approved_req(self, req_handler, pid, title="Test Req"):
+        """Create a requirement and approve it. Returns the requirement ID."""
+        await _create_req(req_handler, pid, title=title)
+        # IDs are sequential: first call = REQ-0001, etc.  We read it from DB.
+        rows = await req_handler.db.execute_query(
+            "SELECT id FROM requirements WHERE title = ? AND project_id = ?",
+            [title, pid],
+            fetch_all=True,
+            row_factory=True,
+        )
+        req_id = rows[-1]["id"]  # latest with that title
+        await req_handler.handle_tool_call(
+            "update_requirement_status", {"requirement_id": req_id, "new_status": "Approved"}
+        )
+        return req_id
+
+    async def _create_task(self, task_handler, pid, title="Test Task"):
+        """Create a task and return its ID."""
+        result = await task_handler.handle_tool_call(
+            "create_task", {"project_id": pid, "title": title, "priority": "P1"}
+        )
+        assert "SUCCESS" in result[0].text
+        rows = await task_handler.db.execute_query(
+            "SELECT id FROM tasks WHERE title = ? AND project_id = ?",
+            [title, pid],
+            fetch_all=True,
+            row_factory=True,
+        )
+        return rows[-1]["id"]
+
+    async def _link_task_to_req(self, db, task_id, req_id, pid):
+        """Insert an 'implements' relationship between task and requirement."""
+        await db.insert_record(
+            "relationships",
+            {
+                "id": f"rel-{task_id}-{req_id}",
+                "source_type": "task",
+                "source_id": task_id,
+                "target_type": "requirement",
+                "target_id": req_id,
+                "relationship_type": "implements",
+                "project_id": pid,
+            },
+        )
+
+    async def _approve_task(self, task_handler, task_id):
+        """Move a task from Under Review -> Approved."""
+        result = await task_handler.handle_tool_call(
+            "update_task_status", {"task_id": task_id, "new_status": "Approved"}
+        )
+        assert "SUCCESS" in result[0].text
+
+    async def _implement_task(self, task_handler, task_id):
+        """Move a task from Approved -> Implemented."""
+        result = await task_handler.handle_tool_call(
+            "update_task_status", {"task_id": task_id, "new_status": "Implemented"}
+        )
+        assert "SUCCESS" in result[0].text
+
+    async def _validate_task(self, task_handler, task_id):
+        """Move a task from Implemented -> Validated."""
+        result = await task_handler.handle_tool_call(
+            "update_task_status", {"task_id": task_id, "new_status": "Validated"}
+        )
+        assert "SUCCESS" in result[0].text
+
+    async def _deprecate_task(self, task_handler, task_id):
+        """Move a task to Deprecated (allowed from any non-terminal state)."""
+        result = await task_handler.handle_tool_call(
+            "update_task_status", {"task_id": task_id, "new_status": "Deprecated"}
+        )
+        assert "SUCCESS" in result[0].text
+
+    async def _get_req_status(self, db, req_id):
+        """Read current requirement status directly from DB."""
+        row = await db.execute_query(
+            "SELECT status FROM requirements WHERE id = ?",
+            [req_id],
+            fetch_one=True,
+            row_factory=True,
+        )
+        return row["status"]
+
+    # -- Tests: Implemented cascade ------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_single_task_implemented_cascades_to_implemented(self, env):
+        """1 req + 1 task: task -> Implemented -> req becomes Implemented (via PI)."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Single Impl")
+        task_id = await self._create_task(task_h, pid, "Task A")
+        await self._link_task_to_req(db, task_id, req_id, pid)
+        await self._approve_task(task_h, task_id)
+
+        await self._implement_task(task_h, task_id)
+
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+    @pytest.mark.asyncio
+    async def test_one_of_three_implemented_gives_partially_implemented(self, env):
+        """1 req + 3 tasks: 1 task -> Implemented -> req becomes Partially Implemented."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Partial Impl")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        await self._implement_task(task_h, task_ids[0])
+
+        assert await self._get_req_status(db, req_id) == "Partially Implemented"
+
+    @pytest.mark.asyncio
+    async def test_all_three_implemented_gives_implemented(self, env):
+        """1 req + 3 tasks: all 3 -> Implemented -> req becomes Implemented."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Full Impl")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        for tid in task_ids:
+            await self._implement_task(task_h, tid)
+
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+    # -- Tests: Validated cascade --------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_single_task_validated_cascades_to_validated(self, env):
+        """1 req + 1 task: task -> Validated -> req becomes Validated (via PV)."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Single Val")
+        task_id = await self._create_task(task_h, pid, "Task A")
+        await self._link_task_to_req(db, task_id, req_id, pid)
+        await self._approve_task(task_h, task_id)
+
+        await self._implement_task(task_h, task_id)
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+        await self._validate_task(task_h, task_id)
+        assert await self._get_req_status(db, req_id) == "Validated"
+
+    @pytest.mark.asyncio
+    async def test_one_of_three_validated_gives_partially_validated(self, env):
+        """1 req + 3 tasks: all implemented then 1 validated -> req becomes Partially Validated."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Partial Val")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        # Implement all 3 first -> req = Implemented
+        for tid in task_ids:
+            await self._implement_task(task_h, tid)
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+        # Validate only 1 -> req = Partially Validated
+        await self._validate_task(task_h, task_ids[0])
+        assert await self._get_req_status(db, req_id) == "Partially Validated"
+
+    @pytest.mark.asyncio
+    async def test_all_three_validated_gives_validated(self, env):
+        """1 req + 3 tasks: all implemented then all validated -> req becomes Validated."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Full Val")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        for tid in task_ids:
+            await self._implement_task(task_h, tid)
+
+        for tid in task_ids:
+            await self._validate_task(task_h, tid)
+
+        assert await self._get_req_status(db, req_id) == "Validated"
+
+    # -- Tests: Unrelated tasks ----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_unrelated_task_does_not_affect_requirement(self, env):
+        """Req with no linked tasks: unrelated task advances -> req stays Approved."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Unrelated Req")
+        # Create a task but do NOT link it to the requirement
+        task_id = await self._create_task(task_h, pid, "Unlinked Task")
+        await self._approve_task(task_h, task_id)
+
+        await self._implement_task(task_h, task_id)
+
+        assert await self._get_req_status(db, req_id) == "Approved"
+
+    # -- Tests: Deprecated tasks excluded ------------------------------
+
+    @pytest.mark.asyncio
+    async def test_deprecated_task_excluded_from_implemented_calc(self, env):
+        """3 tasks, 1 deprecated: other 2 -> Implemented -> req becomes Implemented."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Depr Impl")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        # Deprecate task 3
+        await self._deprecate_task(task_h, task_ids[2])
+
+        # Implement remaining 2
+        await self._implement_task(task_h, task_ids[0])
+        assert await self._get_req_status(db, req_id) == "Partially Implemented"
+
+        await self._implement_task(task_h, task_ids[1])
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+    @pytest.mark.asyncio
+    async def test_deprecated_task_excluded_from_validated_calc(self, env):
+        """3 tasks, 1 deprecated: other 2 -> Validated -> req becomes Validated."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Depr Val")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        # Deprecate task 3
+        await self._deprecate_task(task_h, task_ids[2])
+
+        # Implement remaining 2 -> req = Implemented
+        for tid in task_ids[:2]:
+            await self._implement_task(task_h, tid)
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+        # Validate remaining 2 -> req = Validated
+        for tid in task_ids[:2]:
+            await self._validate_task(task_h, tid)
+        assert await self._get_req_status(db, req_id) == "Validated"
+
+    # -- Tests: Mixed Implemented/Validated states ---------------------
+
+    @pytest.mark.asyncio
+    async def test_implemented_task_jumps_to_validated_gives_partially_validated(self, env):
+        """3 tasks all Implemented: 1 jumps to Validated -> req becomes Partially Validated."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Jump Val")
+        task_ids = []
+        for i in range(3):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        for tid in task_ids:
+            await self._implement_task(task_h, tid)
+        assert await self._get_req_status(db, req_id) == "Implemented"
+
+        await self._validate_task(task_h, task_ids[0])
+        assert await self._get_req_status(db, req_id) == "Partially Validated"
+
+    @pytest.mark.asyncio
+    async def test_partially_implemented_task_validated_gives_piv(self, env):
+        """1 req in Partially Implemented: task jumps to Validated -> req becomes PIV."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "PIV Req")
+        # 2 tasks — implement only 1 to get PI, then validate it
+        task_ids = []
+        for i in range(2):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        # Implement only task 0 -> req = Partially Implemented
+        await self._implement_task(task_h, task_ids[0])
+        assert await self._get_req_status(db, req_id) == "Partially Implemented"
+
+        # Validate task 0 -> req = Partially Implemented Validated
+        await self._validate_task(task_h, task_ids[0])
+        assert await self._get_req_status(db, req_id) == "Partially Implemented Validated"
+
+    @pytest.mark.asyncio
+    async def test_piv_all_validated_gives_validated(self, env):
+        """1 req in PIV: all non-deprecated tasks -> Validated -> req becomes Validated."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "PIV Full")
+        task_ids = []
+        for i in range(2):
+            tid = await self._create_task(task_h, pid, f"Task {i}")
+            await self._link_task_to_req(db, tid, req_id, pid)
+            await self._approve_task(task_h, tid)
+            task_ids.append(tid)
+
+        # Implement task 0 -> PI, then validate task 0 -> PIV
+        await self._implement_task(task_h, task_ids[0])
+        await self._validate_task(task_h, task_ids[0])
+        assert await self._get_req_status(db, req_id) == "Partially Implemented Validated"
+
+        # Now implement + validate task 1 -> req should reach Validated
+        await self._implement_task(task_h, task_ids[1])
+        # After implement: req is PIV, trigger 1 does not change PIV
+        assert await self._get_req_status(db, req_id) == "Partially Implemented Validated"
+
+        await self._validate_task(task_h, task_ids[1])
+        assert await self._get_req_status(db, req_id) == "Validated"
+
+    # -- Tests: Lifecycle event logging --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_auto_progression_events_have_system_actor(self, env):
+        """Auto-progression events in lifecycle_events have actor = 'system:auto-progression'."""
+        req_h, task_h, db, pid = env
+
+        req_id = await self._create_approved_req(req_h, pid, "Events Req")
+        task_id = await self._create_task(task_h, pid, "Events Task")
+        await self._link_task_to_req(db, task_id, req_id, pid)
+        await self._approve_task(task_h, task_id)
+
+        await self._implement_task(task_h, task_id)
+        await self._validate_task(task_h, task_id)
+
+        # Query status_change events for this requirement (excludes "created" etc.)
+        events = await db.execute_query(
+            "SELECT * FROM lifecycle_events "
+            "WHERE entity_id = ? AND entity_type = 'requirement' "
+            "AND event_type = 'status_change' "
+            "ORDER BY id",
+            [req_id],
+            fetch_all=True,
+            row_factory=True,
+        )
+
+        # The manual Approved transition is done by the handler -> actor = 'MCP User'
+        manual_events = [e for e in events if e["actor"] == "MCP User"]
+        auto_events = [e for e in events if e["actor"] == "system:auto-progression"]
+
+        # Manual: Under Review -> Approved
+        assert len(manual_events) == 1
+        assert manual_events[0]["from_value"] == "Under Review"
+        assert manual_events[0]["to_value"] == "Approved"
+
+        # Auto-progression transitions: Approved->PI, PI->Implemented, Implemented->PV, PV->Validated
+        assert len(auto_events) == 4
+        auto_transitions = [(e["from_value"], e["to_value"]) for e in auto_events]
+        assert ("Approved", "Partially Implemented") in auto_transitions
+        assert ("Partially Implemented", "Implemented") in auto_transitions
+        assert ("Implemented", "Partially Validated") in auto_transitions
+        assert ("Partially Validated", "Validated") in auto_transitions
