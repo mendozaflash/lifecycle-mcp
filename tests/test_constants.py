@@ -28,13 +28,17 @@ class TestStateMachineStructure:
 
     def test_requirement_transitions_keys(self):
         expected = {
-            "Draft", "Under Review", "Approved", "Architecture",
-            "Ready", "Implemented", "Validated", "Deprecated",
+            "Under Review", "Approved", "Partially Implemented",
+            "Partially Implemented Validated", "Implemented",
+            "Partially Validated", "Validated", "Deprecated",
         }
         assert set(REQUIREMENT_TRANSITIONS.keys()) == expected
 
     def test_task_transitions_keys(self):
-        expected = {"Not Started", "In Progress", "Blocked", "Complete", "Abandoned"}
+        expected = {
+            "Under Review", "Approved", "Implemented",
+            "Validated", "Deprecated",
+        }
         assert set(TASK_TRANSITIONS.keys()) == expected
 
     def test_architecture_transitions_keys(self):
@@ -51,8 +55,8 @@ class TestStateMachineStructure:
 
 
 class TestTerminalStates:
-    """Deprecated is terminal for requirements and architecture;
-    Complete and Abandoned are terminal for tasks."""
+    """Deprecated is the single terminal state for requirements, tasks,
+    and architecture."""
 
     def test_requirement_deprecated_is_terminal(self):
         assert REQUIREMENT_TRANSITIONS["Deprecated"] == []
@@ -60,11 +64,8 @@ class TestTerminalStates:
     def test_architecture_deprecated_is_terminal(self):
         assert ARCHITECTURE_TRANSITIONS["Deprecated"] == []
 
-    def test_task_complete_is_terminal(self):
-        assert TASK_TRANSITIONS["Complete"] == []
-
-    def test_task_abandoned_is_terminal(self):
-        assert TASK_TRANSITIONS["Abandoned"] == []
+    def test_task_deprecated_is_terminal(self):
+        assert TASK_TRANSITIONS["Deprecated"] == []
 
 
 # ---------------------------------------------------------------
@@ -81,7 +82,8 @@ class TestStatusSets:
 
     def test_task_statuses_has_all_five(self):
         assert TASK_STATUSES == {
-            "Not Started", "In Progress", "Blocked", "Complete", "Abandoned"
+            "Under Review", "Approved", "Implemented",
+            "Validated", "Deprecated",
         }
 
     def test_requirement_statuses_equals_keys(self):
@@ -177,3 +179,65 @@ class TestArchitectureShortcut:
 
     def test_draft_includes_accepted(self):
         assert "Accepted" in ARCHITECTURE_TRANSITIONS["Draft"]
+
+
+# ---------------------------------------------------------------
+# Requirement transition details (per acceptance criteria)
+# ---------------------------------------------------------------
+
+
+class TestRequirementTransitionDetails:
+    """Verify exact allowed transitions for each requirement state.
+
+    Only manual transitions are in the dict. Auto-only forward
+    transitions (e.g. Approved -> Partially Implemented) are excluded
+    because they are enforced by DB triggers, not app logic.
+    """
+
+    def test_under_review_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Under Review"] == ["Approved", "Deprecated"]
+
+    def test_approved_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Approved"] == ["Deprecated"]
+
+    def test_partially_implemented_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Partially Implemented"] == ["Deprecated"]
+
+    def test_partially_implemented_validated_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Partially Implemented Validated"] == ["Deprecated"]
+
+    def test_implemented_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Implemented"] == ["Deprecated"]
+
+    def test_partially_validated_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Partially Validated"] == ["Deprecated"]
+
+    def test_validated_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Validated"] == ["Deprecated"]
+
+    def test_deprecated_transitions(self):
+        assert REQUIREMENT_TRANSITIONS["Deprecated"] == []
+
+
+# ---------------------------------------------------------------
+# Task transition details (per acceptance criteria)
+# ---------------------------------------------------------------
+
+
+class TestTaskTransitionDetails:
+    """Verify exact allowed transitions for each task state."""
+
+    def test_under_review_transitions(self):
+        assert TASK_TRANSITIONS["Under Review"] == ["Approved", "Deprecated"]
+
+    def test_approved_transitions(self):
+        assert TASK_TRANSITIONS["Approved"] == ["Implemented", "Deprecated"]
+
+    def test_implemented_transitions(self):
+        assert TASK_TRANSITIONS["Implemented"] == ["Validated", "Deprecated"]
+
+    def test_validated_transitions(self):
+        assert TASK_TRANSITIONS["Validated"] == ["Deprecated"]
+
+    def test_deprecated_transitions(self):
+        assert TASK_TRANSITIONS["Deprecated"] == []

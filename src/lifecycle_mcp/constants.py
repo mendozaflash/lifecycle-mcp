@@ -8,23 +8,23 @@ ENTITY_TABLE_MAP: dict[str, str] = {
 }
 
 REQUIREMENT_TRANSITIONS: dict[str, list[str]] = {
-    "Draft": ["Under Review", "Deprecated"],
-    "Under Review": ["Draft", "Approved", "Deprecated"],
-    "Approved": ["Architecture", "Ready", "Deprecated"],
-    "Architecture": ["Ready", "Approved"],
-    "Ready": ["Implemented", "Deprecated"],
-    "Implemented": ["Validated", "Ready"],
+    "Under Review": ["Approved", "Deprecated"],
+    "Approved": ["Deprecated"],
+    "Partially Implemented": ["Deprecated"],
+    "Partially Implemented Validated": ["Deprecated"],
+    "Implemented": ["Deprecated"],
+    "Partially Validated": ["Deprecated"],
     "Validated": ["Deprecated"],
     "Deprecated": [],
 }
 REQUIREMENT_STATUSES: set[str] = set(REQUIREMENT_TRANSITIONS.keys())
 
 TASK_TRANSITIONS: dict[str, list[str]] = {
-    "Not Started": ["In Progress", "Abandoned"],
-    "In Progress": ["Complete", "Blocked", "Abandoned"],
-    "Blocked": ["In Progress", "Abandoned"],
-    "Complete": [],
-    "Abandoned": [],
+    "Under Review": ["Approved", "Deprecated"],
+    "Approved": ["Implemented", "Deprecated"],
+    "Implemented": ["Validated", "Deprecated"],
+    "Validated": ["Deprecated"],
+    "Deprecated": [],
 }
 TASK_STATUSES: set[str] = set(TASK_TRANSITIONS.keys())
 
