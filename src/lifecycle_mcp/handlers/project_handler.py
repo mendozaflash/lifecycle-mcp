@@ -99,7 +99,7 @@ class ProjectHandler(BaseHandler):
             },
             {
                 "name": "get_project_details",
-                "description": "Get project details at varying depth: summary (metadata + totals), status (+ per-status breakdowns, completion %, blocked items), or metrics (+ priority/assignee/effort breakdowns as JSON)",
+                "description": "Get project details at varying depth: summary (metadata + totals), status (+ per-status breakdowns, completion %), or metrics (+ priority/assignee/effort breakdowns as JSON)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -291,7 +291,7 @@ class ProjectHandler(BaseHandler):
 
         detail_level values:
           - summary (default): metadata + total counts
-          - status: summary + per-status breakdowns, completion %, blocked items
+          - status: summary + per-status breakdowns, completion %
           - metrics: status + priority/assignee/effort breakdowns as JSON
         """
         error = self._validate_required_params(params, ["project_id"])
@@ -326,7 +326,7 @@ class ProjectHandler(BaseHandler):
 
         req_count = await self._count_entities("requirements", project_id)
         task_count = await self._count_entities("tasks", project_id)
-        tasks_complete = await self._count_entities("tasks", project_id, status="Complete")
+        tasks_complete = await self._count_entities("tasks", project_id, status="Validated")
         adr_count = await self._count_entities("architecture", project_id)
 
         status = project["status"]
@@ -380,7 +380,7 @@ class ProjectHandler(BaseHandler):
             [project_id], fetch_all=True, row_factory=True,
         )
         total_tasks = sum(t["count"] for t in task_stats) if task_stats else 0
-        completed_tasks = next((t["count"] for t in task_stats if t["status"] == "Complete"), 0) if task_stats else 0
+        completed_tasks = next((t["count"] for t in task_stats if t["status"] == "Validated"), 0) if task_stats else 0
         completion_pct = round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
         task_parts = ", ".join(f"{t['count']} {t['status']}" for t in task_stats) if task_stats else ""
 
@@ -401,17 +401,6 @@ class ProjectHandler(BaseHandler):
             f"Tasks: {total_tasks} total" + (f" ({task_parts})" if task_parts else "") + (f" -- {completion_pct}% complete" if total_tasks > 0 else ""),
             f"Architecture: {total_adrs} total" + (f" ({adr_parts})" if adr_parts else ""),
         ]
-
-        # Blocked tasks (always shown for status level)
-        blocked = await self.db.execute_query(
-            "SELECT id, title, blocked_by_id FROM blocked_tasks WHERE project_id = ?",
-            [project_id], fetch_all=True, row_factory=True,
-        )
-        if blocked:
-            lines.append("")
-            lines.append("Blocked Tasks:")
-            for b in blocked:
-                lines.append(f"- {b['id']}: {b['title']} (blocked by {b['blocked_by_id']})")
 
         return [TextContent(type="text", text="\n".join(lines))]
 
@@ -453,16 +442,9 @@ class ProjectHandler(BaseHandler):
             [project_id], fetch_all=True, row_factory=True,
         )
 
-        # Blocked count
-        blocked_row = await self.db.execute_query(
-            "SELECT COUNT(*) as cnt FROM blocked_tasks WHERE project_id = ?",
-            [project_id], fetch_one=True, row_factory=True,
-        )
-        blocked_count = blocked_row["cnt"] if blocked_row else 0
-
         # Assemble metrics
         total_tasks = sum(t["count"] for t in task_by_status) if task_by_status else 0
-        completed_tasks = next((t["count"] for t in task_by_status if t["status"] == "Complete"), 0) if task_by_status else 0
+        completed_tasks = next((t["count"] for t in task_by_status if t["status"] == "Validated"), 0) if task_by_status else 0
         completion_pct = round(completed_tasks / total_tasks * 100, 1) if total_tasks > 0 else 0
 
         metrics = {
@@ -483,7 +465,6 @@ class ProjectHandler(BaseHandler):
                 "total": sum(a["count"] for a in adr_by_status) if adr_by_status else 0,
                 "by_status": {a["status"]: a["count"] for a in adr_by_status} if adr_by_status else {},
             },
-            "blocked_count": blocked_count,
         }
 
         return [TextContent(type="text", text=json.dumps(metrics))]

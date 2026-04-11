@@ -343,16 +343,6 @@ async def _add_adr(db, adr_id, project_id, status="Draft"):
     )
 
 
-async def _add_blocking_relationship(db, blocker_id, blocked_id, project_id):
-    import uuid
-    rel_id = f"rel-{uuid.uuid4().hex[:8]}"
-    await db.execute_query(
-        "INSERT INTO relationships (id, source_type, source_id, target_type, target_id, relationship_type, project_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [rel_id, "task", blocker_id, "task", blocked_id, "blocks", project_id],
-    )
-
-
 @pytest.mark.asyncio
 async def test_get_project_details_summary_default(project_handler):
     """get_project_details defaults to summary level with metadata + total counts."""
@@ -374,7 +364,7 @@ async def test_get_project_details_summary_default(project_handler):
     assert "CountTest" in text
     # Summary shows total counts
     assert "Requirements: 2" in text
-    assert "Tasks: 2" in text
+    assert "Tasks: 2 (1 complete)" in text or ("Tasks: 2" in text and "1 complete" in text)
     assert "ADRs: 1" in text
 
 
@@ -434,32 +424,28 @@ async def test_get_project_details_status(project_handler):
     )
     text = result[0].text
 
-    # Production code queries the dropped blocked_tasks view. If it errors,
-    # the handler returns an ERROR response. If the view happens to exist
-    # (e.g. from a later migration), we validate the breakdowns.
-    if "ERROR" in text:
-        assert "blocked_tasks" in text.lower() or "no such table" in text.lower() or "ERROR" in text
-    else:
-        # Per-status breakdowns
-        assert "2 Under Review" in text  # requirements
-        assert "1 Approved" in text
-        assert "1 Under Review" in text  # tasks (shared label with reqs)
-        assert "2 Validated" in text
-        # Completion percentage: production code checks for status=="Complete" which is gone,
-        # so completion_pct will be 0%
-        assert "0%" in text
-        # ADR breakdown
-        assert "1 Draft" in text
-        assert "1 Accepted" in text
+    # Should succeed now that blocked_tasks view references are removed
+    assert "SUCCESS" in text or "PROJ-0001" in text
+
+    # Per-status breakdowns
+    assert "2 Under Review" in text  # requirements
+    assert "1 Approved" in text
+    assert "1 Under Review" in text  # tasks (shared label with reqs)
+    assert "2 Validated" in text
+    # Completion percentage: 2 Validated out of 4 tasks = 50%
+    assert "50%" in text
+    # ADR breakdown
+    assert "1 Draft" in text
+    assert "1 Accepted" in text
 
 
 @pytest.mark.asyncio
-async def test_get_project_details_status_no_blocked_view(project_handler):
-    """get_project_details with detail_level=status gracefully handles missing blocked_tasks view.
+async def test_get_project_details_status_no_blocked_section(project_handler):
+    """get_project_details with detail_level=status does not include a Blocked Tasks section.
 
-    The blocked_tasks view was removed from the v2 schema; the production code
-    still references it, so this test verifies the handler returns an error
-    response rather than crashing.
+    The blocked_tasks view was removed from the v2 schema and the handler
+    no longer queries it. Verify the response succeeds and contains no
+    'Blocked Tasks' section.
     """
     db = project_handler.db
     await project_handler.handle_tool_call("create_project", {"name": "BlockTest"})
@@ -471,8 +457,9 @@ async def test_get_project_details_status_no_blocked_view(project_handler):
         "get_project_details", {"project_id": "PROJ-0001", "detail_level": "status"}
     )
     text = result[0].text
-    # Production code queries the dropped blocked_tasks view, which causes an error
-    assert "ERROR" in text or "PROJ-0001" in text
+    assert "PROJ-0001" in text
+    assert "SUCCESS" in text
+    assert "Blocked Tasks" not in text
 
 
 @pytest.mark.asyncio
@@ -492,16 +479,15 @@ async def test_get_project_details_metrics(project_handler):
         "get_project_details", {"project_id": "PROJ-0001", "detail_level": "metrics"}
     )
     text = result[0].text
-    # Production code queries dropped blocked_tasks view, causing an error.
-    # Accept either a valid JSON response or an error response.
-    if "ERROR" in text:
-        # The blocked_tasks view is missing; this is expected
-        assert "blocked_tasks" in text.lower() or "no such table" in text.lower() or "ERROR" in text
-    else:
-        metrics = json.loads(text)
-        assert metrics["project_id"] == "PROJ-0001"
-        assert metrics["requirements"]["total"] == 2
-        assert metrics["tasks"]["total"] == 3
+    metrics = json.loads(text)
+    assert metrics["project_id"] == "PROJ-0001"
+    assert metrics["requirements"]["total"] == 2
+    assert metrics["tasks"]["total"] == 3
+    # 1 Validated task out of 3 = 33.3%
+    assert metrics["tasks"]["completion_pct"] == 33.3
+    assert metrics["architecture"]["total"] == 1
+    # No blocked_count key in metrics
+    assert "blocked_count" not in metrics
 
 
 @pytest.mark.asyncio
@@ -513,16 +499,12 @@ async def test_get_project_details_metrics_empty(project_handler):
         "get_project_details", {"project_id": "PROJ-0001", "detail_level": "metrics"}
     )
     text = result[0].text
-    # Production code queries dropped blocked_tasks view, causing an error.
-    # Accept either a valid JSON response or an error response.
-    if "ERROR" in text:
-        assert "blocked_tasks" in text.lower() or "no such table" in text.lower() or "ERROR" in text
-    else:
-        metrics = json.loads(text)
-        assert metrics["requirements"]["total"] == 0
-        assert metrics["tasks"]["total"] == 0
-        assert metrics["tasks"]["completion_pct"] == 0
-        assert metrics["architecture"]["total"] == 0
+    metrics = json.loads(text)
+    assert metrics["requirements"]["total"] == 0
+    assert metrics["tasks"]["total"] == 0
+    assert metrics["tasks"]["completion_pct"] == 0
+    assert metrics["architecture"]["total"] == 0
+    assert "blocked_count" not in metrics
 
 
 @pytest.mark.asyncio
