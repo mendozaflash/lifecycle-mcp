@@ -254,17 +254,9 @@ class ValidationHandler(BaseHandler):
                 })
 
         # ----------------------------------------------------------
-        # 6. Blocked tasks
+        # 6. (Removed — "Blocked" status no longer exists; blocking
+        #     is expressed via task-to-task relationships.)
         # ----------------------------------------------------------
-        for task in tasks:
-            if task["status"] == "Blocked":
-                infos += 1
-                details.append({
-                    "check": "blocked_task",
-                    "severity": "info",
-                    "entity_id": task["id"],
-                    "message": f"Task {task['id']} is blocked",
-                })
 
         # ----------------------------------------------------------
         # 7. Unlinked ADRs

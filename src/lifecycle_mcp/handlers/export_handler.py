@@ -547,12 +547,13 @@ class ExportHandler(BaseHandler):
             for req in reqs:
                 node_id = req["id"].replace("-", "_")
                 status_color = {
-                    "Draft": "fill:#ff9999",
                     "Under Review": "fill:#ffcc99",
                     "Approved": "fill:#99ccff",
-                    "Ready": "fill:#99ff99",
-                    "Implemented": "fill:#ccffcc",
-                    "Validated": "fill:#99ff99",
+                    "Partially Implemented": "fill:#ffff99",
+                    "Partially Implemented Validated": "fill:#ccff99",
+                    "Implemented": "fill:#99ff99",
+                    "Partially Validated": "fill:#ccff99",
+                    "Validated": "fill:#66ff66",
                     "Deprecated": "fill:#cccccc",
                 }.get(req["status"], "fill:#ffffff")
 
@@ -601,11 +602,11 @@ class ExportHandler(BaseHandler):
         for task in tasks:
             node_id = task["id"].replace("-", "_")
             status_color = {
-                "Not Started": "fill:#ff9999",
-                "In Progress": "fill:#ffcc99",
-                "Blocked": "fill:#ff6666",
-                "Complete": "fill:#99ff99",
-                "Abandoned": "fill:#cccccc",
+                "Under Review": "fill:#ffcc99",
+                "Approved": "fill:#99ccff",
+                "Implemented": "fill:#99ff99",
+                "Validated": "fill:#66ff66",
+                "Deprecated": "fill:#cccccc",
             }.get(task["status"], "fill:#ffffff")
 
             title_short = task["title"][:30] + "..." if len(task["title"]) > 30 else task["title"]
