@@ -101,8 +101,9 @@ class RequirementHandler(BaseHandler):
                         "new_status": {
                             "type": "string",
                             "enum": [
-                                "Draft", "Under Review", "Approved", "Architecture",
-                                "Ready", "Implemented", "Validated", "Deprecated",
+                                "Under Review", "Approved", "Partially Implemented",
+                                "Partially Implemented Validated", "Implemented",
+                                "Partially Validated", "Validated", "Deprecated",
                             ],
                         },
                         "comment": {"type": "string"},
@@ -203,7 +204,7 @@ class RequirementHandler(BaseHandler):
                 "name": "clone_requirement",
                 "description": (
                     "Clone a requirement with a new ID. Copies relationships. "
-                    "Resets status to Draft. Review copied relationships for applicability."
+                    "Resets status to Under Review. Review copied relationships for applicability."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -627,7 +628,7 @@ class RequirementHandler(BaseHandler):
             "project_id": project_id,
             "type": original["type"],
             "title": original["title"],
-            "status": "Draft",
+            "status": "Under Review",
             "priority": original["priority"],
         }
 
@@ -678,7 +679,7 @@ class RequirementHandler(BaseHandler):
             "type": params["type"],
             "title": params["title"],
             "priority": params["priority"],
-            "status": "Draft",
+            "status": "Under Review",
         }
         # Optional scalar fields
         for field in ["current_state", "desired_state", "business_value", "author"]:

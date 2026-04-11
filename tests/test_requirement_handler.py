@@ -48,7 +48,7 @@ async def _create_task(db, project_id, task_id, title="Test Task"):
     """Insert a task directly into the DB for relationship testing."""
     await db.execute_query(
         "INSERT INTO tasks (id, project_id, title, priority, status) "
-        "VALUES (?, ?, ?, 'P1', 'Not Started')",
+        "VALUES (?, ?, ?, 'P1', 'Under Review')",
         [task_id, project_id, title],
     )
 
@@ -167,7 +167,7 @@ async def test_create_requirement_stores_fields(setup):
     assert json.loads(row["acceptance_criteria"]) == ["AC-1", "AC-2"]
     assert row["business_value"] == "High value"
     assert row["author"] == "Alice"
-    assert row["status"] == "Draft"
+    assert row["status"] == "Under Review"
     assert row["project_id"] == pid
 
 
@@ -287,13 +287,7 @@ async def test_update_requirement_no_fields(setup):
 @pytest.mark.asyncio
 async def test_update_status_valid_transitions(setup):
     handler, db, pid = setup
-    await _create_req(handler, pid)
-
-    # Draft -> Under Review
-    result = await handler.handle_tool_call(
-        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Under Review"}
-    )
-    assert "SUCCESS" in result[0].text
+    await _create_req(handler, pid)  # status = "Under Review"
 
     # Under Review -> Approved
     result = await handler.handle_tool_call(
@@ -301,13 +295,19 @@ async def test_update_status_valid_transitions(setup):
     )
     assert "SUCCESS" in result[0].text
 
+    # Approved -> Deprecated
+    result = await handler.handle_tool_call(
+        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Deprecated"}
+    )
+    assert "SUCCESS" in result[0].text
+
 
 @pytest.mark.asyncio
 async def test_update_status_invalid_transition(setup):
     handler, db, pid = setup
-    await _create_req(handler, pid)  # status = "Draft"
+    await _create_req(handler, pid)  # status = "Under Review"
 
-    # Draft -> Validated (not allowed)
+    # Under Review -> Validated (not allowed)
     result = await handler.handle_tool_call(
         "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Validated"}
     )
@@ -318,16 +318,16 @@ async def test_update_status_invalid_transition(setup):
 @pytest.mark.asyncio
 async def test_update_status_deprecated_is_terminal(setup):
     handler, db, pid = setup
-    await _create_req(handler, pid)
+    await _create_req(handler, pid)  # status = "Under Review"
 
-    # Draft -> Deprecated
+    # Under Review -> Deprecated
     await handler.handle_tool_call(
         "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Deprecated"}
     )
 
-    # Deprecated -> Draft (not allowed, Deprecated is terminal)
+    # Deprecated -> Under Review (not allowed, Deprecated is terminal)
     result = await handler.handle_tool_call(
-        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Draft"}
+        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Under Review"}
     )
     assert "ERROR" in result[0].text
 
@@ -335,11 +335,11 @@ async def test_update_status_deprecated_is_terminal(setup):
 @pytest.mark.asyncio
 async def test_update_status_logs_event(setup):
     handler, db, pid = setup
-    await _create_req(handler, pid)
+    await _create_req(handler, pid)  # status = "Under Review"
 
     await handler.handle_tool_call(
         "update_requirement_status",
-        {"requirement_id": "REQ-0001", "new_status": "Under Review", "comment": "Ready for review"},
+        {"requirement_id": "REQ-0001", "new_status": "Approved", "comment": "Looks good"},
     )
 
     # Check lifecycle_events table for trigger-based log
@@ -349,8 +349,8 @@ async def test_update_status_logs_event(setup):
         row_factory=True,
     )
     assert len(events) >= 1
-    assert events[0]["from_value"] == "Draft"
-    assert events[0]["to_value"] == "Under Review"
+    assert events[0]["from_value"] == "Under Review"
+    assert events[0]["to_value"] == "Approved"
 
 
 @pytest.mark.asyncio
@@ -366,10 +366,10 @@ async def test_update_status_not_found(setup):
 @pytest.mark.asyncio
 async def test_update_status_with_comment(setup):
     handler, db, pid = setup
-    await _create_req(handler, pid)
+    await _create_req(handler, pid)  # status = "Under Review"
     result = await handler.handle_tool_call(
         "update_requirement_status",
-        {"requirement_id": "REQ-0001", "new_status": "Under Review", "comment": "Please review"},
+        {"requirement_id": "REQ-0001", "new_status": "Approved", "comment": "Approved by lead"},
     )
     assert "SUCCESS" in result[0].text
 
@@ -379,7 +379,7 @@ async def test_update_status_with_comment(setup):
         fetch_one=True,
         row_factory=True,
     )
-    assert row["status"] == "Under Review"
+    assert row["status"] == "Approved"
 
 
 # =============================================================================
@@ -470,18 +470,18 @@ async def test_query_requirements_filters(setup):
 @pytest.mark.asyncio
 async def test_query_requirements_by_status(setup):
     handler, db, pid = setup
-    await _create_req(handler, pid, title="Draft Req")
-    await _create_req(handler, pid, title="Reviewed Req")
+    await _create_req(handler, pid, title="Review Req")
+    await _create_req(handler, pid, title="Approved Req")
     await handler.handle_tool_call(
-        "update_requirement_status", {"requirement_id": "REQ-0002", "new_status": "Under Review"}
+        "update_requirement_status", {"requirement_id": "REQ-0002", "new_status": "Approved"}
     )
 
     result = await handler.handle_tool_call(
-        "query_requirements", {"status": "Under Review"}
+        "query_requirements", {"status": "Approved"}
     )
     text = result[0].text
-    assert "Reviewed Req" in text
-    assert "Draft Req" not in text
+    assert "Approved Req" in text
+    assert "Review Req" not in text
 
 
 @pytest.mark.asyncio
@@ -521,8 +521,8 @@ async def test_query_requirements_summary_format(setup):
     result = await handler.handle_tool_call("query_requirements", {"project_id": pid})
     text = result[0].text
     # Summary format: "REQ-XXXX | title | status | priority"
-    assert "REQ-0001 | Alpha Req | Draft | P0" in text
-    assert "REQ-0002 | Beta Req | Draft | P1" in text
+    assert "REQ-0001 | Alpha Req | Under Review | P0" in text
+    assert "REQ-0002 | Beta Req | Under Review | P1" in text
 
 
 @pytest.mark.asyncio
@@ -535,7 +535,7 @@ async def test_query_requirements_summary_format_explicit(setup):
         "query_requirements", {"project_id": pid, "output_format": "summary"}
     )
     text = result[0].text
-    assert "REQ-0001 | Explicit Summary | Draft | P2" in text
+    assert "REQ-0001 | Explicit Summary | Under Review | P2" in text
 
 
 @pytest.mark.asyncio
@@ -571,7 +571,7 @@ async def test_query_requirements_markdown_format(setup):
     # Markdown format has the detailed listing with dashes
     assert "REQ-0001" in text
     assert "Markdown Req" in text
-    assert "Draft" in text
+    assert "Under Review" in text
     assert "P1" in text
 
 
@@ -861,7 +861,7 @@ async def test_clone_requirement_basic(setup):
     assert "SUCCESS" in text
     assert "REQ-0002" in text
 
-    # Cloned requirement should have same fields but new ID, Draft status
+    # Cloned requirement should have same fields but new ID, Under Review status
     row = await db.execute_query(
         "SELECT title, priority, type, status FROM requirements WHERE id = 'REQ-0002'",
         fetch_one=True,
@@ -870,7 +870,7 @@ async def test_clone_requirement_basic(setup):
     assert row["title"] == "Original"
     assert row["priority"] == "P1"
     assert row["type"] == "FUNC"
-    assert row["status"] == "Draft"
+    assert row["status"] == "Under Review"
 
 
 @pytest.mark.asyncio
@@ -893,13 +893,10 @@ async def test_clone_requirement_copies_relationships(setup):
 
 
 @pytest.mark.asyncio
-async def test_clone_requirement_resets_status_to_draft(setup):
+async def test_clone_requirement_resets_status_to_under_review(setup):
     handler, db, pid = setup
     await _create_req(handler, pid, title="Advanced Req")
     # Move through lifecycle
-    await handler.handle_tool_call(
-        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Under Review"}
-    )
     await handler.handle_tool_call(
         "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Approved"}
     )
@@ -911,7 +908,7 @@ async def test_clone_requirement_resets_status_to_draft(setup):
         fetch_one=True,
         row_factory=True,
     )
-    assert row["status"] == "Draft"
+    assert row["status"] == "Under Review"
 
 
 @pytest.mark.asyncio
@@ -943,6 +940,48 @@ async def test_clone_requirement_not_found(setup):
     result = await handler.handle_tool_call("clone_requirement", {"requirement_id": "REQ-9999"})
     assert "ERROR" in result[0].text
     assert "not found" in result[0].text.lower()
+
+
+# =============================================================================
+#  update_requirement_status — auto-only transition rejection
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_manual_partially_implemented_rejected(setup):
+    """Approved -> Partially Implemented is auto-only and must be rejected via manual tool call."""
+    handler, db, pid = setup
+    await _create_req(handler, pid)
+    # Under Review -> Approved
+    await handler.handle_tool_call(
+        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Approved"}
+    )
+
+    # Approved -> Partially Implemented (auto-only, not in manual transitions)
+    result = await handler.handle_tool_call(
+        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Partially Implemented"}
+    )
+    assert "ERROR" in result[0].text
+    assert "Invalid transition" in result[0].text or "transition" in result[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_manual_partially_validated_rejected(setup):
+    """Implemented -> Partially Validated is auto-only and must be rejected via manual tool call."""
+    handler, db, pid = setup
+    await _create_req(handler, pid)
+    # Set status directly to Implemented (no manual path to get there)
+    await db.execute_query(
+        "UPDATE requirements SET status = 'Implemented' WHERE id = ?",
+        ["REQ-0001"],
+    )
+
+    # Implemented -> Partially Validated (auto-only, not in manual transitions)
+    result = await handler.handle_tool_call(
+        "update_requirement_status", {"requirement_id": "REQ-0001", "new_status": "Partially Validated"}
+    )
+    assert "ERROR" in result[0].text
+    assert "Invalid transition" in result[0].text or "transition" in result[0].text.lower()
 
 
 # =============================================================================
