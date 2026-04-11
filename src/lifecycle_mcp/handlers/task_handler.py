@@ -136,32 +136,38 @@ class TaskHandler(BaseHandler):
                             "type": "boolean",
                             "description": "Include archived tasks (default: false)",
                         },
-                    },
-                },
-            },
-            {
-                "name": "query_tasks_json",
-                "description": "Query tasks and return structured JSON data for UI",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string"},
-                        "status": {"type": "string"},
-                        "priority": {"type": "string"},
-                        "assignee": {"type": "string"},
-                        "include_archived": {
-                            "type": "boolean",
-                            "description": "Include archived tasks (default: false)",
+                        "output_format": {
+                            "type": "string",
+                            "enum": ["summary", "json", "markdown"],
+                            "description": "Output format: summary (one-line per task), json (structured array), markdown (verbose). Default: summary",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of tasks to return (default: 25)",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Number of tasks to skip for pagination (default: 0)",
                         },
                     },
                 },
             },
             {
                 "name": "get_task_details",
-                "description": "Get full task details with linked requirements and ADRs",
+                "description": "Get task details with configurable sections",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "sections": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["planning", "execution", "requirements", "adrs", "subtasks"],
+                            },
+                            "description": "Sections to include. Default: ['planning', 'requirements']",
+                        },
+                    },
                     "required": ["task_id"],
                 },
             },
@@ -221,33 +227,6 @@ class TaskHandler(BaseHandler):
                     "required": ["task_id"],
                 },
             },
-            {
-                "name": "get_task_requirement_context",
-                "description": "Get requirements linked to this task via relationships",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
-                    "required": ["task_id"],
-                },
-            },
-            {
-                "name": "get_task_adr_context",
-                "description": "Get architecture decisions linked to this task via relationships",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
-                    "required": ["task_id"],
-                },
-            },
-            {
-                "name": "get_task_full_context",
-                "description": "Get both requirements AND ADRs linked to this task",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
-                    "required": ["task_id"],
-                },
-            },
         ]
 
     # ------------------------------------------------------------------
@@ -262,13 +241,9 @@ class TaskHandler(BaseHandler):
             "update_task_status": self._update_task_status,
             "archive_task": self._archive_task,
             "query_tasks": self._query_tasks,
-            "query_tasks_json": self._query_tasks_json,
             "get_task_details": self._get_task_details,
             "batch_create_tasks": self._batch_create_tasks,
             "clone_task": self._clone_task,
-            "get_task_requirement_context": self._get_task_requirement_context,
-            "get_task_adr_context": self._get_task_adr_context,
-            "get_task_full_context": self._get_task_full_context,
         }
         handler = handlers.get(tool_name)
         if not handler:
@@ -409,20 +384,64 @@ class TaskHandler(BaseHandler):
     # ------------------------------------------------------------------
 
     async def _query_tasks(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query tasks with filters."""
+        """Query tasks with filters, output_format, limit, and offset."""
+        output_format = params.get("output_format", "summary")
+        limit = params.get("limit", 25)
+        offset = params.get("offset", 0)
+
         conditions, query_params = self._build_query_filters(params)
         where_clause = " AND ".join(conditions) if conditions else ""
 
-        tasks = await self.db.get_records(
-            "tasks", "*",
-            where_clause=where_clause,
-            where_params=query_params,
-            order_by="priority, created_at DESC",
+        # Build query with LIMIT/OFFSET
+        query = "SELECT * FROM tasks"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+        query += " ORDER BY priority, created_at DESC"
+        query += " LIMIT ? OFFSET ?"
+        query_params.extend([limit, offset])
+
+        tasks = await self.db.execute_query(
+            query, query_params, fetch_all=True, row_factory=True
         )
 
         if not tasks:
             return self._create_above_fold_response("INFO", "No tasks found", "Try adjusting search criteria")
 
+        if output_format == "json":
+            return self._format_tasks_json(tasks)
+        elif output_format == "markdown":
+            return self._format_tasks_markdown(tasks, params)
+        else:
+            return self._format_tasks_summary(tasks, params)
+
+    def _format_tasks_summary(self, tasks: list, params: dict[str, Any]) -> list[TextContent]:
+        """Format tasks as one-line pipe-delimited summaries."""
+        lines = []
+        for task in tasks:
+            line = f"TASK {task['id']} | {task['title']} | {task['status']} | {task['priority']}"
+            if task["assignee"]:
+                line += f" | {task['assignee']}"
+            lines.append(line)
+
+        filter_desc = self._build_filter_description(params)
+        key_info = self._format_count_summary("task", len(tasks), filter_desc)
+        return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
+
+    def _format_tasks_json(self, tasks: list) -> list[TextContent]:
+        """Format tasks as a JSON array of {id, title, status, priority}."""
+        result_list = [
+            {
+                "id": task["id"],
+                "title": task["title"],
+                "status": task["status"],
+                "priority": task["priority"],
+            }
+            for task in tasks
+        ]
+        return [TextContent(type="text", text=json.dumps(result_list))]
+
+    def _format_tasks_markdown(self, tasks: list, params: dict[str, Any]) -> list[TextContent]:
+        """Format tasks as verbose markdown (backward-compatible with old query_tasks)."""
         lines = []
         for task in tasks:
             info = f"- {task['id']}: {task['title']} [{task['status']}] {task['priority']}"
@@ -435,43 +454,11 @@ class TaskHandler(BaseHandler):
         return self._create_above_fold_response("SUCCESS", key_info, "", "\n".join(lines))
 
     # ------------------------------------------------------------------
-    # query_tasks_json
-    # ------------------------------------------------------------------
-
-    async def _query_tasks_json(self, params: dict[str, Any]) -> list[TextContent]:
-        """Query tasks and return structured JSON."""
-        conditions, query_params = self._build_query_filters(params)
-        where_clause = " AND ".join(conditions) if conditions else ""
-
-        tasks = await self.db.get_records(
-            "tasks", "*",
-            where_clause=where_clause,
-            where_params=query_params,
-            order_by="priority, created_at DESC",
-        )
-
-        json_fields = [
-            "acceptance_criteria", "files_touched", "verification_commands", "public_symbols",
-        ]
-        result_list = []
-        for task in tasks:
-            task_dict = dict(task) if hasattr(task, "keys") else task
-            for field in json_fields:
-                if field in task_dict and isinstance(task_dict[field], str):
-                    try:
-                        task_dict[field] = json.loads(task_dict[field]) if task_dict[field] else []
-                    except (json.JSONDecodeError, TypeError):
-                        task_dict[field] = []
-            result_list.append(task_dict)
-
-        return [TextContent(type="text", text=json.dumps(result_list))]
-
-    # ------------------------------------------------------------------
     # get_task_details
     # ------------------------------------------------------------------
 
     async def _get_task_details(self, params: dict[str, Any]) -> list[TextContent]:
-        """Get full task details with relationships."""
+        """Get task details with configurable sections."""
         error = self._validate_required_params(params, ["task_id"])
         if error:
             return self._create_error_response(error)
@@ -482,8 +469,9 @@ class TaskHandler(BaseHandler):
             return self._create_error_response(f"Task not found: {task_id}")
 
         task = dict(rows[0])
+        sections = params.get("sections", ["planning", "requirements"])
 
-        # Build report
+        # Build report — basic info is always included
         report = f"""# Task Details: {task["id"]}
 
 ## Basic Information
@@ -508,73 +496,81 @@ class TaskHandler(BaseHandler):
         else:
             report += "No acceptance criteria defined\n"
 
-        # Planning fields
-        planning_items = []
-        if task.get("scope_boundaries"):
-            planning_items.append(f"- **Scope Boundaries**: {task['scope_boundaries']}")
-        if task.get("technical_outline"):
-            planning_items.append(f"- **Technical Outline**: {task['technical_outline']}")
-        if task.get("files_touched"):
-            files = self._safe_json_loads(task["files_touched"])
-            if files:
-                planning_items.append(f"- **Files Touched**: {', '.join(files)}")
-        if task.get("verification_commands"):
-            cmds = self._safe_json_loads(task["verification_commands"])
-            if cmds:
-                planning_items.append(f"- **Verification Commands**: {', '.join(cmds)}")
-        if task.get("public_symbols"):
-            syms = self._safe_json_loads(task["public_symbols"])
-            if syms:
-                planning_items.append(f"- **Public Symbols**: {', '.join(syms)}")
-        if task.get("risk_notes"):
-            planning_items.append(f"- **Risk Notes**: {task['risk_notes']}")
+        # Planning section
+        if "planning" in sections:
+            planning_items = []
+            if task.get("scope_boundaries"):
+                planning_items.append(f"- **Scope Boundaries**: {task['scope_boundaries']}")
+            if task.get("technical_outline"):
+                planning_items.append(f"- **Technical Outline**: {task['technical_outline']}")
+            if task.get("files_touched"):
+                files = self._safe_json_loads(task["files_touched"])
+                if files:
+                    planning_items.append(f"- **Files Touched**: {', '.join(files)}")
+            if task.get("verification_commands"):
+                cmds = self._safe_json_loads(task["verification_commands"])
+                if cmds:
+                    planning_items.append(f"- **Verification Commands**: {', '.join(cmds)}")
+            if task.get("public_symbols"):
+                syms = self._safe_json_loads(task["public_symbols"])
+                if syms:
+                    planning_items.append(f"- **Public Symbols**: {', '.join(syms)}")
+            if task.get("risk_notes"):
+                planning_items.append(f"- **Risk Notes**: {task['risk_notes']}")
 
-        if planning_items:
-            report += "\n## Planning\n" + "\n".join(planning_items) + "\n"
+            if planning_items:
+                report += "\n## Planning\n" + "\n".join(planning_items) + "\n"
 
-        # Execution fields
-        if task.get("execution_notes") or task.get("deviation_from_plan"):
-            report += "\n## Execution\n"
+        # Execution section
+        if "execution" in sections:
+            exec_items = []
             if task.get("execution_notes"):
-                report += f"- **Execution Notes**: {task['execution_notes']}\n"
+                exec_items.append(f"- **Execution Notes**: {task['execution_notes']}")
             if task.get("deviation_from_plan"):
-                report += f"- **Deviation from Plan**: {task['deviation_from_plan']}\n"
+                exec_items.append(f"- **Deviation from Plan**: {task['deviation_from_plan']}")
+            if task.get("completed_at"):
+                exec_items.append(f"- **Completed At**: {task['completed_at']}")
 
-        # Linked requirements via relationships
-        requirements = await self._get_linked_requirements(task_id)
-        if requirements:
-            report += f"\n## Linked Requirements ({len(requirements)})\n"
-            for req in requirements:
-                report += f"- {req['id']}: {req['title']}\n"
+            if exec_items:
+                report += "\n## Execution\n" + "\n".join(exec_items) + "\n"
 
-        # Linked ADRs via relationships
-        adrs = await self._get_linked_adrs(task_id)
-        if adrs:
-            report += f"\n## Linked Architecture Decisions ({len(adrs)})\n"
-            for adr in adrs:
-                report += f"- {adr['id']}: {adr['title']}\n"
+        # Requirements section
+        if "requirements" in sections:
+            requirements = await self._get_linked_requirements(task_id)
+            if requirements:
+                report += f"\n## Linked Requirements ({len(requirements)})\n"
+                for req in requirements:
+                    report += f"- {req['id']}: {req['title']}\n"
 
-        # Child tasks
-        children = await self.db.get_records(
-            "tasks", "id, title, status",
-            where_clause="parent_task_id = ? AND is_archived = 0",
-            where_params=[task_id],
-        )
-        if children:
-            report += f"\n## Subtasks ({len(children)})\n"
-            for child in children:
-                report += f"- {child['id']}: {child['title']} [{child['status']}]\n"
+        # ADRs section
+        if "adrs" in sections:
+            adrs = await self._get_linked_adrs(task_id)
+            if adrs:
+                report += f"\n## Linked Architecture Decisions ({len(adrs)})\n"
+                for adr in adrs:
+                    report += f"- {adr['id']}: {adr['title']}\n"
 
-        # Parent task
-        if task.get("parent_task_id"):
-            parent_rows = await self.db.get_records(
+        # Subtasks section
+        if "subtasks" in sections:
+            children = await self.db.get_records(
                 "tasks", "id, title, status",
-                where_clause="id = ?",
-                where_params=[task["parent_task_id"]],
+                where_clause="parent_task_id = ? AND is_archived = 0",
+                where_params=[task_id],
             )
-            if parent_rows:
-                p = parent_rows[0]
-                report += f"\n## Parent Task\n- {p['id']}: {p['title']} [{p['status']}]\n"
+            if children:
+                report += f"\n## Subtasks ({len(children)})\n"
+                for child in children:
+                    report += f"- {child['id']}: {child['title']} [{child['status']}]\n"
+
+            if task.get("parent_task_id"):
+                parent_rows = await self.db.get_records(
+                    "tasks", "id, title, status",
+                    where_clause="id = ?",
+                    where_params=[task["parent_task_id"]],
+                )
+                if parent_rows:
+                    p = parent_rows[0]
+                    report += f"\n## Parent Task\n- {p['id']}: {p['title']} [{p['status']}]\n"
 
         key_info = self._format_status_summary("Task", task["id"], task["status"])
         action_info = f"{task['title']} | {task['priority']} | {task['effort'] or 'No effort'}"
@@ -743,107 +739,6 @@ class TaskHandler(BaseHandler):
         return cloned_ids
 
     # ------------------------------------------------------------------
-    # Context tools
-    # ------------------------------------------------------------------
-
-    async def _get_task_requirement_context(self, params: dict[str, Any]) -> list[TextContent]:
-        """Get requirements linked to this task."""
-        error = self._validate_required_params(params, ["task_id"])
-        if error:
-            return self._create_error_response(error)
-
-        task_id = params["task_id"]
-        error = await self._validate_entity_exists("task", task_id)
-        if error:
-            return self._create_error_response(error)
-
-        requirements = await self._get_linked_requirements(task_id)
-
-        if not requirements:
-            return self._create_above_fold_response(
-                "INFO", f"No linked requirements for {task_id}"
-            )
-
-        lines = []
-        for req in requirements:
-            lines.append(f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}")
-
-        return self._create_above_fold_response(
-            "SUCCESS",
-            f"{len(requirements)} requirement(s) linked to {task_id}",
-            "",
-            "\n".join(lines),
-        )
-
-    async def _get_task_adr_context(self, params: dict[str, Any]) -> list[TextContent]:
-        """Get ADRs linked to this task."""
-        error = self._validate_required_params(params, ["task_id"])
-        if error:
-            return self._create_error_response(error)
-
-        task_id = params["task_id"]
-        error = await self._validate_entity_exists("task", task_id)
-        if error:
-            return self._create_error_response(error)
-
-        adrs = await self._get_linked_adrs(task_id)
-
-        if not adrs:
-            return self._create_above_fold_response(
-                "INFO", f"No linked ADRs for {task_id}"
-            )
-
-        lines = []
-        for adr in adrs:
-            lines.append(f"- {adr['id']}: {adr['title']} [{adr['status']}]")
-
-        return self._create_above_fold_response(
-            "SUCCESS",
-            f"{len(adrs)} ADR(s) linked to {task_id}",
-            "",
-            "\n".join(lines),
-        )
-
-    async def _get_task_full_context(self, params: dict[str, Any]) -> list[TextContent]:
-        """Get both requirements AND ADRs linked to this task."""
-        error = self._validate_required_params(params, ["task_id"])
-        if error:
-            return self._create_error_response(error)
-
-        task_id = params["task_id"]
-        error = await self._validate_entity_exists("task", task_id)
-        if error:
-            return self._create_error_response(error)
-
-        requirements = await self._get_linked_requirements(task_id)
-        adrs = await self._get_linked_adrs(task_id)
-
-        lines = []
-        if requirements:
-            lines.append(f"## Requirements ({len(requirements)})")
-            for req in requirements:
-                lines.append(f"- {req['id']}: {req['title']} [{req['status']}] {req['priority']}")
-            lines.append("")
-
-        if adrs:
-            lines.append(f"## Architecture Decisions ({len(adrs)})")
-            for adr in adrs:
-                lines.append(f"- {adr['id']}: {adr['title']} [{adr['status']}]")
-
-        if not requirements and not adrs:
-            return self._create_above_fold_response(
-                "INFO", f"No linked entities for {task_id}"
-            )
-
-        total = len(requirements) + len(adrs)
-        return self._create_above_fold_response(
-            "SUCCESS",
-            f"{total} linked entity(ies) for {task_id}",
-            f"{len(requirements)} requirement(s), {len(adrs)} ADR(s)",
-            "\n".join(lines),
-        )
-
-    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
@@ -868,7 +763,7 @@ class TaskHandler(BaseHandler):
         return data
 
     def _build_query_filters(self, params: dict[str, Any]) -> tuple[list[str], list[Any]]:
-        """Build WHERE conditions for query_tasks / query_tasks_json."""
+        """Build WHERE conditions for query_tasks."""
         conditions: list[str] = []
         query_params: list[Any] = []
 
