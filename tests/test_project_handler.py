@@ -201,7 +201,7 @@ async def test_archive_project_cascading(project_handler):
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, status, is_archived) "
         "VALUES (?, ?, ?, ?, ?)",
-        ["ADR-0001", "PROJ-0001", "Child ADR", "Draft", 0],
+        ["ADR-0001", "PROJ-0001", "Child ADR", "Under Review", 0],
     )
 
     # Archive the project
@@ -336,7 +336,7 @@ async def _add_task(db, task_id, project_id, status="Under Review", priority="P1
     )
 
 
-async def _add_adr(db, adr_id, project_id, status="Draft"):
+async def _add_adr(db, adr_id, project_id, status="Under Review"):
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, context, decision, status) VALUES (?, ?, ?, ?, ?, ?)",
         [adr_id, project_id, f"ADR {adr_id}", "ctx", "dec", status],
@@ -418,7 +418,7 @@ async def test_get_project_details_status(project_handler):
     await _add_task(db, "TASK-0003", "PROJ-0001", status="Validated")
     await _add_task(db, "TASK-0004", "PROJ-0001", status="Validated")
     await _add_task(db, "TASK-0005", "PROJ-0001", status="Implemented")
-    await _add_adr(db, "ADR-0001", "PROJ-0001", status="Draft")
+    await _add_adr(db, "ADR-0001", "PROJ-0001", status="Under Review")
     await _add_adr(db, "ADR-0002", "PROJ-0001", status="Accepted")
 
     result = await project_handler.handle_tool_call(
@@ -439,7 +439,7 @@ async def test_get_project_details_status(project_handler):
     assert "25% progress" in text
     assert "0% validated" in text
     # ADR breakdown
-    assert "1 Draft" in text
+    # ADR breakdown -- both req and ADR show "Under Review" in separate lines
     assert "1 Accepted" in text
 
 

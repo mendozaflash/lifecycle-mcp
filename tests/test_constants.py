@@ -9,6 +9,7 @@ from lifecycle_mcp.constants import (
     ARCHITECTURE_STATUSES,
     ARCHITECTURE_TRANSITIONS,
     ENTITY_TABLE_MAP,
+    PATTERN_TYPES,
     REQUIREMENT_STATUSES,
     REQUIREMENT_TRANSITIONS,
     STATE_MACHINES,
@@ -43,8 +44,8 @@ class TestStateMachineStructure:
 
     def test_architecture_transitions_keys(self):
         expected = {
-            "Draft", "Under Review", "Proposed", "Accepted",
-            "Rejected", "Deprecated", "Approved", "Implemented",
+            "Under Review", "Proposed", "Accepted",
+            "Rejected", "Deprecated",
         }
         assert set(ARCHITECTURE_TRANSITIONS.keys()) == expected
 
@@ -130,10 +131,10 @@ class TestRelationshipCombinations:
 
 
 class TestEntityTableMap:
-    """ENTITY_TABLE_MAP contains all 4 entity types."""
+    """ENTITY_TABLE_MAP contains all 5 entity types."""
 
-    def test_has_four_entries(self):
-        assert len(ENTITY_TABLE_MAP) == 4
+    def test_has_five_entries(self):
+        assert len(ENTITY_TABLE_MAP) == 5
 
     def test_project_maps_to_projects(self):
         assert ENTITY_TABLE_MAP["project"] == "projects"
@@ -146,6 +147,9 @@ class TestEntityTableMap:
 
     def test_architecture_maps_to_architecture(self):
         assert ENTITY_TABLE_MAP["architecture"] == "architecture"
+
+    def test_architectural_pattern_maps_to_architectural_patterns(self):
+        assert ENTITY_TABLE_MAP["architectural_pattern"] == "architectural_patterns"
 
 
 # ---------------------------------------------------------------
@@ -170,15 +174,15 @@ class TestStateMachinesAggregate:
 
 
 # ---------------------------------------------------------------
-# Shortcut: Architecture Draft -> Accepted
+# Shortcut: Architecture Under Review -> Accepted
 # ---------------------------------------------------------------
 
 
 class TestArchitectureShortcut:
-    """ARCHITECTURE_TRANSITIONS['Draft'] includes 'Accepted' as a shortcut."""
+    """ARCHITECTURE_TRANSITIONS['Under Review'] includes 'Accepted' as a shortcut."""
 
-    def test_draft_includes_accepted(self):
-        assert "Accepted" in ARCHITECTURE_TRANSITIONS["Draft"]
+    def test_under_review_includes_accepted(self):
+        assert "Accepted" in ARCHITECTURE_TRANSITIONS["Under Review"]
 
 
 # ---------------------------------------------------------------
@@ -241,3 +245,53 @@ class TestTaskTransitionDetails:
 
     def test_deprecated_transitions(self):
         assert TASK_TRANSITIONS["Deprecated"] == []
+
+
+# ---------------------------------------------------------------
+# Architecture transition details (simplified state machine)
+# ---------------------------------------------------------------
+
+
+class TestArchitectureTransitionDetails:
+    """Verify exact allowed transitions for each architecture state."""
+
+    def test_architecture_has_exactly_5_states(self):
+        assert len(ARCHITECTURE_TRANSITIONS) == 5
+
+    def test_under_review_transitions(self):
+        assert ARCHITECTURE_TRANSITIONS["Under Review"] == ["Proposed", "Accepted", "Deprecated"]
+
+    def test_proposed_transitions(self):
+        assert ARCHITECTURE_TRANSITIONS["Proposed"] == ["Accepted", "Rejected", "Deprecated"]
+
+    def test_accepted_transitions(self):
+        assert ARCHITECTURE_TRANSITIONS["Accepted"] == ["Deprecated"]
+
+    def test_rejected_transitions(self):
+        assert ARCHITECTURE_TRANSITIONS["Rejected"] == ["Deprecated"]
+
+    def test_deprecated_transitions(self):
+        assert ARCHITECTURE_TRANSITIONS["Deprecated"] == []
+
+
+# ---------------------------------------------------------------
+# PATTERN_TYPES
+# ---------------------------------------------------------------
+
+
+class TestPatternTypes:
+    """PATTERN_TYPES is a frozenset of 15 valid pattern type values."""
+
+    def test_is_frozenset(self):
+        assert isinstance(PATTERN_TYPES, frozenset)
+
+    def test_has_15_values(self):
+        assert len(PATTERN_TYPES) == 15
+
+    def test_contains_expected_types(self):
+        expected = {
+            "database", "api", "transport", "adapter", "auth", "schema", "messaging", "ui",
+            "reliability", "modularity", "performance", "security",
+            "scalability", "testability", "observability",
+        }
+        assert PATTERN_TYPES == expected

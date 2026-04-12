@@ -59,7 +59,7 @@ async def setup(v2_db_manager):
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, context, decision, status) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        ["ADR-0001", "PROJ-0001", "ADR One", "ctx", "dec", "Draft"],
+        ["ADR-0001", "PROJ-0001", "ADR One", "ctx", "dec", "Under Review"],
     )
     # Relationship: requirement implements task
     await db.execute_query(

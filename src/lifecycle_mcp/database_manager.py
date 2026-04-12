@@ -332,6 +332,7 @@ class DatabaseManager:
             "task": "TASK",
             "architecture": "ADR",
             "project": "PROJ",
+            "architectural_pattern": "PAT",
         }
         if entity_type not in prefixes:
             raise KeyError(f"Unknown entity type: {entity_type!r}")

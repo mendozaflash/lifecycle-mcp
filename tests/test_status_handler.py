@@ -62,7 +62,7 @@ async def _add_task(db, task_id, project_id, status="Under Review", priority="P1
     )
 
 
-async def _add_adr(db, adr_id, project_id, status="Draft"):
+async def _add_adr(db, adr_id, project_id, status="Under Review"):
     """Insert an architecture decision directly."""
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, context, decision, status) VALUES (?, ?, ?, ?, ?, ?)",

@@ -56,7 +56,7 @@ async def _create_adr(db, project_id, adr_id, title="Test ADR"):
     """Insert an architecture decision directly into the DB."""
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, status) "
-        "VALUES (?, ?, ?, 'Draft')",
+        "VALUES (?, ?, ?, 'Under Review')",
         [adr_id, project_id, title],
     )
 

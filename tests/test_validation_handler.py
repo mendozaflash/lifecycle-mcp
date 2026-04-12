@@ -86,7 +86,7 @@ async def _insert_adr(db, adr_id, project_id, **kwargs):
         "title": f"ADR {adr_id}",
         "context": "test context",
         "decision": "test decision",
-        "status": "Draft",
+        "status": "Under Review",
         "superseded_by": None,
     }
     defaults.update(kwargs)
@@ -402,7 +402,7 @@ class TestBlockedAndInvalidStatus:
         """ADR with superseded_by set but status!='Deprecated' should produce error."""
         handler, db, pid = setup
         await _insert_adr(db, "ADR-0002", pid)
-        await _insert_adr(db, "ADR-0001", pid, superseded_by="ADR-0002", status="Approved")
+        await _insert_adr(db, "ADR-0001", pid, superseded_by="ADR-0002", status="Accepted")
 
         result = await handler.handle_tool_call(
             "validate_project_plan", {"project_id": pid, "summary_only": False}

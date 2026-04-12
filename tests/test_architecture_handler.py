@@ -146,7 +146,7 @@ async def test_create_adr_stores_all_fields(setup):
     assert json.loads(row["considered_options"]) == ["Option A", "Option B"]
     assert json.loads(row["consequences"]) == {"positive": "Good", "negative": "Trade-offs"}
     assert json.loads(row["authors"]) == ["Alice", "Bob"]
-    assert row["status"] == "Draft"
+    assert row["status"] == "Under Review"
     assert row["project_id"] == pid
 
 
@@ -264,12 +264,6 @@ async def test_update_status_valid_transitions(setup):
     handler, db, pid = setup
     await _create_adr(handler, pid)
 
-    # Draft -> Under Review
-    result = await handler.handle_tool_call(
-        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Under Review"}
-    )
-    assert "SUCCESS" in result[0].text
-
     # Under Review -> Proposed
     result = await handler.handle_tool_call(
         "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Proposed"}
@@ -282,9 +276,9 @@ async def test_update_status_valid_transitions(setup):
     )
     assert "SUCCESS" in result[0].text
 
-    # Accepted -> Implemented
+    # Accepted -> Deprecated
     result = await handler.handle_tool_call(
-        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Implemented"}
+        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Deprecated"}
     )
     assert "SUCCESS" in result[0].text
 
@@ -292,11 +286,11 @@ async def test_update_status_valid_transitions(setup):
 @pytest.mark.asyncio
 async def test_update_status_invalid_transition(setup):
     handler, db, pid = setup
-    await _create_adr(handler, pid)  # status = "Draft"
+    await _create_adr(handler, pid)  # status = "Under Review"
 
-    # Draft -> Implemented (not allowed)
+    # Under Review -> Rejected (not allowed, must go through Proposed first)
     result = await handler.handle_tool_call(
-        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Implemented"}
+        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Rejected"}
     )
     assert "ERROR" in result[0].text
     assert "Invalid transition" in result[0].text or "transition" in result[0].text.lower()
@@ -307,14 +301,14 @@ async def test_update_status_deprecated_is_terminal(setup):
     handler, db, pid = setup
     await _create_adr(handler, pid)
 
-    # Draft -> Deprecated
+    # Under Review -> Deprecated
     await handler.handle_tool_call(
         "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Deprecated"}
     )
 
-    # Deprecated -> Draft (not allowed, Deprecated is terminal)
+    # Deprecated -> Under Review (not allowed, Deprecated is terminal)
     result = await handler.handle_tool_call(
-        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Draft"}
+        "update_architecture_status", {"architecture_id": "ADR-0001", "new_status": "Under Review"}
     )
     assert "ERROR" in result[0].text
 
@@ -351,7 +345,7 @@ async def test_update_status_with_comment(setup):
     await _create_adr(handler, pid)
     result = await handler.handle_tool_call(
         "update_architecture_status",
-        {"architecture_id": "ADR-0001", "new_status": "Under Review", "comment": "Ready for review"},
+        {"architecture_id": "ADR-0001", "new_status": "Proposed", "comment": "Ready for review"},
     )
     assert "SUCCESS" in result[0].text
 
@@ -381,17 +375,17 @@ async def test_update_status_not_found(setup):
 
 
 @pytest.mark.asyncio
-async def test_adr_draft_to_accepted_shortcut(setup):
-    """Draft -> Accepted shortcut transition works in one call."""
+async def test_adr_under_review_to_accepted_shortcut_direct(setup):
+    """Under Review -> Accepted shortcut transition works in one call (from initial status)."""
     handler, db, pid = setup
-    await _create_adr(handler, pid)  # starts as Draft
+    await _create_adr(handler, pid)  # starts as Under Review
 
     result = await handler.handle_tool_call(
         "update_architecture_status",
         {"architecture_id": "ADR-0001", "new_status": "Accepted"},
     )
     assert "SUCCESS" in result[0].text
-    assert "Draft" in result[0].text
+    assert "Under Review" in result[0].text
     assert "Accepted" in result[0].text
 
     # Verify DB
@@ -404,24 +398,24 @@ async def test_adr_draft_to_accepted_shortcut(setup):
 
 
 @pytest.mark.asyncio
-async def test_adr_under_review_to_accepted_shortcut(setup):
-    """Under Review -> Accepted shortcut transition works in one call."""
+async def test_adr_proposed_to_accepted_transition(setup):
+    """Under Review -> Proposed -> Accepted works through normal flow."""
     handler, db, pid = setup
     await _create_adr(handler, pid)
 
-    # First: Draft -> Under Review
+    # Under Review -> Proposed
     await handler.handle_tool_call(
         "update_architecture_status",
-        {"architecture_id": "ADR-0001", "new_status": "Under Review"},
+        {"architecture_id": "ADR-0001", "new_status": "Proposed"},
     )
 
-    # Shortcut: Under Review -> Accepted
+    # Proposed -> Accepted
     result = await handler.handle_tool_call(
         "update_architecture_status",
         {"architecture_id": "ADR-0001", "new_status": "Accepted"},
     )
     assert "SUCCESS" in result[0].text
-    assert "Under Review" in result[0].text
+    assert "Proposed" in result[0].text
     assert "Accepted" in result[0].text
 
     # Verify DB
@@ -513,18 +507,18 @@ async def test_query_includes_archived_with_flag(setup):
 @pytest.mark.asyncio
 async def test_query_filters_by_status(setup):
     handler, db, pid = setup
-    await _create_adr(handler, pid, title="Draft ADR")
-    await _create_adr(handler, pid, title="Reviewed ADR")
+    await _create_adr(handler, pid, title="UR ADR")
+    await _create_adr(handler, pid, title="Proposed ADR")
     await handler.handle_tool_call(
-        "update_architecture_status", {"architecture_id": "ADR-0002", "new_status": "Under Review"}
+        "update_architecture_status", {"architecture_id": "ADR-0002", "new_status": "Proposed"}
     )
 
     result = await handler.handle_tool_call(
-        "query_architecture_decisions", {"status": "Under Review"}
+        "query_architecture_decisions", {"status": "Proposed"}
     )
     text = result[0].text
-    assert "Reviewed ADR" in text
-    assert "Draft ADR" not in text
+    assert "Proposed ADR" in text
+    assert "UR ADR" not in text
 
 
 @pytest.mark.asyncio
@@ -545,7 +539,7 @@ async def test_query_filters_by_search_text(setup):
 async def test_query_no_results(setup):
     handler, db, pid = setup
     result = await handler.handle_tool_call(
-        "query_architecture_decisions", {"status": "Implemented"}
+        "query_architecture_decisions", {"status": "Rejected"}
     )
     text = result[0].text
     assert "No architecture decisions found" in text or "0" in text
@@ -577,7 +571,7 @@ async def test_query_architecture_json_output_format(setup):
     assert len(data) == 1
     assert data[0]["title"] == "JSON ADR"
     assert data[0]["id"] == "ADR-0001"
-    assert data[0]["status"] == "Draft"
+    assert data[0]["status"] == "Under Review"
     # JSON fields should be parsed
     assert data[0]["decision_drivers"] == ["Speed"]
     assert data[0]["consequences"] == {"pro": "fast"}
@@ -611,7 +605,7 @@ async def test_query_architecture_summary_format(setup):
         {"project_id": pid, "output_format": "summary"},
     )
     text = result[0].text
-    assert "ADR-0001 | Summary ADR | Draft" in text
+    assert "ADR-0001 | Summary ADR | Under Review" in text
 
 
 @pytest.mark.asyncio
@@ -625,7 +619,7 @@ async def test_query_architecture_summary_is_default(setup):
         {"project_id": pid},
     )
     text = result[0].text
-    assert "ADR-0001 | Default Format ADR | Draft" in text
+    assert "ADR-0001 | Default Format ADR | Under Review" in text
 
 
 @pytest.mark.asyncio
@@ -642,7 +636,7 @@ async def test_query_architecture_markdown_format(setup):
     # Markdown format should contain the ADR-ID and title in verbose style
     assert "ADR-0001" in text
     assert "Markdown ADR" in text
-    assert "Draft" in text
+    assert "Under Review" in text
 
 
 @pytest.mark.asyncio
@@ -894,7 +888,7 @@ async def test_supersession_full_flow(setup):
     result2 = await handler.handle_tool_call(
         "get_architecture_details", {"architecture_id": "ADR-0002"}
     )
-    assert "Draft" in result2[0].text
+    assert "Under Review" in result2[0].text
     assert "Improved Design" in result2[0].text
 
 

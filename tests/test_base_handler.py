@@ -65,7 +65,7 @@ async def seeded_db(v2_db_manager):
     await db.execute_query(
         "INSERT INTO architecture (id, project_id, title, status, is_archived) "
         "VALUES (?, ?, ?, ?, ?)",
-        ["ADR-0001", "PROJ-0001", "Test ADR", "Draft", 0],
+        ["ADR-0001", "PROJ-0001", "Test ADR", "Under Review", 0],
     )
     return db
 

@@ -5,6 +5,7 @@ ENTITY_TABLE_MAP: dict[str, str] = {
     "requirement": "requirements",
     "task": "tasks",
     "architecture": "architecture",
+    "architectural_pattern": "architectural_patterns",
 }
 
 REQUIREMENT_TRANSITIONS: dict[str, list[str]] = {
@@ -29,14 +30,11 @@ TASK_TRANSITIONS: dict[str, list[str]] = {
 TASK_STATUSES: set[str] = set(TASK_TRANSITIONS.keys())
 
 ARCHITECTURE_TRANSITIONS: dict[str, list[str]] = {
-    "Draft": ["Under Review", "Accepted", "Deprecated"],
-    "Under Review": ["Proposed", "Approved", "Accepted", "Deprecated"],
-    "Proposed": ["Accepted", "Rejected", "Deprecated"],
-    "Accepted": ["Implemented", "Deprecated"],
-    "Rejected": ["Deprecated"],
-    "Deprecated": [],
-    "Approved": ["Implemented", "Deprecated"],
-    "Implemented": ["Deprecated"],
+    "Under Review": ["Proposed", "Accepted", "Deprecated"],
+    "Proposed":     ["Accepted", "Rejected", "Deprecated"],
+    "Accepted":     ["Deprecated"],
+    "Rejected":     ["Deprecated"],
+    "Deprecated":   [],
 }
 ARCHITECTURE_STATUSES: set[str] = set(ARCHITECTURE_TRANSITIONS.keys())
 
@@ -67,3 +65,9 @@ VALID_RELATIONSHIP_COMBINATIONS: set[tuple[str, str, str]] = {
     ("requirement", "requirement", "conflicts"),
     ("requirement", "requirement", "relates"),
 }
+
+PATTERN_TYPES: frozenset[str] = frozenset({
+    "database", "api", "transport", "adapter", "auth", "schema", "messaging", "ui",
+    "reliability", "modularity", "performance", "security",
+    "scalability", "testability", "observability",
+})

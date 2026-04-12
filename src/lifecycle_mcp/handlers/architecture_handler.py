@@ -78,7 +78,7 @@ class ArchitectureHandler(BaseHandler):
             {
                 "name": "update_architecture_status",
                 "description": "Update architecture decision status with transition validation. "
-                "Supports shortcut transitions: Draft->Accepted, Under Review->Accepted.",
+                "Supports shortcut transition: Under Review->Accepted.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -86,8 +86,8 @@ class ArchitectureHandler(BaseHandler):
                         "new_status": {
                             "type": "string",
                             "enum": [
-                                "Draft", "Under Review", "Proposed", "Accepted",
-                                "Rejected", "Deprecated", "Approved", "Implemented",
+                                "Under Review", "Proposed", "Accepted",
+                                "Rejected", "Deprecated",
                             ],
                         },
                         "comment": {"type": "string"},
@@ -209,7 +209,7 @@ class ArchitectureHandler(BaseHandler):
             "title": params["title"],
             "context": params["context"],
             "decision": params["decision"],
-            "status": "Draft",
+            "status": "Under Review",
         }
 
         # Optional JSON fields
@@ -221,7 +221,7 @@ class ArchitectureHandler(BaseHandler):
         await self._log_operation("architecture", adr_id, "created", project_id=project_id)
 
         key_info = f"Architecture decision {adr_id} created"
-        action_info = f"{params['title']} | Draft"
+        action_info = f"{params['title']} | Under Review"
         return self._create_above_fold_response("SUCCESS", key_info, action_info)
 
     # ------------------------------------------------------------------

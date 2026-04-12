@@ -16,6 +16,8 @@ EXPECTED_TABLES = [
     "requirements",
     "tasks",
     "architecture",
+    "architectural_patterns",
+    "adr_patterns",
     "relationships",
     "reviews",
     "lifecycle_events",
@@ -37,6 +39,11 @@ EXPECTED_INDEXES = [
     "idx_tasks_status",
     "idx_tasks_project",
     "idx_architecture_project",
+    "idx_adr_patterns_adr",
+    "idx_adr_patterns_pattern",
+    "idx_adr_patterns_role",
+    "idx_architectural_patterns_project",
+    "idx_architectural_patterns_type",
 ]
 
 
@@ -108,7 +115,7 @@ async def test_indexes_created(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sequences_initialized(tmp_path):
-    """All 4 entity types have sequence entries starting at 1."""
+    """All 5 entity types have sequence entries starting at 1."""
     db_path = await _init_db(tmp_path)
     conn = await _connect(db_path)
     try:
@@ -116,6 +123,7 @@ async def test_sequences_initialized(tmp_path):
         rows = await cursor.fetchall()
         seq_map = {r["entity_type"]: r["next_val"] for r in rows}
         assert seq_map == {
+            "architectural_pattern": 1,
             "architecture": 1,
             "project": 1,
             "requirement": 1,
@@ -655,3 +663,337 @@ async def test_architecture_superseded_by_fk(tmp_path):
         assert row["superseded_by"] == "ADR-0001"
     finally:
         await conn.close()
+
+
+# ── Architectural Patterns table ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_architectural_patterns_table_exists(tmp_path):
+    """architectural_patterns table with all columns and CHECK constraints."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+            ("PAT-0001", "PROJ-0001", "Event Sourcing", "database"),
+        )
+        await conn.commit()
+
+        cursor = await conn.execute("SELECT * FROM architectural_patterns WHERE id = 'PAT-0001'")
+        row = await cursor.fetchone()
+        assert row["name"] == "Event Sourcing"
+        assert row["type"] == "database"
+        assert row["project_id"] == "PROJ-0001"
+        assert row["is_archived"] == 0
+        assert row["created_at"] is not None
+        assert row["updated_at"] is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_architectural_patterns_type_check_constraint(tmp_path):
+    """architectural_patterns type must be one of the allowed values."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+                ("PAT-0001", "PROJ-0001", "Bad Pattern", "INVALID_TYPE"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_architectural_patterns_fk_requires_project(tmp_path):
+    """architectural_patterns project_id must reference an existing project."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+                ("PAT-0001", "PROJ-9999", "Bad Pattern", "api"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+# ── ADR Patterns table ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_adr_patterns_table_exists(tmp_path):
+    """adr_patterns table with composite PK, FKs, role CHECK, default role."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architecture (id, project_id, title) VALUES (?, ?, ?)",
+            ("ADR-0001", "PROJ-0001", "Test ADR"),
+        )
+        await conn.execute(
+            "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+            ("PAT-0001", "PROJ-0001", "Test Pattern", "api"),
+        )
+        # Insert with default role
+        await conn.execute(
+            "INSERT INTO adr_patterns (adr_id, pattern_id) VALUES (?, ?)",
+            ("ADR-0001", "PAT-0001"),
+        )
+        await conn.commit()
+
+        cursor = await conn.execute("SELECT * FROM adr_patterns WHERE adr_id = 'ADR-0001'")
+        row = await cursor.fetchone()
+        assert row["adr_id"] == "ADR-0001"
+        assert row["pattern_id"] == "PAT-0001"
+        assert row["role"] == "follows"  # default
+        assert row["created_at"] is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_adr_patterns_role_check_constraint(tmp_path):
+    """adr_patterns role must be establishes, follows, or refines."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architecture (id, project_id, title) VALUES (?, ?, ?)",
+            ("ADR-0001", "PROJ-0001", "Test ADR"),
+        )
+        await conn.execute(
+            "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+            ("PAT-0001", "PROJ-0001", "Test Pattern", "api"),
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO adr_patterns (adr_id, pattern_id, role) VALUES (?, ?, ?)",
+                ("ADR-0001", "PAT-0001", "INVALID_ROLE"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_adr_patterns_composite_pk(tmp_path):
+    """Duplicate (adr_id, pattern_id) should fail."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architecture (id, project_id, title) VALUES (?, ?, ?)",
+            ("ADR-0001", "PROJ-0001", "Test ADR"),
+        )
+        await conn.execute(
+            "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+            ("PAT-0001", "PROJ-0001", "Test Pattern", "api"),
+        )
+        await conn.execute(
+            "INSERT INTO adr_patterns (adr_id, pattern_id) VALUES (?, ?)",
+            ("ADR-0001", "PAT-0001"),
+        )
+        await conn.commit()
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO adr_patterns (adr_id, pattern_id, role) VALUES (?, ?, ?)",
+                ("ADR-0001", "PAT-0001", "refines"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+# ── Architecture status CHECK (simplified) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_architecture_rejects_draft_status(tmp_path):
+    """Architecture status CHECK no longer allows 'Draft'."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO architecture (id, project_id, title, status) VALUES (?, ?, ?, ?)",
+                ("ADR-0001", "PROJ-0001", "Test", "Draft"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_architecture_rejects_approved_status(tmp_path):
+    """Architecture status CHECK no longer allows 'Approved'."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO architecture (id, project_id, title, status) VALUES (?, ?, ?, ?)",
+                ("ADR-0001", "PROJ-0001", "Test", "Approved"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_architecture_rejects_implemented_status(tmp_path):
+    """Architecture status CHECK no longer allows 'Implemented'."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await conn.execute(
+                "INSERT INTO architecture (id, project_id, title, status) VALUES (?, ?, ?, ?)",
+                ("ADR-0001", "PROJ-0001", "Test", "Implemented"),
+            )
+            await conn.commit()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_architecture_default_status_is_under_review(tmp_path):
+    """Architecture default status should be 'Under Review'."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architecture (id, project_id, title) VALUES (?, ?, ?)",
+            ("ADR-0001", "PROJ-0001", "Test ADR"),
+        )
+        await conn.commit()
+
+        cursor = await conn.execute("SELECT status FROM architecture WHERE id = 'ADR-0001'")
+        row = await cursor.fetchone()
+        assert row["status"] == "Under Review"
+    finally:
+        await conn.close()
+
+
+# ── Auto-archive trigger for Deprecated ADRs ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_archive_deprecated_adr(tmp_path):
+    """Setting architecture status to Deprecated auto-sets is_archived=1 and archived_at."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architecture (id, project_id, title) VALUES (?, ?, ?)",
+            ("ADR-0001", "PROJ-0001", "Test ADR"),
+        )
+        await conn.commit()
+
+        # Initially not archived
+        cursor = await conn.execute("SELECT is_archived, archived_at FROM architecture WHERE id = 'ADR-0001'")
+        row = await cursor.fetchone()
+        assert row["is_archived"] == 0
+        assert row["archived_at"] is None
+
+        # Set to Deprecated
+        await conn.execute(
+            "UPDATE architecture SET status = 'Deprecated' WHERE id = 'ADR-0001'"
+        )
+        await conn.commit()
+
+        cursor = await conn.execute("SELECT is_archived, archived_at FROM architecture WHERE id = 'ADR-0001'")
+        row = await cursor.fetchone()
+        assert row["is_archived"] == 1
+        assert row["archived_at"] is not None
+    finally:
+        await conn.close()
+
+
+# ── Architectural patterns updated_at trigger ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_architectural_patterns_updated_at_trigger(tmp_path):
+    """updated_at is auto-set on architectural_patterns update."""
+    db_path = await _init_db(tmp_path)
+    conn = await _connect(db_path)
+    try:
+        await conn.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)", ("PROJ-0001", "Test")
+        )
+        await conn.execute(
+            "INSERT INTO architectural_patterns (id, project_id, name, type) VALUES (?, ?, ?, ?)",
+            ("PAT-0001", "PROJ-0001", "Test Pattern", "api"),
+        )
+        await conn.commit()
+
+        cursor = await conn.execute("SELECT updated_at FROM architectural_patterns WHERE id = 'PAT-0001'")
+        row = await cursor.fetchone()
+        original_updated = row["updated_at"]
+
+        import asyncio
+        await asyncio.sleep(1.1)
+
+        await conn.execute(
+            "UPDATE architectural_patterns SET name = 'Updated Pattern' WHERE id = 'PAT-0001'"
+        )
+        await conn.commit()
+
+        cursor = await conn.execute("SELECT updated_at FROM architectural_patterns WHERE id = 'PAT-0001'")
+        row = await cursor.fetchone()
+        assert row["updated_at"] > original_updated
+    finally:
+        await conn.close()
+
+
+# ── generate_id for architectural_pattern ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_generate_id_architectural_pattern(v2_db_manager):
+    """generate_id('architectural_pattern') returns PAT-XXXX format."""
+    pat_id, number = await v2_db_manager.generate_id("architectural_pattern")
+    assert pat_id == "PAT-0001"
+    assert number == 1
+
+    pat_id2, number2 = await v2_db_manager.generate_id("architectural_pattern")
+    assert pat_id2 == "PAT-0002"
+    assert number2 == 2

@@ -11,7 +11,7 @@ CREATE TABLE sequences (
     next_val INTEGER NOT NULL DEFAULT 1
 );
 
-INSERT INTO sequences (entity_type) VALUES ('requirement'), ('task'), ('architecture'), ('project');
+INSERT INTO sequences (entity_type) VALUES ('requirement'), ('task'), ('architecture'), ('project'), ('architectural_pattern');
 
 -- ============================================================
 -- Projects — first-class project entity
@@ -95,7 +95,7 @@ CREATE TABLE architecture (
     id TEXT PRIMARY KEY,           -- ADR-XXXX
     project_id TEXT NOT NULL REFERENCES projects(id),
     title TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Draft' CHECK(status IN ('Draft', 'Under Review', 'Proposed', 'Accepted', 'Rejected', 'Deprecated', 'Approved', 'Implemented')),
+    status TEXT NOT NULL DEFAULT 'Under Review' CHECK(status IN ('Under Review', 'Proposed', 'Accepted', 'Rejected', 'Deprecated')),
     context TEXT,
     decision TEXT,
     decision_drivers TEXT,         -- JSON array
@@ -107,6 +107,35 @@ CREATE TABLE architecture (
     archived_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ============================================================
+-- Architectural Patterns — reusable cross-ADR patterns
+-- ============================================================
+
+CREATE TABLE architectural_patterns (
+    id         TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL CHECK(type IN (
+        'database', 'api', 'transport', 'adapter', 'auth', 'schema', 'messaging', 'ui',
+        'reliability', 'modularity', 'performance', 'security',
+        'scalability', 'testability', 'observability'
+    )),
+    description TEXT,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE adr_patterns (
+    adr_id     TEXT NOT NULL REFERENCES architecture(id),
+    pattern_id TEXT NOT NULL REFERENCES architectural_patterns(id),
+    role       TEXT NOT NULL DEFAULT 'follows'
+                   CHECK(role IN ('establishes', 'follows', 'refines')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (adr_id, pattern_id)
 );
 
 -- ============================================================
@@ -193,6 +222,15 @@ BEGIN UPDATE tasks SET updated_at = datetime('now') WHERE id = NEW.id; END;
 
 CREATE TRIGGER update_architecture_timestamp AFTER UPDATE ON architecture
 BEGIN UPDATE architecture SET updated_at = datetime('now') WHERE id = NEW.id; END;
+
+CREATE TRIGGER update_architectural_patterns_timestamp AFTER UPDATE ON architectural_patterns
+BEGIN UPDATE architectural_patterns SET updated_at = datetime('now') WHERE id = NEW.id; END;
+
+CREATE TRIGGER auto_archive_deprecated_adr AFTER UPDATE OF status ON architecture
+WHEN NEW.status = 'Deprecated'
+BEGIN
+    UPDATE architecture SET is_archived = 1, archived_at = datetime('now') WHERE id = NEW.id;
+END;
 
 -- ============================================================
 -- Triggers: auto-progression (requirement status from task status)
@@ -380,3 +418,8 @@ CREATE INDEX idx_requirements_project ON requirements(project_id);
 CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_tasks_project ON tasks(project_id);
 CREATE INDEX idx_architecture_project ON architecture(project_id);
+CREATE INDEX idx_adr_patterns_adr ON adr_patterns(adr_id);
+CREATE INDEX idx_adr_patterns_pattern ON adr_patterns(pattern_id);
+CREATE INDEX idx_adr_patterns_role ON adr_patterns(role);
+CREATE INDEX idx_architectural_patterns_project ON architectural_patterns(project_id);
+CREATE INDEX idx_architectural_patterns_type ON architectural_patterns(type);
