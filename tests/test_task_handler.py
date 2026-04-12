@@ -1272,3 +1272,194 @@ async def test_unknown_tool(task_env):
     handler, _, _ = task_env
     result = await handler.handle_tool_call("nonexistent_tool", {})
     assert "ERROR" in result[0].text or "Unknown" in result[0].text
+
+
+# -- Agent Nudge Tests -------------------------------------------------------
+
+
+def _extract_task_id(result):
+    """Extract TASK-XXXX ID from handler response text."""
+    import re
+    text = result[0].text
+    match = re.search(r"TASK-\d{4}", text)
+    assert match, f"Could not extract TASK ID from: {text}"
+    return match.group()
+
+
+@pytest.mark.asyncio
+async def test_nudge_create_task_reminds_to_link(task_env):
+    """create_task response should remind agent to link requirements and set dependencies."""
+    handler, _, project_id = task_env
+    result = await _create_task(handler, project_id, "Nudge Test")
+    text = result[0].text
+    assert "create_relationship" in text
+    assert "implements" in text
+    assert "depends" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_implemented_reminds_to_validate(task_env):
+    """When task moves to Implemented, response should remind to validate."""
+    handler, _, project_id = task_env
+    result = await _create_task(handler, project_id, "Validate Test")
+    task_id = _extract_task_id(result)
+
+    await handler.handle_tool_call("update_task_status", {"task_id": task_id, "new_status": "Approved"})
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Implemented",
+        "execution_notes": "Done",
+    })
+    text = result[0].text
+    assert "Validated" in text
+    assert "verification" in text.lower() or "update_task_status" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_implemented_reports_auto_progression(task_env):
+    """When task moves to Implemented, linked requirement should auto-progress and be reported."""
+    handler, db, project_id = task_env
+    await _create_requirement(db, project_id, "REQ-0001", "Auto-progress Test")
+    await db.update_record("requirements", {"status": "Approved"}, "id = ?", ["REQ-0001"])
+
+    result = await _create_task(handler, project_id, "AP Task")
+    task_id = _extract_task_id(result)
+    await _link(db, "task", task_id, "requirement", "REQ-0001", "implements", project_id)
+
+    await handler.handle_tool_call("update_task_status", {"task_id": task_id, "new_status": "Approved"})
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Implemented",
+    })
+    text = result[0].text
+    assert "REQ-0001" in text
+    assert "auto-progressed" in text
+    # With only one task, trigger goes Approved -> Partially Implemented -> Implemented
+    # in a single trigger execution, so the final reported state is Implemented
+    assert "Implemented" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_validated_reports_auto_progression(task_env):
+    """When task moves to Validated, linked requirement auto-progression should be reported."""
+    handler, db, project_id = task_env
+    await _create_requirement(db, project_id, "REQ-0002", "Validate AP Test")
+    await db.update_record("requirements", {"status": "Approved"}, "id = ?", ["REQ-0002"])
+
+    result = await _create_task(handler, project_id, "VP Task")
+    task_id = _extract_task_id(result)
+    await _link(db, "task", task_id, "requirement", "REQ-0002", "implements", project_id)
+
+    await handler.handle_tool_call("update_task_status", {"task_id": task_id, "new_status": "Approved"})
+    await handler.handle_tool_call("update_task_status", {"task_id": task_id, "new_status": "Implemented"})
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Validated",
+    })
+    text = result[0].text
+    assert "REQ-0002" in text
+    assert "auto-progressed" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_validated_full_requirement_completion(task_env):
+    """When the last task validates, requirement should reach Validated and include review hint."""
+    handler, db, project_id = task_env
+    await _create_requirement(db, project_id, "REQ-0003", "Full Completion Test")
+    await db.update_record("requirements", {"status": "Approved"}, "id = ?", ["REQ-0003"])
+
+    result = await _create_task(handler, project_id, "FC Task")
+    task_id = _extract_task_id(result)
+    await _link(db, "task", task_id, "requirement", "REQ-0003", "implements", project_id)
+
+    await handler.handle_tool_call("update_task_status", {"task_id": task_id, "new_status": "Approved"})
+    await handler.handle_tool_call("update_task_status", {"task_id": task_id, "new_status": "Implemented"})
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Validated",
+    })
+    text = result[0].text
+    assert "Validated" in text
+    assert "architectural consistency" in text.lower() or "code quality" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_nudge_approved_warns_missing_verification(task_env):
+    """Approving a task without verification_commands should show a warning."""
+    handler, _, project_id = task_env
+    result = await _create_task(handler, project_id, "No VC Task",
+                                acceptance_criteria=["AC1"])
+    task_id = _extract_task_id(result)
+
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Approved",
+    })
+    text = result[0].text
+    assert "verification_commands" in text
+    assert "Warning" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_approved_warns_missing_acceptance_criteria(task_env):
+    """Approving a task without acceptance_criteria should show a warning."""
+    handler, _, project_id = task_env
+    result = await _create_task(handler, project_id, "No AC Task",
+                                verification_commands=["pytest tests/"])
+    task_id = _extract_task_id(result)
+
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Approved",
+    })
+    text = result[0].text
+    assert "acceptance_criteria" in text
+    assert "Warning" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_approved_no_warning_when_fields_present(task_env):
+    """Approving a task with both fields present should NOT show warnings."""
+    handler, _, project_id = task_env
+    result = await _create_task(handler, project_id, "Complete Task",
+                                acceptance_criteria=["AC1"],
+                                verification_commands=["pytest tests/"])
+    task_id = _extract_task_id(result)
+
+    result = await handler.handle_tool_call("update_task_status", {
+        "task_id": task_id, "new_status": "Approved",
+    })
+    text = result[0].text
+    assert "Warning" not in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_batch_create_reports_missing_fields(task_env):
+    """batch_create_tasks should report count of tasks missing AC or VC."""
+    handler, _, project_id = task_env
+    result = await handler.handle_tool_call("batch_create_tasks", {
+        "project_id": project_id,
+        "tasks": [
+            {"title": "Has both", "priority": "P1",
+             "acceptance_criteria": ["AC"], "verification_commands": ["cmd"]},
+            {"title": "Missing AC", "priority": "P1",
+             "verification_commands": ["cmd"]},
+            {"title": "Missing VC", "priority": "P1",
+             "acceptance_criteria": ["AC"]},
+            {"title": "Missing both", "priority": "P1"},
+        ],
+    })
+    text = result[0].text
+    assert "2 task(s) missing acceptance_criteria" in text
+    assert "2 task(s) missing verification_commands" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_batch_create_no_warning_when_complete(task_env):
+    """batch_create_tasks with all fields present should NOT show notes."""
+    handler, _, project_id = task_env
+    result = await handler.handle_tool_call("batch_create_tasks", {
+        "project_id": project_id,
+        "tasks": [
+            {"title": "Complete 1", "priority": "P1",
+             "acceptance_criteria": ["AC"], "verification_commands": ["cmd"]},
+            {"title": "Complete 2", "priority": "P1",
+             "acceptance_criteria": ["AC"], "verification_commands": ["cmd"]},
+        ],
+    })
+    text = result[0].text
+    assert "Note:" not in text

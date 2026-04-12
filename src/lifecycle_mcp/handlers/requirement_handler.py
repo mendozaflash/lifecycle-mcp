@@ -338,7 +338,10 @@ class RequirementHandler(BaseHandler):
 
         key_info = f"Requirement {req_id} updated"
         action_info = f"{current_status} -> {new_status}"
-        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+        details = ""
+        if new_status == "Approved":
+            details = "Next: Create implementation tasks and link via create_relationship(type='implements')"
+        return self._create_above_fold_response("SUCCESS", key_info, action_info, details)
 
     # ------------------------------------------------------------------
     # archive_requirement
@@ -585,11 +588,18 @@ class RequirementHandler(BaseHandler):
             "requirement", f"batch:{len(created_ids)}", "batch_created", project_id=project_id
         )
 
+        # Nudge: report missing acceptance criteria
+        missing_ac = sum(1 for r in req_defs if not r.get("acceptance_criteria"))
+        details = ""
+        if missing_ac:
+            details = f"Note: {missing_ac} requirement(s) missing acceptance_criteria"
+
         ids_str = ", ".join(created_ids)
         return self._create_above_fold_response(
             "SUCCESS",
             f"Created {len(created_ids)} requirements",
             ids_str,
+            details,
         )
 
     # ------------------------------------------------------------------

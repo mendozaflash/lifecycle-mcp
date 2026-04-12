@@ -275,7 +275,11 @@ class TaskHandler(BaseHandler):
 
         key_info = f"Task {task_id} created"
         action_info = f"{params['title']} | {params['priority']} | {params.get('effort', 'No effort')}"
-        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+        details = (
+            "Reminder: Link to requirement(s) via create_relationship(type='implements')\n"
+            "Also set task dependencies via create_relationship(type='depends') if this task has prerequisites"
+        )
+        return self._create_above_fold_response("SUCCESS", key_info, action_info, details)
 
     # ------------------------------------------------------------------
     # update_task (broad planning update)
@@ -330,8 +334,11 @@ class TaskHandler(BaseHandler):
                 f"Invalid status '{new_status}'. Valid: {', '.join(sorted(TASK_STATUSES))}"
             )
 
-        # Get current task
-        rows = await self.db.get_records("tasks", "status", where_clause="id = ?", where_params=[task_id])
+        # Get current task (include fields needed for approval nudges)
+        rows = await self.db.get_records(
+            "tasks", "status, verification_commands, acceptance_criteria",
+            where_clause="id = ?", where_params=[task_id],
+        )
         if not rows:
             return self._create_error_response(f"Task not found: {task_id}")
 
@@ -349,6 +356,12 @@ class TaskHandler(BaseHandler):
             if gating_error:
                 return self._create_error_response(gating_error)
 
+        # Snapshot linked requirement statuses before update (for auto-progression reporting)
+        req_states_before: dict[str, str] = {}
+        if new_status in ("Implemented", "Validated"):
+            linked_reqs = await self._get_linked_requirements(task_id)
+            req_states_before = {r["id"]: r["status"] for r in linked_reqs}
+
         # NARROW WRITE: only status + execution fields
         data: dict[str, Any] = {"status": new_status}
         if "execution_notes" in params and params["execution_notes"] is not None:
@@ -358,9 +371,40 @@ class TaskHandler(BaseHandler):
 
         await self.db.update_record("tasks", data, "id = ?", [task_id])
 
+        # Build response with nudges
+        hints = []
+
+        # Report auto-progression of linked requirements
+        if req_states_before:
+            linked_reqs_after = await self._get_linked_requirements(task_id)
+            for req in linked_reqs_after:
+                old_status = req_states_before.get(req["id"])
+                if old_status and old_status != req["status"]:
+                    hints.append(f"Requirement {req['id']} auto-progressed: {old_status} -> {req['status']}")
+                    if req["status"] == "Validated":
+                        hints.append(
+                            f"Requirement {req['id']} is now fully Validated. "
+                            "Review architectural consistency and code quality for this requirement."
+                        )
+
+        # Nudge: remind to validate after implementing
+        if new_status == "Implemented":
+            hints.append("Next: Run verification commands and mark Validated via update_task_status")
+
+        # Nudge: warn about missing fields when approving
+        if new_status == "Approved":
+            task_row = dict(rows[0])
+            vc = self._safe_json_loads(task_row.get("verification_commands"))
+            ac = self._safe_json_loads(task_row.get("acceptance_criteria"))
+            if not vc:
+                hints.append("Warning: No verification_commands defined — validation will lack test evidence")
+            if not ac:
+                hints.append("Warning: No acceptance_criteria defined — Definition of Done is undefined")
+
         key_info = f"Task {task_id} updated"
         action_info = f"{current_status} -> {new_status}"
-        return self._create_above_fold_response("SUCCESS", key_info, action_info)
+        details = "\n".join(hints) if hints else ""
+        return self._create_above_fold_response("SUCCESS", key_info, action_info, details)
 
     # ------------------------------------------------------------------
     # archive_task
@@ -626,11 +670,22 @@ class TaskHandler(BaseHandler):
 
         await self._log_operation("task", f"batch:{len(created_ids)}", "batch_created", project_id=project_id)
 
+        # Nudge: report missing fields
+        missing_ac = sum(1 for t in task_defs if not t.get("acceptance_criteria"))
+        missing_vc = sum(1 for t in task_defs if not t.get("verification_commands"))
+        hints = []
+        if missing_ac:
+            hints.append(f"Note: {missing_ac} task(s) missing acceptance_criteria")
+        if missing_vc:
+            hints.append(f"Note: {missing_vc} task(s) missing verification_commands")
+
         ids_str = ", ".join(created_ids)
+        details = "\n".join(hints) if hints else ""
         return self._create_above_fold_response(
             "SUCCESS",
             f"Created {len(created_ids)} tasks",
             ids_str,
+            details,
         )
 
     # ------------------------------------------------------------------

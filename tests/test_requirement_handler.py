@@ -1618,3 +1618,69 @@ class TestCoverageGaps:
         )
         text = result[0].text
         assert "type: TECH" in text
+
+
+# -- Agent Nudge Tests -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nudge_approved_reminds_to_create_tasks(setup):
+    """When requirement moves to Approved, response should remind to create tasks."""
+    handler, _, project_id = setup
+    result = await _create_req(handler, project_id, "Nudge Approve Test")
+    req_id = _extract_id(result)
+
+    result = await handler.handle_tool_call("update_requirement_status", {
+        "requirement_id": req_id, "new_status": "Approved",
+    })
+    text = result[0].text
+    assert "create_relationship" in text
+    assert "implements" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_approved_not_shown_for_deprecated(setup):
+    """Deprecated transition should NOT show the 'create tasks' nudge."""
+    handler, _, project_id = setup
+    result = await _create_req(handler, project_id, "Deprecate Test")
+    req_id = _extract_id(result)
+
+    result = await handler.handle_tool_call("update_requirement_status", {
+        "requirement_id": req_id, "new_status": "Deprecated",
+    })
+    text = result[0].text
+    assert "create_relationship" not in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_batch_create_reports_missing_ac(setup):
+    """batch_create_requirements should report count of requirements missing acceptance_criteria."""
+    handler, _, project_id = setup
+    result = await handler.handle_tool_call("batch_create_requirements", {
+        "project_id": project_id,
+        "requirements": [
+            {"title": "Has AC", "type": "FUNC", "priority": "P1",
+             "acceptance_criteria": ["AC1"]},
+            {"title": "No AC 1", "type": "FUNC", "priority": "P1"},
+            {"title": "No AC 2", "type": "TECH", "priority": "P2"},
+        ],
+    })
+    text = result[0].text
+    assert "2 requirement(s) missing acceptance_criteria" in text
+
+
+@pytest.mark.asyncio
+async def test_nudge_batch_create_no_warning_when_all_have_ac(setup):
+    """batch_create_requirements with all ACs present should NOT show notes."""
+    handler, _, project_id = setup
+    result = await handler.handle_tool_call("batch_create_requirements", {
+        "project_id": project_id,
+        "requirements": [
+            {"title": "Complete 1", "type": "FUNC", "priority": "P1",
+             "acceptance_criteria": ["AC1"]},
+            {"title": "Complete 2", "type": "TECH", "priority": "P1",
+             "acceptance_criteria": ["AC2"]},
+        ],
+    })
+    text = result[0].text
+    assert "Note:" not in text
