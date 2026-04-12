@@ -381,34 +381,38 @@ class PatternHandler(BaseHandler):
             row_factory=True,
         )
 
-        # For each pattern, get linked ADRs (non-archived, non-deprecated)
-        pattern_sections: list[str] = []
-        # Track all ADR IDs that are linked to any pattern
+        # Fetch ALL linked ADRs for the matched patterns in a single query
+        pattern_ids = [p["id"] for p in patterns]
+        adr_by_pattern: dict[str, list] = {pid: [] for pid in pattern_ids}
         linked_adr_ids: set[str] = set()
 
+        if pattern_ids:
+            placeholders = ",".join("?" for _ in pattern_ids)
+            all_adr_rows = await self.db.execute_query(
+                f"""SELECT ap.pattern_id, a.id, a.title, a.status, a.decision, ap.role
+                    FROM adr_patterns ap
+                    JOIN architecture a ON a.id = ap.adr_id
+                    WHERE ap.pattern_id IN ({placeholders})
+                      AND a.is_archived = 0
+                      AND a.status != 'Deprecated'
+                    ORDER BY ap.pattern_id, ap.role, a.id""",
+                pattern_ids,
+                fetch_all=True,
+                row_factory=True,
+            )
+            for row in all_adr_rows:
+                adr_by_pattern[row["pattern_id"]].append(row)
+                linked_adr_ids.add(row["id"])
+
         # Group patterns by type
+        pattern_sections: list[str] = []
         patterns_by_type: dict[str, list] = {}
         for pat in patterns:
             patterns_by_type.setdefault(pat["type"], []).append(pat)
 
         for ptype, pats in patterns_by_type.items():
             for pat in pats:
-                # Query linked ADRs with roles
-                adr_rows = await self.db.execute_query(
-                    """SELECT a.id, a.title, a.status, a.decision, ap.role
-                       FROM adr_patterns ap
-                       JOIN architecture a ON a.id = ap.adr_id
-                       WHERE ap.pattern_id = ?
-                         AND a.is_archived = 0
-                         AND a.status != 'Deprecated'
-                       ORDER BY ap.role, a.id""",
-                    [pat["id"]],
-                    fetch_all=True,
-                    row_factory=True,
-                )
-
-                for row in adr_rows:
-                    linked_adr_ids.add(row["id"])
+                adr_rows = adr_by_pattern[pat["id"]]
 
                 # Group by role
                 by_role: dict[str, list] = {"establishes": [], "refines": [], "follows": []}
