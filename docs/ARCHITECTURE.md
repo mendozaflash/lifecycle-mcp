@@ -14,6 +14,7 @@ The server exposes **36 tools** across **8 handler modules**, accessible via std
 | Constants | `src/lifecycle_mcp/constants.py` | Shared state machines, relationship rules, entity-table map |
 | DatabaseManager | `src/lifecycle_mcp/database_manager.py` | Async SQLite pool, FK enforcement, ID generation |
 | Schema | `src/lifecycle_mcp/lifecycle-schema-v2.sql` | v2 database schema (tables, views, triggers, indexes) |
+| LockManager | `src/lifecycle_mcp/locks.py` | Per-requirement asyncio locks for concurrent task status updates |
 | BaseHandler | `src/lifecycle_mcp/handlers/base_handler.py` | Abstract base class, validation helpers, response formatting |
 | ProjectHandler | `src/lifecycle_mcp/handlers/project_handler.py` | Project CRUD and archiving (5 tools) |
 | RequirementHandler | `src/lifecycle_mcp/handlers/requirement_handler.py` | Requirement lifecycle management (8 tools) |
@@ -86,10 +87,15 @@ Valid relationship combinations include:
 - `requirement ↔ task` via `implements`
 - `task → requirement` via `addresses`
 - `requirement ↔ architecture` via `addresses`
+- `requirement ↔ architecture` via `informs` (ADR informs requirement direction without directly addressing it)
 - `task → architecture` via `implements` or `informs`
 - `architecture → task` via `informs`
 - `task ↔ task` via `depends`, `blocks`, `informs`, `requires`
 - `requirement ↔ requirement` via `depends`, `parent`, `refines`, `conflicts`, `relates`
+
+Semantic distinction for architecture ↔ requirement:
+- `addresses` — ADR directly resolves or satisfies the requirement
+- `informs` — ADR provides context or constraints that shape the requirement's direction
 
 The canonical list lives in `src/lifecycle_mcp/constants.py` (`VALID_RELATIONSHIP_COMBINATIONS`).
 
@@ -105,6 +111,20 @@ The canonical list lives in `src/lifecycle_mcp/constants.py` (`VALID_RELATIONSHI
 - `ENTITY_TABLE_MAP` — maps entity type strings to table names
 
 All handlers import from `constants.py`. No state machine definitions exist in handler files.
+
+### RequirementLockManager
+
+`src/lifecycle_mcp/locks.py` serializes the snapshot→update→compare cycle in `TaskHandler._update_task_status` when parallel agents update tasks that share linked requirements.
+
+**Problem it solves:** Without locking, two parallel agents that both snapshot a requirement status and then update linked tasks can each report stale "before" states, even though SQLite triggers correctly serialize the actual state transitions.
+
+**Design:**
+- Per-requirement `asyncio.Lock` (not global) — unrelated requirements proceed in parallel
+- Sorted acquisition order across multi-requirement sets prevents deadlocks
+- Reference counting cleans up idle lock objects to prevent unbounded memory growth
+- Lock is acquired **only** for `Implemented` and `Validated` transitions (the only ones that fire auto-progression triggers)
+
+**Integration point:** `TaskHandler.__init__` instantiates one `RequirementLockManager`; `_update_task_status` acquires it around the critical section when `new_status in ("Implemented", "Validated")` and the task has linked requirements.
 
 ### BaseHandler
 
@@ -128,6 +148,17 @@ The server maintains a flat `dict[str, BaseHandler]` mapping each of the 36 tool
 
 `list_projects` returns lightweight `id, name, status` per project. `get_project_details` accepts a `detail_level` parameter (`summary`, `status`, `metrics`) to control output depth.
 
+**Progress metrics** (returned by `get_project_details` at `status` and `metrics` levels):
+
+| Metric | Formula | Meaning |
+|--------|---------|---------|
+| `progress_pct` (tasks) | `(Implemented + Validated) / total × 100` | Code-done progress — non-zero during active implementation |
+| `validated_pct` (tasks) | `Validated / total × 100` | Verified-done progress — strict "all checks pass" |
+| `progress_pct` (requirements) | `(Implemented + Partially Validated + Validated) / total × 100` | Requirements with code complete |
+| `validated_pct` (requirements) | `Validated / total × 100` | Requirements fully verified |
+
+> `completion_pct` (Validated-only) was replaced by the dual `progress_pct` / `validated_pct` breakdown. Using Validated-only caused 0% display during active implementation.
+
 **Requirements (8 tools)**:
 `create_requirement`, `update_requirement`, `update_requirement_status`, `archive_requirement`, `query_requirements`, `get_requirement_details`, `batch_create_requirements`, `clone_requirement`
 
@@ -137,6 +168,8 @@ The server maintains a flat `dict[str, BaseHandler]` mapping each of the 36 tool
 `create_task`, `update_task`, `update_task_status`, `archive_task`, `query_tasks`, `get_task_details`, `batch_create_tasks`, `clone_task`
 
 `query_tasks` supports `output_format`, `limit`, `offset`. `get_task_details` accepts a `sections` array (`planning`, `execution`, `requirements`, `adrs`, `subtasks`); default is `["planning", "requirements"]`.
+
+**`update_task_status` is narrow-write:** only accepts `new_status`, `execution_notes`, `deviation_from_plan`. Use `update_task` to change planning fields (title, assignee, effort, files_touched, etc.).
 
 **Architecture (7 tools)**:
 `create_architecture_decision`, `update_architecture_decision`, `update_architecture_status`, `archive_architecture_decision`, `query_architecture_decisions`, `get_architecture_details`, `add_architecture_review`
@@ -276,6 +309,13 @@ CLI arguments take precedence over environment variables:
 
 When binding to `0.0.0.0`, DNS-rebinding protection is disabled to allow LAN clients. For other bind addresses, protection is enabled with explicit allowed hosts/origins.
 
+### Docker Deployment
+
+`Dockerfile` + `docker-compose.yml` in project root. The container runs streamable-http transport on port 8080 by default. Database is stored at `/data/lifecycle.db` — mount a volume at `/data` for persistence.
+
+**Streamable-HTTP endpoint**: `/mcp/` (trailing slash required).
+**SSE endpoints**: `/sse` + `/messages/`.
+
 ## Database Manager
 
 `DatabaseManager` provides an async connection pool backed by `aiosqlite`:
@@ -305,6 +345,7 @@ src/lifecycle_mcp/
     database_manager.py          # Async SQLite pool
     lifecycle-schema-v2.sql      # Database schema
     constants.py                 # Shared state machines, relationship rules, entity-table map
+    locks.py                     # RequirementLockManager — per-requirement asyncio locks
     handlers/
         __init__.py              # Handler exports
         base_handler.py          # Abstract base class
