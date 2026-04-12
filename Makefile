@@ -53,7 +53,7 @@ pre-commit:
 
 build-dxt:
 	@echo "Building Desktop Extension package..."
-	python build_dxt.py
+	python3 build_dxt.py
 
 clean:
 	rm -rf build/
