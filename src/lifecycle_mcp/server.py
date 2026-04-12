@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import os
+import subprocess
 from typing import Any
 
 from mcp.server import Server
@@ -359,6 +360,15 @@ def main():
     CLI arguments take precedence over environment variables.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    try:
+        git_info = subprocess.check_output(
+            ["git", "log", "-1", "--pretty=%h %s"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        short_msg = " ".join(git_info.split()[:6])
+        logger.info("lifecycle-mcp version: %s", short_msg)
+    except Exception:
+        pass
 
     parser = argparse.ArgumentParser(description="Lifecycle MCP Server")
     parser.add_argument(
