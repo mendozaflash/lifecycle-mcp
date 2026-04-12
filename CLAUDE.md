@@ -198,6 +198,7 @@ The server uses the `LIFECYCLE_DB` environment variable to specify the SQLite da
 
 - **Async Architecture**: All handler methods use async/await for MCP protocol compliance
 - The server implements strict state transition validation for requirements
+- `get_project_details` uses `progress_pct` (Implemented + Validated tasks / total) and `validated_pct` (Validated / total) instead of the old `completion_pct`. Requirements use `progress_pct` counting Implemented + Partially Validated + Validated statuses.
 - All entities use structured ID formats (REQ-XXXX-TYPE-VV, TASK-XXXX-YY-ZZ, ADR-XXXX)
 - JSON fields are used extensively for structured data (arrays, objects)
 - Automatic triggers maintain denormalized counters and timestamps
