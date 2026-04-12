@@ -931,3 +931,126 @@ async def test_no_query_json_route(setup):
     handler, db, pid = setup
     result = await handler.handle_tool_call("query_architecture_decisions_json", {})
     assert "ERROR" in result[0].text or "Unknown" in result[0].text
+
+
+# =============================================================================
+#  ADR lifecycle simplification (ADR-COH-02)
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_adr_creation_defaults_to_under_review(setup):
+    """ADR creation defaults to 'Under Review' status (not Draft)."""
+    handler, db, pid = setup
+    result = await _create_adr(handler, pid, title="Fresh ADR")
+
+    text = result[0].text
+    assert "SUCCESS" in text
+    assert "Under Review" in text
+
+    row = await db.execute_query(
+        "SELECT status FROM architecture WHERE id = 'ADR-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["status"] == "Under Review"
+
+
+@pytest.mark.asyncio
+async def test_deprecated_auto_archives(setup):
+    """Deprecating an ADR auto-sets is_archived=1 and archived_at via DB trigger."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid, title="Will be deprecated")
+
+    # Under Review -> Accepted (shortcut)
+    await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Accepted"},
+    )
+    # Accepted -> Deprecated
+    result = await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Deprecated"},
+    )
+    assert "SUCCESS" in result[0].text
+
+    row = await db.execute_query(
+        "SELECT status, is_archived, archived_at FROM architecture WHERE id = 'ADR-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert row["status"] == "Deprecated"
+    assert row["is_archived"] == 1
+    assert row["archived_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_deprecated_adr_excluded_from_default_queries(setup):
+    """Deprecated (auto-archived) ADR is excluded from default query results."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid, title="Staying")
+    await _create_adr(handler, pid, title="Going away")
+
+    # Deprecate ADR-0002
+    await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0002", "new_status": "Deprecated"},
+    )
+
+    # Default query (include_archived=False)
+    result = await handler.handle_tool_call(
+        "query_architecture_decisions", {"project_id": pid},
+    )
+    text = result[0].text
+    assert "Staying" in text
+    assert "Going away" not in text
+
+    # Explicit include_archived=True brings it back
+    result_all = await handler.handle_tool_call(
+        "query_architecture_decisions", {"project_id": pid, "include_archived": True},
+    )
+    text_all = result_all[0].text
+    assert "Staying" in text_all
+    assert "Going away" in text_all
+
+
+@pytest.mark.asyncio
+async def test_draft_as_new_status_rejected(setup):
+    """'Draft' is not a valid status in the simplified 5-state lifecycle."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid)
+
+    result = await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Draft"},
+    )
+    assert "ERROR" in result[0].text
+    assert "Invalid transition" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_approved_as_new_status_rejected(setup):
+    """'Approved' is not a valid status in the simplified 5-state lifecycle."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid)
+
+    result = await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Approved"},
+    )
+    assert "ERROR" in result[0].text
+    assert "Invalid transition" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_implemented_as_new_status_rejected(setup):
+    """'Implemented' is not a valid status in the simplified 5-state lifecycle."""
+    handler, db, pid = setup
+    await _create_adr(handler, pid)
+
+    result = await handler.handle_tool_call(
+        "update_architecture_status",
+        {"architecture_id": "ADR-0001", "new_status": "Implemented"},
+    )
+    assert "ERROR" in result[0].text
+    assert "Invalid transition" in result[0].text
