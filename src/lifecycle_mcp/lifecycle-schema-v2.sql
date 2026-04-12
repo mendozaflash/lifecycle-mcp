@@ -7,7 +7,7 @@
 -- ============================================================
 
 CREATE TABLE sequences (
-    entity_type TEXT PRIMARY KEY,  -- 'requirement', 'task', 'architecture', 'project'
+    entity_type TEXT PRIMARY KEY,  -- 'requirement', 'task', 'architecture', 'project', 'architectural_pattern'
     next_val INTEGER NOT NULL DEFAULT 1
 );
 

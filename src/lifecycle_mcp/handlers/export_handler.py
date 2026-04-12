@@ -658,6 +658,7 @@ class ExportHandler(BaseHandler):
         for arch in architecture:
             node_id = arch["id"].replace("-", "_")
             status_color = {
+                "Under Review": "fill:#ffffcc",
                 "Proposed": "fill:#ffcc99",
                 "Accepted": "fill:#99ff99",
                 "Rejected": "fill:#ff9999",
