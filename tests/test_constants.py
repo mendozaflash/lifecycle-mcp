@@ -120,8 +120,8 @@ class TestRelationshipCombinations:
         assert ("requirement", "requirement", "parent") in VALID_RELATIONSHIP_COMBINATIONS
 
     def test_expected_count(self):
-        # 17 entries per the spec
-        assert len(VALID_RELATIONSHIP_COMBINATIONS) == 17
+        # 19 entries: 17 original + 2 architecture<->requirement informs (TASK-0026)
+        assert len(VALID_RELATIONSHIP_COMBINATIONS) == 19
 
 
 # ---------------------------------------------------------------

@@ -405,17 +405,19 @@ async def test_get_project_details_nonexistent(project_handler):
 
 @pytest.mark.asyncio
 async def test_get_project_details_status(project_handler):
-    """get_project_details with detail_level=status shows per-status breakdowns and completion %."""
+    """get_project_details with detail_level=status shows per-status breakdowns, progress/validated %."""
     db = project_handler.db
     await project_handler.handle_tool_call("create_project", {"name": "StatusTest"})
 
     await _add_req(db, "REQ-0001", "PROJ-0001", status="Under Review")
     await _add_req(db, "REQ-0002", "PROJ-0001", status="Under Review")
     await _add_req(db, "REQ-0003", "PROJ-0001", status="Approved")
+    await _add_req(db, "REQ-0004", "PROJ-0001", status="Implemented")
     await _add_task(db, "TASK-0001", "PROJ-0001", status="Under Review")
     await _add_task(db, "TASK-0002", "PROJ-0001", status="Approved")
     await _add_task(db, "TASK-0003", "PROJ-0001", status="Validated")
     await _add_task(db, "TASK-0004", "PROJ-0001", status="Validated")
+    await _add_task(db, "TASK-0005", "PROJ-0001", status="Implemented")
     await _add_adr(db, "ADR-0001", "PROJ-0001", status="Draft")
     await _add_adr(db, "ADR-0002", "PROJ-0001", status="Accepted")
 
@@ -429,11 +431,13 @@ async def test_get_project_details_status(project_handler):
 
     # Per-status breakdowns
     assert "2 Under Review" in text  # requirements
-    assert "1 Approved" in text
-    assert "1 Under Review" in text  # tasks (shared label with reqs)
     assert "2 Validated" in text
-    # Completion percentage: 2 Validated out of 4 tasks = 50%
-    assert "50%" in text
+    # Task progress: (1 Implemented + 2 Validated) / 5 = 60% progress, 2/5 = 40% validated
+    assert "60% progress" in text
+    assert "40% validated" in text
+    # Requirement progress: 1 Implemented / 4 = 25% progress, 0/4 = 0% validated
+    assert "25% progress" in text
+    assert "0% validated" in text
     # ADR breakdown
     assert "1 Draft" in text
     assert "1 Accepted" in text
@@ -470,9 +474,11 @@ async def test_get_project_details_metrics(project_handler):
 
     await _add_req(db, "REQ-0001", "PROJ-0001", status="Under Review", priority="P0")
     await _add_req(db, "REQ-0002", "PROJ-0001", status="Approved", priority="P1")
+    await _add_req(db, "REQ-0003", "PROJ-0001", status="Implemented", priority="P1")
     await _add_task(db, "TASK-0001", "PROJ-0001", status="Validated", priority="P1", assignee="Alice")
     await _add_task(db, "TASK-0002", "PROJ-0001", status="Approved", priority="P2", assignee="Bob")
     await _add_task(db, "TASK-0003", "PROJ-0001", status="Under Review", priority="P1", assignee=None)
+    await _add_task(db, "TASK-0004", "PROJ-0001", status="Implemented", priority="P1", assignee="Alice")
     await _add_adr(db, "ADR-0001", "PROJ-0001", status="Accepted")
 
     result = await project_handler.handle_tool_call(
@@ -481,10 +487,17 @@ async def test_get_project_details_metrics(project_handler):
     text = result[0].text
     metrics = json.loads(text)
     assert metrics["project_id"] == "PROJ-0001"
-    assert metrics["requirements"]["total"] == 2
-    assert metrics["tasks"]["total"] == 3
-    # 1 Validated task out of 3 = 33.3%
-    assert metrics["tasks"]["completion_pct"] == 33.3
+    assert metrics["requirements"]["total"] == 3
+    # Requirement progress: 1 Implemented / 3 = 33.3%
+    assert metrics["requirements"]["progress_pct"] == 33.3
+    assert metrics["requirements"]["validated_pct"] == 0
+    assert metrics["tasks"]["total"] == 4
+    # Task progress: (1 Implemented + 1 Validated) / 4 = 50.0%
+    assert metrics["tasks"]["progress_pct"] == 50.0
+    # Task validated: 1 Validated / 4 = 25.0%
+    assert metrics["tasks"]["validated_pct"] == 25.0
+    # completion_pct should no longer exist
+    assert "completion_pct" not in metrics["tasks"]
     assert metrics["architecture"]["total"] == 1
     # No blocked_count key in metrics
     assert "blocked_count" not in metrics
@@ -501,10 +514,61 @@ async def test_get_project_details_metrics_empty(project_handler):
     text = result[0].text
     metrics = json.loads(text)
     assert metrics["requirements"]["total"] == 0
+    assert metrics["requirements"]["progress_pct"] == 0
+    assert metrics["requirements"]["validated_pct"] == 0
     assert metrics["tasks"]["total"] == 0
-    assert metrics["tasks"]["completion_pct"] == 0
+    assert metrics["tasks"]["progress_pct"] == 0
+    assert metrics["tasks"]["validated_pct"] == 0
+    assert "completion_pct" not in metrics["tasks"]
     assert metrics["architecture"]["total"] == 0
     assert "blocked_count" not in metrics
+
+
+@pytest.mark.asyncio
+async def test_get_project_details_progress_mixed_statuses(project_handler):
+    """progress_pct counts Implemented+Validated tasks; validated_pct counts only Validated."""
+    db = project_handler.db
+    await project_handler.handle_tool_call("create_project", {"name": "ProgressTest"})
+
+    # Tasks: 2 Approved, 1 Implemented, 2 Validated = 5 total
+    await _add_task(db, "TASK-0001", "PROJ-0001", status="Approved", priority="P1")
+    await _add_task(db, "TASK-0002", "PROJ-0001", status="Approved", priority="P2")
+    await _add_task(db, "TASK-0003", "PROJ-0001", status="Implemented", priority="P1")
+    await _add_task(db, "TASK-0004", "PROJ-0001", status="Validated", priority="P0")
+    await _add_task(db, "TASK-0005", "PROJ-0001", status="Validated", priority="P1")
+
+    # Requirements: 1 Approved, 1 Implemented, 1 Partially Validated, 1 Validated = 4 total
+    await _add_req(db, "REQ-0001", "PROJ-0001", status="Approved", priority="P1")
+    await _add_req(db, "REQ-0002", "PROJ-0001", status="Implemented", priority="P1")
+    await _add_req(db, "REQ-0003", "PROJ-0001", status="Partially Validated", priority="P1")
+    await _add_req(db, "REQ-0004", "PROJ-0001", status="Validated", priority="P0")
+
+    # Check metrics level
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "metrics"}
+    )
+    metrics = json.loads(result[0].text)
+
+    # Task progress: (1 Implemented + 2 Validated) / 5 = 60.0%
+    assert metrics["tasks"]["progress_pct"] == 60.0
+    # Task validated: 2 Validated / 5 = 40.0%
+    assert metrics["tasks"]["validated_pct"] == 40.0
+    assert "completion_pct" not in metrics["tasks"]
+
+    # Requirement progress: (1 Implemented + 1 Partially Validated + 1 Validated) / 4 = 75.0%
+    assert metrics["requirements"]["progress_pct"] == 75.0
+    # Requirement validated: 1 Validated / 4 = 25.0%
+    assert metrics["requirements"]["validated_pct"] == 25.0
+
+    # Check status level too
+    result = await project_handler.handle_tool_call(
+        "get_project_details", {"project_id": "PROJ-0001", "detail_level": "status"}
+    )
+    text = result[0].text
+    assert "60% progress" in text
+    assert "40% validated" in text
+    assert "75% progress" in text
+    assert "25% validated" in text
 
 
 @pytest.mark.asyncio

@@ -99,7 +99,7 @@ class ProjectHandler(BaseHandler):
             },
             {
                 "name": "get_project_details",
-                "description": "Get project details at varying depth: summary (metadata + totals), status (+ per-status breakdowns, completion %), or metrics (+ priority/assignee/effort breakdowns as JSON)",
+                "description": "Get project details at varying depth: summary (metadata + totals), status (+ per-status breakdowns, progress/validated %), or metrics (+ priority/assignee/effort breakdowns as JSON)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -291,7 +291,7 @@ class ProjectHandler(BaseHandler):
 
         detail_level values:
           - summary (default): metadata + total counts
-          - status: summary + per-status breakdowns, completion %
+          - status: summary + per-status breakdowns, progress/validated %
           - metrics: status + priority/assignee/effort breakdowns as JSON
         """
         error = self._validate_required_params(params, ["project_id"])
@@ -353,7 +353,7 @@ class ProjectHandler(BaseHandler):
         )
 
     async def _get_project_details_status(self, project_id: str) -> list[TextContent]:
-        """Status level: summary + per-status breakdowns, completion %, blocked items."""
+        """Status level: summary + per-status breakdowns, progress/validated %."""
         # Fetch project name
         summary = await self.db.execute_query(
             "SELECT name, status FROM project_summary WHERE id = ?",
@@ -380,9 +380,18 @@ class ProjectHandler(BaseHandler):
             [project_id], fetch_all=True, row_factory=True,
         )
         total_tasks = sum(t["count"] for t in task_stats) if task_stats else 0
-        completed_tasks = next((t["count"] for t in task_stats if t["status"] == "Validated"), 0) if task_stats else 0
-        completion_pct = round(completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+        implemented_tasks = next((t["count"] for t in task_stats if t["status"] == "Implemented"), 0) if task_stats else 0
+        validated_tasks = next((t["count"] for t in task_stats if t["status"] == "Validated"), 0) if task_stats else 0
+        progress_pct = round((implemented_tasks + validated_tasks) / total_tasks * 100) if total_tasks > 0 else 0
+        validated_pct = round(validated_tasks / total_tasks * 100) if total_tasks > 0 else 0
         task_parts = ", ".join(f"{t['count']} {t['status']}" for t in task_stats) if task_stats else ""
+
+        # Requirement progress metrics
+        req_progress_statuses = ("Implemented", "Partially Validated", "Validated")
+        req_progress_count = sum(r["count"] for r in req_stats if r["status"] in req_progress_statuses) if req_stats else 0
+        req_validated_count = next((r["count"] for r in req_stats if r["status"] == "Validated"), 0) if req_stats else 0
+        req_progress_pct = round(req_progress_count / total_reqs * 100) if total_reqs > 0 else 0
+        req_validated_pct = round(req_validated_count / total_reqs * 100) if total_reqs > 0 else 0
 
         # ADR breakdown
         adr_stats = await self.db.execute_query(
@@ -397,8 +406,8 @@ class ProjectHandler(BaseHandler):
         lines = [
             f"[SUCCESS] Project {project_id}: {project_name} [{project_status}]",
             "",
-            f"Requirements: {total_reqs} total" + (f" ({req_parts})" if req_parts else ""),
-            f"Tasks: {total_tasks} total" + (f" ({task_parts})" if task_parts else "") + (f" -- {completion_pct}% complete" if total_tasks > 0 else ""),
+            f"Requirements: {total_reqs} total" + (f" ({req_parts})" if req_parts else "") + (f" -- {req_progress_pct}% progress, {req_validated_pct}% validated" if total_reqs > 0 else ""),
+            f"Tasks: {total_tasks} total" + (f" ({task_parts})" if task_parts else "") + (f" -- {progress_pct}% progress, {validated_pct}% validated" if total_tasks > 0 else ""),
             f"Architecture: {total_adrs} total" + (f" ({adr_parts})" if adr_parts else ""),
         ]
 
@@ -444,22 +453,35 @@ class ProjectHandler(BaseHandler):
 
         # Assemble metrics
         total_tasks = sum(t["count"] for t in task_by_status) if task_by_status else 0
-        completed_tasks = next((t["count"] for t in task_by_status if t["status"] == "Validated"), 0) if task_by_status else 0
-        completion_pct = round(completed_tasks / total_tasks * 100, 1) if total_tasks > 0 else 0
+        implemented_tasks = next((t["count"] for t in task_by_status if t["status"] == "Implemented"), 0) if task_by_status else 0
+        validated_tasks = next((t["count"] for t in task_by_status if t["status"] == "Validated"), 0) if task_by_status else 0
+        progress_pct = round((implemented_tasks + validated_tasks) / total_tasks * 100, 1) if total_tasks > 0 else 0
+        validated_pct = round(validated_tasks / total_tasks * 100, 1) if total_tasks > 0 else 0
+
+        # Requirement progress metrics
+        total_reqs = sum(r["count"] for r in req_by_status) if req_by_status else 0
+        req_progress_statuses = ("Implemented", "Partially Validated", "Validated")
+        req_progress_count = sum(r["count"] for r in req_by_status if r["status"] in req_progress_statuses) if req_by_status else 0
+        req_validated_count = next((r["count"] for r in req_by_status if r["status"] == "Validated"), 0) if req_by_status else 0
+        req_progress_pct = round(req_progress_count / total_reqs * 100, 1) if total_reqs > 0 else 0
+        req_validated_pct = round(req_validated_count / total_reqs * 100, 1) if total_reqs > 0 else 0
 
         metrics = {
             "project_id": project_id,
             "requirements": {
-                "total": sum(r["count"] for r in req_by_status) if req_by_status else 0,
+                "total": total_reqs,
                 "by_status": {r["status"]: r["count"] for r in req_by_status} if req_by_status else {},
                 "by_priority": {r["priority"]: r["count"] for r in req_by_priority} if req_by_priority else {},
+                "progress_pct": req_progress_pct,
+                "validated_pct": req_validated_pct,
             },
             "tasks": {
                 "total": total_tasks,
                 "by_status": {t["status"]: t["count"] for t in task_by_status} if task_by_status else {},
                 "by_priority": {t["priority"]: t["count"] for t in task_by_priority} if task_by_priority else {},
                 "by_assignee": {t["assignee"]: t["count"] for t in task_by_assignee} if task_by_assignee else {},
-                "completion_pct": completion_pct,
+                "progress_pct": progress_pct,
+                "validated_pct": validated_pct,
             },
             "architecture": {
                 "total": sum(a["count"] for a in adr_by_status) if adr_by_status else 0,

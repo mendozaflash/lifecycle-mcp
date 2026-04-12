@@ -778,3 +778,40 @@ class TestFetchAllRelationshipsJoin:
 
         # The two results should be different
         assert relationships[0]["source_id"] != relationships2[0]["source_id"]
+
+
+# ===========================================================================
+# Architecture <-> Requirement informs relationship (IMP-01, TASK-0026)
+# ===========================================================================
+
+
+class TestArchitectureRequirementInforms:
+    """Test architecture <-> requirement 'informs' relationship in both directions."""
+
+    @pytest.mark.asyncio
+    async def test_create_architecture_requirement_informs(self, setup):
+        """architecture -> requirement with 'informs' should succeed."""
+        handler, _, project_id = setup
+        result = await _create_relationship(handler, "ADR-0001", "REQ-0001", "informs", project_id)
+        text = _text(result)
+        assert "SUCCESS" in text
+        assert "ADR-0001" in text
+        assert "REQ-0001" in text
+
+    @pytest.mark.asyncio
+    async def test_create_requirement_architecture_informs(self, setup):
+        """requirement -> architecture with 'informs' should succeed."""
+        handler, _, project_id = setup
+        result = await _create_relationship(handler, "REQ-0001", "ADR-0001", "informs", project_id)
+        text = _text(result)
+        assert "SUCCESS" in text
+        assert "REQ-0001" in text
+        assert "ADR-0001" in text
+
+    @pytest.mark.asyncio
+    async def test_existing_addresses_still_works(self, setup):
+        """Regression: architecture -> requirement 'addresses' must still work."""
+        handler, _, project_id = setup
+        result = await _create_relationship(handler, "ADR-0001", "REQ-0001", "addresses", project_id)
+        text = _text(result)
+        assert "SUCCESS" in text

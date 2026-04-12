@@ -17,6 +17,7 @@ from typing import Any
 from mcp.types import TextContent
 
 from lifecycle_mcp.constants import TASK_STATUSES, TASK_TRANSITIONS
+from lifecycle_mcp.locks import RequirementLockManager
 
 from .base_handler import BaseHandler
 
@@ -35,6 +36,7 @@ class TaskHandler(BaseHandler):
 
     def __init__(self, db_manager):
         super().__init__(db_manager)
+        self._req_lock_mgr = RequirementLockManager()
 
     # ------------------------------------------------------------------
     # Tool definitions
@@ -356,55 +358,67 @@ class TaskHandler(BaseHandler):
             if gating_error:
                 return self._create_error_response(gating_error)
 
-        # Snapshot linked requirement statuses before update (for auto-progression reporting)
-        req_states_before: dict[str, str] = {}
+        # Acquire per-requirement locks for transitions that trigger auto-progression
+        locked_ids: list[str] = []
         if new_status in ("Implemented", "Validated"):
             linked_reqs = await self._get_linked_requirements(task_id)
-            req_states_before = {r["id"]: r["status"] for r in linked_reqs}
+            req_ids = {r["id"] for r in linked_reqs}
+            if req_ids:
+                locked_ids = await self._req_lock_mgr.acquire_for_requirements(req_ids)
 
-        # NARROW WRITE: only status + execution fields
-        data: dict[str, Any] = {"status": new_status}
-        if "execution_notes" in params and params["execution_notes"] is not None:
-            data["execution_notes"] = params["execution_notes"]
-        if "deviation_from_plan" in params and params["deviation_from_plan"] is not None:
-            data["deviation_from_plan"] = params["deviation_from_plan"]
+        try:
+            # Re-read requirement state under lock for a fresh snapshot
+            req_states_before: dict[str, str] = {}
+            if new_status in ("Implemented", "Validated"):
+                linked_reqs = await self._get_linked_requirements(task_id)
+                req_states_before = {r["id"]: r["status"] for r in linked_reqs}
 
-        await self.db.update_record("tasks", data, "id = ?", [task_id])
+            # NARROW WRITE: only status + execution fields
+            data: dict[str, Any] = {"status": new_status}
+            if "execution_notes" in params and params["execution_notes"] is not None:
+                data["execution_notes"] = params["execution_notes"]
+            if "deviation_from_plan" in params and params["deviation_from_plan"] is not None:
+                data["deviation_from_plan"] = params["deviation_from_plan"]
 
-        # Build response with nudges
-        hints = []
+            await self.db.update_record("tasks", data, "id = ?", [task_id])
 
-        # Report auto-progression of linked requirements
-        if req_states_before:
-            linked_reqs_after = await self._get_linked_requirements(task_id)
-            for req in linked_reqs_after:
-                old_status = req_states_before.get(req["id"])
-                if old_status and old_status != req["status"]:
-                    hints.append(f"Requirement {req['id']} auto-progressed: {old_status} -> {req['status']}")
-                    if req["status"] == "Validated":
-                        hints.append(
-                            f"Requirement {req['id']} is now fully Validated. "
-                            "Review architectural consistency and code quality for this requirement."
-                        )
+            # Build response with nudges
+            hints = []
 
-        # Nudge: remind to validate after implementing
-        if new_status == "Implemented":
-            hints.append("Next: Run verification commands and mark Validated via update_task_status")
+            # Report auto-progression of linked requirements
+            if req_states_before:
+                linked_reqs_after = await self._get_linked_requirements(task_id)
+                for req in linked_reqs_after:
+                    old_status = req_states_before.get(req["id"])
+                    if old_status and old_status != req["status"]:
+                        hints.append(f"Requirement {req['id']} auto-progressed: {old_status} -> {req['status']}")
+                        if req["status"] == "Validated":
+                            hints.append(
+                                f"Requirement {req['id']} is now fully Validated. "
+                                "Review architectural consistency and code quality for this requirement."
+                            )
 
-        # Nudge: warn about missing fields when approving
-        if new_status == "Approved":
-            task_row = dict(rows[0])
-            vc = self._safe_json_loads(task_row.get("verification_commands"))
-            ac = self._safe_json_loads(task_row.get("acceptance_criteria"))
-            if not vc:
-                hints.append("Warning: No verification_commands defined — validation will lack test evidence")
-            if not ac:
-                hints.append("Warning: No acceptance_criteria defined — Definition of Done is undefined")
+            # Nudge: remind to validate after implementing
+            if new_status == "Implemented":
+                hints.append("Next: Run verification commands and mark Validated via update_task_status")
 
-        key_info = f"Task {task_id} updated"
-        action_info = f"{current_status} -> {new_status}"
-        details = "\n".join(hints) if hints else ""
-        return self._create_above_fold_response("SUCCESS", key_info, action_info, details)
+            # Nudge: warn about missing fields when approving
+            if new_status == "Approved":
+                task_row = dict(rows[0])
+                vc = self._safe_json_loads(task_row.get("verification_commands"))
+                ac = self._safe_json_loads(task_row.get("acceptance_criteria"))
+                if not vc:
+                    hints.append("Warning: No verification_commands defined — validation will lack test evidence")
+                if not ac:
+                    hints.append("Warning: No acceptance_criteria defined — Definition of Done is undefined")
+
+            key_info = f"Task {task_id} updated"
+            action_info = f"{current_status} -> {new_status}"
+            details = "\n".join(hints) if hints else ""
+            return self._create_above_fold_response("SUCCESS", key_info, action_info, details)
+        finally:
+            if locked_ids:
+                await self._req_lock_mgr.release_for_requirements(locked_ids)
 
     # ------------------------------------------------------------------
     # archive_task

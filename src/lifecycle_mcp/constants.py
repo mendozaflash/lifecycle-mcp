@@ -55,6 +55,8 @@ VALID_RELATIONSHIP_COMBINATIONS: set[tuple[str, str, str]] = {
     ("task", "architecture", "implements"),
     ("task", "architecture", "informs"),
     ("architecture", "task", "informs"),
+    ("architecture", "requirement", "informs"),
+    ("requirement", "architecture", "informs"),
     ("task", "task", "depends"),
     ("task", "task", "blocks"),
     ("task", "task", "informs"),

@@ -1463,3 +1463,63 @@ async def test_nudge_batch_create_no_warning_when_complete(task_env):
     })
     text = result[0].text
     assert "Note:" not in text
+
+
+# =============================================================================
+#  Concurrency: RequirementLockManager integration
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_parallel_task_status_updates_same_requirement(task_env):
+    """Parallel task status updates on the same requirement produce correct before/after reports."""
+    import asyncio
+
+    handler, db, pid = task_env
+
+    # Create a requirement and approve it
+    await _create_requirement(db, pid, "REQ-0001", "Shared Req")
+    await db.update_record("requirements", {"status": "Approved"}, "id = ?", ["REQ-0001"])
+
+    # Create two tasks linked to the same requirement
+    await _create_task(handler, pid, title="Task A")
+    await _create_task(handler, pid, title="Task B")
+
+    # Link both to REQ-0001
+    await _link(db, "task", "TASK-0001", "requirement", "REQ-0001", "implements", pid)
+    await _link(db, "task", "TASK-0002", "requirement", "REQ-0001", "implements", pid)
+
+    # Approve both tasks
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0001", "new_status": "Approved"}
+    )
+    await handler.handle_tool_call(
+        "update_task_status", {"task_id": "TASK-0002", "new_status": "Approved"}
+    )
+
+    # Concurrently move both to Implemented
+    results = await asyncio.gather(
+        handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0001", "new_status": "Implemented"}
+        ),
+        handler.handle_tool_call(
+            "update_task_status", {"task_id": "TASK-0002", "new_status": "Implemented"}
+        ),
+    )
+
+    # Both should succeed
+    assert "SUCCESS" in results[0][0].text
+    assert "SUCCESS" in results[1][0].text
+
+    # Both should report auto-progression for REQ-0001
+    combined = results[0][0].text + results[1][0].text
+    assert "REQ-0001" in combined
+    assert "auto-progressed" in combined
+
+    # Requirement should have reached Implemented (both tasks implemented)
+    req_row = await db.execute_query(
+        "SELECT status FROM requirements WHERE id = 'REQ-0001'",
+        fetch_one=True,
+        row_factory=True,
+    )
+    assert req_row["status"] == "Implemented"
