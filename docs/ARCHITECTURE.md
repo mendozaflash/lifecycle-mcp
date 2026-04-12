@@ -4,7 +4,7 @@
 
 lifecycle-mcp is a Model Context Protocol (MCP) server for software lifecycle management. It provides structured tracking of projects, requirements, tasks, and architecture decisions through a SQLite database with an async connection pool.
 
-The server exposes **36 tools** across **8 handler modules**, accessible via stdio, streamable-http, or SSE transports.
+The server exposes **40 tools** across **9 handler modules**, accessible via stdio, streamable-http, or SSE transports.
 
 ## Module Inventory
 
@@ -20,6 +20,7 @@ The server exposes **36 tools** across **8 handler modules**, accessible via std
 | RequirementHandler | `src/lifecycle_mcp/handlers/requirement_handler.py` | Requirement lifecycle management (8 tools) |
 | TaskHandler | `src/lifecycle_mcp/handlers/task_handler.py` | Task management with planning/execution fields (8 tools) |
 | ArchitectureHandler | `src/lifecycle_mcp/handlers/architecture_handler.py` | ADR management and reviews (7 tools) |
+| PatternHandler | `src/lifecycle_mcp/handlers/pattern_handler.py` | Architectural pattern taxonomy (4 tools) |
 | RelationshipHandler | `src/lifecycle_mcp/handlers/relationship_handler.py` | Polymorphic entity relationships (3 tools) |
 | ValidationHandler | `src/lifecycle_mcp/handlers/validation_handler.py` | Plan validation and status transition lookups (2 tools) |
 | ExportHandler | `src/lifecycle_mcp/handlers/export_handler.py` | Documentation and diagram export (2 tools) |
@@ -36,6 +37,8 @@ The server exposes **36 tools** across **8 handler modules**, accessible via std
 | `requirements` | Project-scoped requirements | `id` (REQ-XXXX), `project_id` FK, `type`, `status`, `priority` |
 | `tasks` | Project-scoped tasks with planning+execution fields | `id` (TASK-XXXX), `project_id` FK, `parent_task_id` FK (self-ref) |
 | `architecture` | Architecture Decision Records | `id` (ADR-XXXX), `project_id` FK, `superseded_by` FK (self-ref) |
+| `architectural_patterns` | Reusable architectural pattern definitions | `id` (PAT-XXXX), `project_id` FK, `name`, `type`, `description` |
+| `adr_patterns` | Many-to-many ADR-to-pattern links with role | `adr_id` FK, `pattern_id` FK, `role` (establishes/follows/refines) |
 | `relationships` | Polymorphic entity relationships | `source_type`, `source_id`, `target_type`, `target_id`, `relationship_type` |
 | `reviews` | Entity-scoped review comments | `entity_type`, `entity_id`, `reviewer`, `comment` |
 | `lifecycle_events` | Status change audit log | `entity_type`, `entity_id`, `event_type`, `from_value`, `to_value` |
@@ -56,7 +59,7 @@ The server exposes **36 tools** across **8 handler modules**, accessible via std
 
 ### Indexes
 
-Indexes on: `relationships(source)`, `relationships(target)`, `relationships(project)`, `relationships(type)`, `requirements(status)`, `requirements(priority)`, `requirements(project)`, `tasks(status)`, `tasks(project)`, `architecture(project)`.
+Indexes on: `relationships(source)`, `relationships(target)`, `relationships(project)`, `relationships(type)`, `requirements(status)`, `requirements(priority)`, `requirements(project)`, `tasks(status)`, `tasks(project)`, `architecture(project)`, `adr_patterns(adr)`, `adr_patterns(pattern)`, `adr_patterns(role)`, `architectural_patterns(project)`, `architectural_patterns(type)`.
 
 ## ID Generation
 
@@ -68,6 +71,7 @@ Global sequential IDs are generated atomically via the `sequences` table. Each e
 | requirement | REQ | REQ-0042 |
 | task | TASK | TASK-0007 |
 | architecture | ADR | ADR-0003 |
+| pattern | PAT | PAT-0001 |
 
 The `DatabaseManager.generate_id()` method uses `BEGIN IMMEDIATE` transactions to atomically increment and return the next ID. IDs are globally unique per type -- no project disambiguation needed.
 
@@ -128,7 +132,7 @@ All handlers import from `constants.py`. No state machine definitions exist in h
 
 ### BaseHandler
 
-All 8 handlers inherit from `BaseHandler`, which provides:
+All 9 handlers inherit from `BaseHandler`, which provides:
 - Database manager reference (`self.db`)
 - Standardized response formatting (`_create_response`, `_create_above_fold_response`, `_create_error_response`)
 - Parameter validation (`_validate_required_params`)
@@ -139,9 +143,9 @@ All 8 handlers inherit from `BaseHandler`, which provides:
 
 ### Tool Registry
 
-The server maintains a flat `dict[str, BaseHandler]` mapping each of the 36 tool names to its handler instance. Tool routing is O(1) dictionary lookup.
+The server maintains a flat `dict[str, BaseHandler]` mapping each of the 40 tool names to its handler instance. Tool routing is O(1) dictionary lookup.
 
-### Tool Inventory (36 tools)
+### Tool Inventory (40 tools)
 
 **Project (5 tools)**:
 `create_project`, `update_project`, `archive_project`, `list_projects`, `get_project_details`
@@ -175,6 +179,11 @@ The server maintains a flat `dict[str, BaseHandler]` mapping each of the 36 tool
 `create_architecture_decision`, `update_architecture_decision`, `update_architecture_status`, `archive_architecture_decision`, `query_architecture_decisions`, `get_architecture_details`, `add_architecture_review`
 
 `query_architecture_decisions` supports `output_format`, `limit`, `offset`.
+
+**Patterns (4 tools)**:
+`create_architectural_pattern`, `link_adr_to_pattern`, `query_architectural_patterns`, `get_architectural_overview`
+
+Patterns provide a taxonomy layer above ADRs. Each pattern has a `type` (e.g., `database`, `api`, `transport`, `reliability`). ADRs are linked to patterns via `adr_patterns` with a `role` (`establishes`, `follows`, `refines`). `get_architectural_overview` provides a cross-cutting view of all patterns and their linked ADRs for a project.
 
 **Relationships (3 tools)**:
 `create_relationship`, `delete_relationship`, `query_relationships`
@@ -353,13 +362,14 @@ src/lifecycle_mcp/
         requirement_handler.py   # Requirement lifecycle (8 tools)
         task_handler.py          # Task management (8 tools)
         architecture_handler.py  # ADR management (7 tools)
+        pattern_handler.py       # Architectural patterns (4 tools)
         relationship_handler.py  # Entity relationships (3 tools)
         validation_handler.py    # Plan validation (2 tools)
         export_handler.py        # Documentation export (2 tools)
         status_handler.py        # Project diffs (1 tool)
 tests/
     conftest.py                  # Shared fixtures
-    test_server_integration.py   # Server integration tests (36 tools, 8 handlers)
+    test_server_integration.py   # Server integration tests (40 tools, 9 handlers)
     test_constants.py            # Constants module tests
     test_*.py                    # Domain-specific handler tests
 ```

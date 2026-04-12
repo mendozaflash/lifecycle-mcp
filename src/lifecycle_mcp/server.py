@@ -3,7 +3,7 @@
 MCP Server for Software Lifecycle Management (v2)
 
 Provides structured access to projects, requirements, tasks, and
-architecture decisions through 8 handler modules and 36 tools.
+architecture decisions through 9 handler modules and 40 tools.
 """
 
 import argparse
@@ -21,6 +21,7 @@ from .database_manager import DatabaseManager
 from .handlers import (
     ArchitectureHandler,
     ExportHandler,
+    PatternHandler,
     ProjectHandler,
     RelationshipHandler,
     RequirementHandler,
@@ -36,21 +37,22 @@ class LifecycleMCPServer:
     """MCP Server using modular handler architecture (v2)"""
 
     def __init__(self):
-        """Initialize server with database manager and 8 handlers"""
+        """Initialize server with database manager and 9 handlers"""
         # Initialize database manager
         self.db_manager = DatabaseManager()
 
-        # Initialize handlers (8 total)
+        # Initialize handlers (9 total)
         self.project_handler = ProjectHandler(self.db_manager)
         self.requirement_handler = RequirementHandler(self.db_manager)
         self.task_handler = TaskHandler(self.db_manager)
         self.architecture_handler = ArchitectureHandler(self.db_manager)
+        self.pattern_handler = PatternHandler(self.db_manager)
         self.relationship_handler = RelationshipHandler(self.db_manager)
         self.validation_handler = ValidationHandler(self.db_manager)
         self.export_handler = ExportHandler(self.db_manager)
         self.status_handler = StatusHandler(self.db_manager)
 
-        # Create handler registry for tool routing (36 tools)
+        # Create handler registry for tool routing (40 tools)
         self.handlers = {
             # Project tools (5)
             "create_project": self.project_handler,
@@ -84,6 +86,11 @@ class LifecycleMCPServer:
             "query_architecture_decisions": self.architecture_handler,
             "get_architecture_details": self.architecture_handler,
             "add_architecture_review": self.architecture_handler,
+            # Pattern tools (4)
+            "create_architectural_pattern": self.pattern_handler,
+            "link_adr_to_pattern": self.pattern_handler,
+            "query_architectural_patterns": self.pattern_handler,
+            "get_architectural_overview": self.pattern_handler,
             # Relationship tools (3)
             "create_relationship": self.relationship_handler,
             "delete_relationship": self.relationship_handler,
@@ -116,6 +123,7 @@ class LifecycleMCPServer:
                 self.requirement_handler,
                 self.task_handler,
                 self.architecture_handler,
+                self.pattern_handler,
                 self.relationship_handler,
                 self.validation_handler,
                 self.export_handler,

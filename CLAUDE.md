@@ -100,7 +100,7 @@ This is a Model Context Protocol (MCP) server for software lifecycle management.
 ### Core Components
 
 1. **LifecycleMCPServer** (`src/lifecycle_mcp/server.py`): Refactored main server using modular handler architecture
-   - Exposes 22 tools for lifecycle management across 6 handler modules
+   - Exposes 40 tools for lifecycle management across 9 handler modules
    - Uses async architecture for proper MCP protocol compliance
    - Implements clean separation of concerns with handler registry for tool routing
    - Validates state transitions and business rules through domain-specific handlers
@@ -108,10 +108,10 @@ This is a Model Context Protocol (MCP) server for software lifecycle management.
 
 2. **Handler Architecture** (`src/lifecycle_mcp/handlers/`): Modular async handlers for different domains
    - `BaseHandler`: Abstract base class with common async patterns, utilities, and standardized response formatting
-   - `RequirementHandler`: Requirements lifecycle management (5 tools) - create, update, query, details, trace
-   - `TaskHandler`: Task creation and progress tracking (4 tools) - create, update, query, details
-   - `ArchitectureHandler`: ADR management and reviews (5 tools) - create, update, query, details, review
-   - `InterviewHandler`: Interactive requirement gathering (4 tools) - start/continue interviews and conversations
+   - `RequirementHandler`: Requirements lifecycle management (8 tools) - create, update, query, details, batch, clone
+   - `TaskHandler`: Task creation and progress tracking (8 tools) - create, update, query, details, batch, clone
+   - `ArchitectureHandler`: ADR management and reviews (7 tools) - create, update, query, details, review
+   - `PatternHandler`: Architectural pattern taxonomy (4 tools) - create, link, query, overview
    - `ExportHandler`: Documentation generation (2 tools) - export docs, create diagrams
    - `StatusHandler`: Project health monitoring (2 tools) - project status and metrics
 
@@ -153,7 +153,7 @@ This is a Model Context Protocol (MCP) server for software lifecycle management.
 
 ### MCP Tools Available
 
-The server exposes 22 tools across 6 handler modules:
+The server exposes 40 tools across 9 handler modules:
 
 **Requirement Management (5 tools):**
 - `create_requirement` - Create new requirements with validation
@@ -168,25 +168,27 @@ The server exposes 22 tools across 6 handler modules:
 - `query_tasks` - Search and filter tasks
 - `get_task_details` - Complete task information
 
-**Architecture Management (5 tools):**
+**Architecture Management (7 tools):**
 - `create_architecture_decision` - Record ADRs
+- `update_architecture_decision` - Update ADR fields
 - `update_architecture_status` - Update ADR status
+- `archive_architecture_decision` - Archive an ADR
 - `query_architecture_decisions` - Search architecture decisions
 - `get_architecture_details` - Full ADR information
 - `add_architecture_review` - Add review comments
 
-**Interactive Interviews (4 tools):**
-- `start_requirement_interview` - Begin requirement gathering
-- `continue_requirement_interview` - Continue interview process
-- `start_architectural_conversation` - Begin architecture discussion
-- `continue_architectural_conversation` - Continue architecture discussion
+**Pattern Management (4 tools):**
+- `create_architectural_pattern` - Define reusable architectural patterns
+- `link_adr_to_pattern` - Link ADRs to patterns
+- `query_architectural_patterns` - Search and filter patterns
+- `get_architectural_overview` - Cross-cutting pattern and ADR overview
 
 **Documentation Export (2 tools):**
 - `export_project_documentation` - Generate project docs
 - `create_architectural_diagrams` - Generate architecture diagrams
 
-**Status Monitoring (2 tools):**
-- `get_project_status` - Project health dashboard
+**Status Monitoring (1 tool):**
+- `diff_project` - Project health dashboard
 
 ### Database Environment
 
